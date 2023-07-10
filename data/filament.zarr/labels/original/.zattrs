@@ -1,0 +1,132 @@
+{
+    "image-label": {
+        "colors": [
+            {
+                "label-value": 0,
+                "rgba": [
+                    0.0,
+                    34.45356,
+                    77.711505
+                ]
+            },
+            {
+                "label-value": 1,
+                "rgba": [
+                    33.320595000000004,
+                    59.021789999999996,
+                    110.3742
+                ]
+            },
+            {
+                "label-value": 2,
+                "rgba": [
+                    75.140595,
+                    84.030405,
+                    108.04758
+                ]
+            },
+            {
+                "label-value": 5,
+                "rgba": [
+                    108.40559999999999,
+                    109.99016999999999,
+                    114.16145999999999
+                ]
+            },
+            {
+                "label-value": 6,
+                "rgba": [
+                    140.66106,
+                    136.386495,
+                    120.216945
+                ]
+            },
+            {
+                "label-value": 7,
+                "rgba": [
+                    177.47617499999998,
+                    165.32516999999999,
+                    112.21836
+                ]
+            },
+            {
+                "label-value": 10,
+                "rgba": [
+                    215.464035,
+                    195.95475,
+                    92.498955
+                ]
+            },
+            {
+                "label-value": 17,
+                "rgba": [
+                    253.912935,
+                    231.88272,
+                    55.53186
+                ]
+            }
+        ],
+        "version": "0.4"
+    },
+    "multiscales": [
+        {
+            "axes": [
+                {
+                    "name": "z",
+                    "type": "space"
+                },
+                {
+                    "name": "y",
+                    "type": "space"
+                },
+                {
+                    "name": "x",
+                    "type": "space"
+                }
+            ],
+            "datasets": [
+                {
+                    "coordinateTransformations": [
+                        {
+                            "scale": [
+                                1.0,
+                                1.0,
+                                1.0
+                            ],
+                            "type": "scale"
+                        }
+                    ],
+                    "path": "0"
+                },
+                {
+                    "coordinateTransformations": [
+                        {
+                            "scale": [
+                                1.0,
+                                2.007936507936508,
+                                2.0
+                            ],
+                            "type": "scale"
+                        }
+                    ],
+                    "path": "1"
+                },
+                {
+                    "coordinateTransformations": [
+                        {
+                            "scale": [
+                                1.0,
+                                4.015873015873016,
+                                4.032786885245901
+                            ],
+                            "type": "scale"
+                        }
+                    ],
+                    "path": "2"
+                }
+            ],
+            "name": "original",
+            "version": "0.4"
+        }
+    ]
+}
