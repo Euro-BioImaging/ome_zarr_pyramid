@@ -1,30 +1,30 @@
-from OME_Zarr.src.OMEZarr import OMEZarr
+from OME_Zarr.src.OMEZarr import OMEZarr, OMEZarrObject as ozobj
 from OME_Zarr.src.core import utils
+from backups.oldversions.OMEZarr_v2 import OMEZarr as omezarr
 import numcodecs, numpy as np
 import napari
 
 basepath = 'OME_Zarr/data/filament.zarr'
+newpath = '/home/oezdemir/PycharmProjects/ZarrSeg/OME_Zarr/data/filament_ex.zarr'
+newpath1 = '/home/oezdemir/PycharmProjects/ZarrSeg/OME_Zarr/data/filament_ex1.zarr'
 
-oz = OMEZarr(basepath)
+obj = ozobj(newpath)
 
-oz.baseobj.typeobj
-oz.baseobj.path_order
-oz.baseobj.dtype('0')
-oz.baseobj.chunks('0')
+obj.dtype('0')
 
-oz.labelobj['original'].typeobj
-oz.labelobj['original'].dtype('0')
+obj.rebase(newpath1, paths = ['0', '1'], zarr_meta = {'dtype': np.float32})
 
-newdir = 'OME_Zarr/data/filament_ex.zarr'
-oz.baseobj.extract(newdir = newdir, paths = ['0', '1'])
+obj.dtype('0')
 
-noz = OMEZarr(newdir)
-noz.baseobj.typeobj
-noz.baseobj.path_order
-noz.baseobj.get_scale('0')
-noz.baseobj.get_scale('1')
+obj.rebase(newpath1, paths = ['0', '1'], zarr_meta = {'dimension_separator': '.'})
+obj.asflat()
 
-noz.baseobj.chunks('0')
-noz.baseobj.rechunk((10, 70, 70))
-noz.baseobj.chunks('0')
+obj1 = ozobj(newpath1)
+obj1.rebase(newpath1, paths = ['0', '1'], zarr_meta = {'dimension_separator': '.'})
 
+
+obj1.dtype('0')
+
+napari.view_path(newpath)
+
+napari.view_path(newpath1)
