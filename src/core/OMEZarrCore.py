@@ -393,35 +393,35 @@ class ZarrayManipulations(ZarrayCore):
                  ):
         self.base = group
         ZarrayCore.__init__(self, self.base)
-    def extract(self,
-                resolutions: [list, tuple],
-                shift_object: bool = True,
-                newname: [str, None] = 'extracted.zarr',
-                newdir: [str, None] = None
-                ):
-        """ Extract specific resolution levels from the parent OME_Zarr. """
-        if newdir is None:
-            newdir = os.path.join(self.basedir, newname)
-        else:
-            newname = os.path.basename(newdir)
-        gr = zarr.group(newdir, overwrite = True)
-        newmeta = self.extract_dataset(resolutions)
-        newmeta[0]['name'] = newname
-        gr.attrs['multiscales'] = newmeta
-        for pth in resolutions:
-            arraypath = os.path.join(newdir, pth)
-            arrmeta = self.array_meta[pth]
-            arr = self.base[pth]
-            dsk = da.from_zarr(arr)
-            dsk.to_zarr(url = arraypath,
-                        compressor = arrmeta['compressor'],
-                        dimension_separator = arrmeta['dimension_separator'],
-                        overwrite = True
-                        )
-        gr.attrs['multiscales'] = newmeta
-        if shift_object:
-            ZarrayCore.__init__(self, gr)
-        return self
+    # def extract(self,
+    #             resolutions: [list, tuple],
+    #             shift_object: bool = True,
+    #             newname: [str, None] = 'extracted.zarr',
+    #             newdir: [str, None] = None
+    #             ):
+    #     """ Extract specific resolution levels from the parent OME_Zarr. """
+    #     if newdir is None:
+    #         newdir = os.path.join(self.basedir, newname)
+    #     else:
+    #         newname = os.path.basename(newdir)
+    #     gr = zarr.group(newdir, overwrite = True)
+    #     newmeta = self.extract_dataset(resolutions)
+    #     newmeta[0]['name'] = newname
+    #     gr.attrs['multiscales'] = newmeta
+    #     for pth in resolutions:
+    #         arraypath = os.path.join(newdir, pth)
+    #         arrmeta = self.array_meta[pth]
+    #         arr = self.base[pth]
+    #         dsk = da.from_zarr(arr)
+    #         dsk.to_zarr(url = arraypath,
+    #                     compressor = arrmeta['compressor'],
+    #                     dimension_separator = arrmeta['dimension_separator'],
+    #                     overwrite = True
+    #                     )
+    #     gr.attrs['multiscales'] = newmeta
+    #     if shift_object:
+    #         ZarrayCore.__init__(self, gr)
+    #     return self
     def reduce_pyramid(self, paths):
         """ Drop those paths that are not included in the paths variable. This method applies in-place.
             Thus consider copying your original OME_Zarr in advance. !!!
