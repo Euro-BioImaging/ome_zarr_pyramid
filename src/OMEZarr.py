@@ -5,7 +5,7 @@ from OME_Zarr.src.core import utils
 
 class BaseReader(Collection, ZarrayManipulations): # TODO: Add s3fs stuff here.
     def __init__(self,
-                 basepath
+                 basepath: str
                  ):
         Collection.__init__(self, basepath)
         if self.is_multiscales:
@@ -33,8 +33,9 @@ class _MultiSeries:
 
 class OMEZarrObject(BaseReader, _MultiSeries, _Labels):
     def __init__(self,
-                 basepath
+                 basepath: str
                  ):
+        """ The main reader class """
         BaseReader.__init__(self, basepath)
         if self.is_labels:
             _Labels.__init__(self)
@@ -55,11 +56,14 @@ class OMEZarrObject(BaseReader, _MultiSeries, _Labels):
             raise Exception('Data is neither multiseries nor labels.')
 
 class OMEZarr:
-    def __init__(self, directory):
+    def __init__(self,
+                 directory: str
+                 ):
+        """ A class that classifies OME-Zarr data as image and label objects. """
         self.baseobj = None
         self.labelobj = None
         self.unstructured_collections = {}
-        self.collection_paths, self.array_paths = utils.get_collection_paths(directory, return_arraypaths = True)
+        self.collection_paths, self.multiscales_paths, self.array_paths = utils.get_collection_paths(directory, return_all = True)
         for fpath in self.collection_paths:
             obj = OMEZarrObject(fpath)
             if fpath == directory:

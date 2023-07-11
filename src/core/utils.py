@@ -61,11 +61,8 @@ def is_generic_collection(group):
     return res
 
 def get_collection_paths(directory,
-                         return_arraypaths = False
+                         return_all = False
                          ):
-    # directory = '/home/oezdemir/PycharmProjects/ZarrSeg/data/6001240.zarr/labels/masks'
-    # directory = '/home/oezdemir/PycharmProjects/ZarrSeg/data/6001240.zarr'
-    # directory = '/home/oezdemir/PycharmProjects/ZarrSeg/data/fake/fixed.ome.zarr'
     gr = zarr.group(directory)
     groupkeys = list(gr.group_keys())
     arraykeys = list(gr.array_keys())
@@ -97,8 +94,8 @@ def get_collection_paths(directory,
         else:
             if mpath not in out:
                 out.append(mpath)
-    if return_arraypaths:
-        return out, arraypaths
+    if return_all:
+        return out, multiscales_paths, arraypaths
     return out
 
 @dask.delayed
