@@ -245,7 +245,12 @@ class ZarrayCore(MultiMeta):
             tempchunks = os.path.join(target_base.name, 'tempchunks')
             arraypath = os.path.join(out_dir, pth)
             if np.all(arrmeta['chunks'] == arr.chunks): ### if there has been no update in chunk size, no need to do the rechunking process. Do this check also for dtype and compressor
-                layer = arr
+                if out_dir == self.base.store.path:
+                    ### cache data first in temporary path if change is in place
+                    print('change is in place')
+                    layer = zarr.array(arr, store = target)
+                else:
+                    layer = arr
             else:
                 try:
                     # print(f'Rechunking for path: {pth}.')
@@ -261,13 +266,21 @@ class ZarrayCore(MultiMeta):
                     warnings.warn(f'Cannot progress with rechunking for path: {pth}. Converting to numpy.')
                     arrnum = np.array(arr)
                     layer = zarr.array(arrnum, chunks = arrmeta['chunks'], store = target)
-            _ = zarr.array(layer,
-                           dimension_separator = arrmeta['dimension_separator'],
-                           compressor = arrmeta['compressor'],
-                           dtype = arrmeta['dtype'],
-                           store = arraypath,
-                           overwrite = overwrite
-                           )
+            # _ = zarr.array(layer,
+            #                dimension_separator = arrmeta['dimension_separator'],
+            #                compressor = arrmeta['compressor'],
+            #                dtype = arrmeta['dtype'],
+            #                store = arraypath,
+            #                overwrite = overwrite
+            #                )
+            layer = layer.astype(arrmeta['dtype'])
+            dsk = da.from_zarr(layer)
+            dsk.to_zarr(url = arraypath,
+                        compressor = arrmeta['compressor'],
+                        dimension_separator = arrmeta['dimension_separator'],
+                        overwrite = overwrite
+                        )
+
             shutil.rmtree(target_base.name)
     def chunks(self,
                pth: str = '0'
@@ -306,6 +319,7 @@ class ZarrayCore(MultiMeta):
         if pth not in curpaths:
             self.array_meta[pth] = self.array_meta[curpaths[0]]
         for metakey, value in zip(metakeys, values):
+            print(f'{metakey}:{value}')
             if metakey == 'chunks':
                 if new_shape is None:
                     shape = np.array(self.base[pth].shape)
@@ -314,6 +328,8 @@ class ZarrayCore(MultiMeta):
                 chunks = np.array(value)
                 value = np.where(chunks > shape, shape, chunks)
                 self.array_meta[pth][metakey] = tuple(value)
+            else:
+                self.array_meta[pth][metakey] = value
     def __modify_array_meta(self,
                             paths: [list, int, str],
                             metakey,
@@ -338,7 +354,9 @@ class ZarrayCore(MultiMeta):
                     shape = np.array(new_arrays[i].shape)
                 chunks = np.array(value)
                 value = np.where(chunks > shape, shape, chunks)
-            self.array_meta[pth][metakey] = value
+                self.array_meta[pth][metakey] = tuple(value)
+            else:
+                self.array_meta[pth][metakey] = value
         # print(self.array_meta)
     def update_arrays(self,
                       paths: [list, int, str],
@@ -451,9 +469,11 @@ class ZarrayManipulations(ZarrayCore):
             newdir = tempfile.TemporaryDirectory()
             basepath = os.path.join(newdir, self.basename)
         elif newdir == self.basepath:
+            print('elif is being used')
             gr = self.base
             basepath = self.basepath
         else:
+            print('else is being used')
             basepath = newdir
             store = zarr.DirectoryStore(basepath)
             gr = zarr.group(store)
