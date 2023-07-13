@@ -60,6 +60,10 @@ class Collection:
     def array_keys(self):
         return list(self.base.array_keys())
 
+    @property
+    def allkeys(self):
+        return list(self.base.keys())
+
     def _classify_collections(self):
         self.is_generic_collection = False
         paths = list(self.base.keys())
@@ -131,7 +135,7 @@ class MultiMeta:
             return config.NotMultiscalesException
 
     def add_axis(self,
-                 name: str = 't',
+                 name: str,
                  unit: str = None,
                  index: int = -1,
                  ):
@@ -153,6 +157,18 @@ class MultiMeta:
         axis = axmake(name, unit)
         self.meta[0]['axes'].insert(index, axis)
 
+    # def del_axis(self,
+    #              name: str
+    #              ):
+    #     if name not in self.axis_order:
+    #         raise ValueError(f'The axis "{name}" does not exist.')
+    #     idx = self.axis_order.index(name)
+    #     self.meta[0]['axes'].pop(idx)
+    #     for pth in self.path_order:
+    #         scale = self.get_scale(pth)
+    #         scale.pop(idx)
+    #         self.set_scale(pth, scale)
+
     @property
     def path_order(self):
         try:
@@ -165,6 +181,35 @@ class MultiMeta:
                   ):
         idx = self.path_order.index(pth)
         return self.meta[0]['datasets'][idx]['coordinateTransformations'][0]['scale']
+
+    def set_scale(self,
+                  pth: Union[str, int],
+                  scale
+                  ):
+        idx = self.path_order.index(pth)
+        self.meta[0]['datasets'][idx]['coordinateTransformations'][0]['scale'] = scale
+
+    def get_scale_factors(self,
+                          paths: Iterable[Union[str, int]]
+                          ):
+        if paths is None: paths = self.path_order
+        scales = np.array([self.get_scale(pth) for pth in paths])
+        factored = scales / scales[0]
+        return {pth: tuple(factored[paths.index(pth)]) for pth in paths}
+
+    def refactor_subset(self, paths, subset):
+        if paths is None: paths = self.path_order
+        factors = self.get_scale_factors(paths)
+        subsets = {}
+        for pth in paths:
+            factor = factors[pth]
+            for key, item in subset.items():
+                idx = self.axis_order.index(key)
+                coef = factor[idx]
+                itemrefact = np.round(np.array(item) / coef).astype(int)
+                subset[key] = tuple(itemrefact) if not np.isscalar(itemrefact) else itemrefact
+            subsets[pth] = copy.deepcopy(subset)
+        return subsets
 
     def add_dataset(self,
                     path: Union[str, int],
@@ -184,13 +229,27 @@ class MultiMeta:
         del self.meta[0]['datasets'][idx]
 
     def extract_dataset(self,
-                        paths: Iterable[Union[str, int]]
+                        paths: Iterable[Union[str, int]],
+                        axes: str = None
                         ):
+        if paths is None: paths = self.path_order
         indices = [self.path_order.index(pth) for pth in paths]
+        scales = [self.get_scale(pth) for pth in paths]
         meta = copy.deepcopy(self.meta)
         meta[0]['datasets'] = []
+        if axes is not None:
+            axinds = [self.axis_order.index(i) for i in axes]
+        else:
+            axinds = [i for i in range(len(self.axis_order))]
+        axdata = [self.meta[0]['axes'][i] for i in axinds]
         for idx in indices:
-            meta[0]['datasets'].append(self.meta[0]['datasets'][idx])
+            dataset = copy.deepcopy(self.meta[0]['datasets'][idx])
+            scale = scales[idx]
+            if axes is not None:
+                scale = [scale[i] for i in axinds]
+            dataset['coordinateTransformations'][0]['scale'] = scale
+            meta[0]['axes'] = axdata
+            meta[0]['datasets'].append(dataset)
         return meta
 
     def increment_scale(self,
@@ -266,7 +325,8 @@ class ZarrayCore(MultiMeta):
     def __write_layer(self,
                       paths: Union[List, str],
                       out_dir: Union[str, None] = None,
-                      overwrite: bool = False,
+                      overwrite_group: bool = False,
+                      overwrite_arrays: bool = False,
                       new_arrays: Union[List, None] = None
                       ):
         """ Write selected array(s) based on the parameters in the current array metadata.
@@ -275,31 +335,46 @@ class ZarrayCore(MultiMeta):
             in the array_meta variable for the paths provided in the paths variable..
          """
         if new_arrays is not None:
-            assert isinstance(new_arrays, list)
+            assert isinstance(new_arrays, (list, tuple))
             assert len(new_arrays) == len(paths)
-        if out_dir is None:
+        if out_dir is None: ### if out_dir is not specified, this is an in-place write
             out_dir = self.base.store.path
         for i, pth in enumerate(paths):
+            arrmeta = self.array_meta[pth]
             if new_arrays is None:
                 arr = self.base[pth]
-            else:
+                assert isinstance(arr, zarr.Array)
+            else: ### If new arrays are provided, make sure that they undergo a rechunking
                 arr = new_arrays[i]
-            arrmeta = self.array_meta[pth]
+                if isinstance(arr, da.Array): ### If the new array is a dask array, update its data type
+                    arr = arr.astype(arrmeta['dtype'])
+                elif isinstance(arr, zarr.Array): ### If the new array is a zarr array, convert it into dask and update its data type
+                    arr = da.from_zarr(arr).astype(arrmeta['dtype'])
+                elif isinstance(arr, np.ndarray):
+                    arr = da.from_array(arr).astype(arrmeta['dtype'])
             target_base = tempfile.TemporaryDirectory()
             target = os.path.join(target_base.name, 'results')
             tempchunks = os.path.join(target_base.name, 'tempchunks')
             arraypath = os.path.join(out_dir, pth)
-            if np.all(arrmeta[
-                          'chunks'] == arr.chunks):  ### if there has been no update in chunk size, no need to do the rechunking process. Do this check also for dtype and compressor
+            chunksize = arr.chunks if isinstance(arr, zarr.Array) else arr.chunksize ### Get the chunk size for comparison
+            print(f"chunk size in array meta: {arrmeta['chunks']}")
+            print(f"chunk size in the array: {chunksize}")
+            print(f"array shape: {arr.shape}")
+            if np.all(arrmeta['chunks'] == chunksize) & (isinstance(arr, zarr.Array)):
+                ### if there has been no update in chunk size, and data is already in zarr format,
+                ### no need to do the rechunking process. If it is a dask array, though, rechunking is needed
+                ### to regularise the chunk size. Especially, reslicing the data often causes irregularities with chunks.
                 if out_dir == self.base.store.path:
                     ### backup data in temporary path if change is in place
-                    # warnings.warn('Data is being changed in-place.')
-                    layer = zarr.array(arr, store=target)
+                    warnings.warn('Data is being changed in-place.')
+                    # arr.to_zarr(url = target) ### save to temporary path
+                    # layer = zarr.open_array(target)
+                    layer = zarr.array(arr, store = target)
                 else:
                     layer = arr
             else:
                 try:
-                    # print(f'Rechunking for path: {pth}.')
+                    print(f'Rechunking for path: {pth}.')
                     plan = rechunk(arr,
                                    target_chunks=arrmeta['chunks'],
                                    max_mem=256000,
@@ -307,18 +382,29 @@ class ZarrayCore(MultiMeta):
                                    target_options={'compressor': arrmeta['compressor']},
                                    temp_store=tempchunks)
                     plan.execute()
-                    layer = zarr.open(target)
+                    layer = zarr.open_array(target)
                 except:
                     warnings.warn(f'Cannot progress with rechunking for path: {pth}. Converting to numpy.')
                     arrnum = np.array(arr)
                     layer = zarr.array(arrnum, chunks=arrmeta['chunks'], store=target)
-            _ = zarr.array(layer,
-                           dimension_separator=arrmeta['dimension_separator'],
-                           compressor=arrmeta['compressor'],
-                           dtype=arrmeta['dtype'],
-                           store=arraypath,
-                           overwrite=overwrite
-                           )
+            if isinstance(layer, zarr.Array):
+                dsk = da.from_zarr(layer).astype(arrmeta['dtype'])
+            elif isinstance(layer, da.Array):
+                dsk = layer.astype(arrmeta['dtype'])
+            if (i == 0) & overwrite_group:
+                _ = zarr.group(out_dir, overwrite = True)
+            dsk.to_zarr(url = arraypath,
+                        compressor = arrmeta['compressor'],
+                        dimension_separator = arrmeta['dimension_separator'],
+                        overwrite = overwrite_arrays
+                        )
+            # _ = zarr.array(layer,
+            #                dimension_separator=arrmeta['dimension_separator'],
+            #                compressor=arrmeta['compressor'],
+            #                dtype=arrmeta['dtype'],
+            #                store=arraypath,
+            #                overwrite=overwrite_arrays
+            #                )
             shutil.rmtree(target_base.name)
 
     def chunks(self,
@@ -463,6 +549,31 @@ class ZarrayManipulations(ZarrayCore):
         self.base = group
         ZarrayCore.__init__(self, self.base)
 
+    # def copy(self,
+    #          pth: str = None,
+    #          rebase: bool = True,
+    #          overwrite = False
+    #          ):
+    #     """ Copy the entire OME-Zarr to a new path. """
+    #     if pth is None:
+    #         target_base = tempfile.TemporaryDirectory()
+    #         pth = os.path.join(target_base.name, 'results')
+    #     store = zarr.DirectoryStore(pth)
+    #     gr = zarr.group(store, overwrite = overwrite)
+    #     for key in self.allkeys:
+    #         gr[key] = self.base[key]
+    #     for key, value in self.base.attrs.items():
+    #         gr.attrs[key] = value
+    #     if rebase:
+    #         self.base = gr
+    #         ZarrayCore.__init__(self, self.base)
+
+    def __stage_inputs(self,
+                     outpath: str
+                     ):
+        if self.basepath == outpath:
+            self.in_place_write = True
+
     def reduce_pyramid(self, paths):
         """ Drop those paths that are not included in the paths variable. This method applies in-place.
             Thus consider copying your original OME_Zarr in advance. !!!
@@ -480,27 +591,58 @@ class ZarrayManipulations(ZarrayCore):
         self.base.attrs['multiscales'] = newmeta
         ZarrayCore.__init__(self, self.base)
 
-    def __mobilise(self,
+    def get_sliced_layers(self,
+                          paths,
+                          subset: dict = {'z': 25,   ### This will be rescaled from the top path in PATHs
+                                          'y': (20, 140),
+                                          'x': (20, 150)
+                                          }
+                          ):
+        if paths is None: paths = self.path_order
+        subsets = self.refactor_subset(paths, subset)
+        layers, shapes, chunks = [], [], []
+        for pth in paths:
+            subset = subsets[pth]
+            keys_, slices = utils.transpose_dict(subset)
+            assert all([key in self.axis_order for key in keys_])
+            arr = self.base[pth]
+            indices = [self.axis_order.index(key) for key in keys_]
+            arr_ = utils.index_nth_dimension(arr, indices, slices)
+            layers.append(arr_)
+            shapes.append(arr_.shape)
+            chunks.append(arr_.chunksize)
+        keys = [key for key in keys_ if not np.isscalar(subset[key])]
+        print(keys)
+        self.__sliced_meta = self.extract_dataset(paths=paths, axes=keys)
+        print(self.__sliced_meta)
+        return layers, shapes, chunks, self.__sliced_meta
+
+    def __mobilise(self, ### IN PLACE KAYDEDERKEN VAR OLAN DATAYI SILMEDEN KAYDEDIYOR. BUNU DUZELT
                    newdir: str = None,
-                   paths: [list, str, None] = None,
-                   overwrite: bool = True,
+                   paths: Union[list, str, None] = None,
+                   overwrite_arrays: bool = True,
+                   overwrite_group: bool = False,
                    zarr_meta: [dict, None] = None,
                    rebase: bool = True,
                    only_meta: bool = False,
                    new_arrays: Union[Iterable, None] = None,
+                   resliced = False
                    ):
+        """"""
         if newdir is None:
             newdir = tempfile.TemporaryDirectory()
             basepath = os.path.join(newdir, self.basename)
         else:
             print('else is being used')
             basepath = newdir
-            gr = zarr.group(basepath)
+        gr = zarr.group(basepath)
         newname = os.path.basename(basepath)
         if isinstance(paths, int):
             paths = str(paths)
-        if isinstance(paths, str):
+        elif isinstance(paths, str):
             paths = [paths]
+        elif paths is None:
+            paths = self.path_order
         if zarr_meta is not None:
             keys, values = utils.transpose_dict(zarr_meta)
             for i, pth in enumerate(paths):
@@ -512,12 +654,16 @@ class ZarrayManipulations(ZarrayCore):
         if only_meta:
             pass
         else:
-            self._ZarrayCore__write_layer(paths, out_dir=basepath, overwrite=overwrite, new_arrays=new_arrays)
+            self._ZarrayCore__write_layer(paths, out_dir=basepath, overwrite_group = overwrite_group,
+                                          overwrite_arrays = overwrite_arrays, new_arrays=new_arrays)
         if newdir == self.basepath:
             pths = list(self.array_meta.keys())
         else:
             pths = paths
-        newmeta = self.extract_dataset(pths)
+        if not resliced:
+            newmeta = self.extract_dataset(pths)
+        else:
+            newmeta = self.__sliced_meta
         newmeta[0]['name'] = newname
         gr.attrs['multiscales'] = newmeta
         if 'omero' in self.base_attrs.keys():
@@ -526,25 +672,59 @@ class ZarrayManipulations(ZarrayCore):
             ZarrayCore.__init__(self, gr)
         return self
 
+    def __basemove(self,  ### Change the base of the OME_Zarr
+                   newdir: str = None,
+                   paths: Iterable = None,
+                   subset = None,
+                   overwrite: bool = True,
+                   zarr_meta: Union[Dict, None] = None,
+                   rebase = True
+                   ):
+        if newdir.startswith('http'):
+            pass
+        elif not newdir.startswith('/'):
+            newdir = os.path.realpath(newdir)
+        if self.basepath == newdir:
+            overwrite_group = False
+            if paths is None:
+                pass
+            else:
+                self.reduce_pyramid(paths)
+        else:
+            overwrite_group = overwrite
+        if paths is None: paths = self.path_order
+        if subset is not None:
+            layers, shapes, chunks, newmeta = self.get_sliced_layers(paths, subset)
+            for pth, layer, shape, chunk in zip(paths, layers, shapes, chunks):
+                self._ZarrayCore__set_array_meta(pth, metakeys = ['chunks'], values = [chunk], new_shape = shape)
+            return self.__mobilise(newdir, paths = paths, overwrite_group = overwrite_group, overwrite_arrays = True,
+                                   zarr_meta = zarr_meta, rebase = rebase, new_arrays = layers, resliced = True)
+        else:
+            return self.__mobilise(newdir, paths = paths, overwrite_group = overwrite_group, overwrite_arrays = True,
+                                   zarr_meta = zarr_meta, rebase = rebase)
+
     def rebase(self,  ### Change the base of the OME_Zarr
                newdir: str = None,
                paths: Iterable = None,
+               subset: Union[dict, None] = None,
                overwrite: bool = True,
                zarr_meta: Union[Dict, None] = None
-               ):
-        return self.__mobilise(newdir, paths = paths, overwrite = overwrite, zarr_meta = zarr_meta, rebase = True)
+               ): ### Works but looks very ugly, make it better.
+        self.__basemove(newdir, paths, subset, overwrite, zarr_meta, rebase = True)
 
-    def extract(self,  ### Write OME_Zarr without changing the base
+    def extract(self,  ### Change the base of the OME_Zarr
                 newdir: str = None,
                 paths: Iterable = None,
+                subset: Union[dict, None] = None,
                 overwrite: bool = True,
                 zarr_meta: Union[Dict, None] = None
-                ):
-        return self.__mobilise(newdir, paths = paths, overwrite = overwrite, zarr_meta = zarr_meta, rebase = False)
+                ): ### Works but looks very ugly, make it better.
+        self.__basemove(newdir, paths, subset, overwrite, zarr_meta, rebase = False)
 
-    def set_to_highest_resolution(self):
-        paths = [sorted(self.path_order)[0]]
-        self.__mobilise(self.basepath, paths, only_meta = True)
+    def reslice(self, ### Apply subsetting to all paths and in-place.
+                subset: Union[dict, None]
+                ):
+        self.rebase(newdir = self.basepath, subset = subset)
 
     def set_array(self,
                   pth: Union[str, int],

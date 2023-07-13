@@ -13,12 +13,16 @@ def index_nth_dimension(array,
                         dimensions = 2, # a scalar or iterable
                         intervals = None # a scalar, an iterable of scalars, a list of tuple or None
                         ):
+    if isinstance(array, zarr.Array):
+        array = da.from_zarr(array)
     allinds = np.arange(array.ndim).astype(int)
     if np.isscalar(dimensions):
         dimensions = [dimensions]
     if intervals is None or np.isscalar(intervals):
         intervals = np.repeat(intervals, len(dimensions))
-    assert len(intervals) == len(dimensions)
+    print(f'here {intervals}')
+    print(dimensions)
+    assert len(intervals) == len(dimensions) ### KALDIM
     interval_dict = {item: interval for item, interval in zip(dimensions, intervals)}
     shape = array.shape
     slcs = []
