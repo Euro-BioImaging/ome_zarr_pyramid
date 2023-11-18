@@ -3,11 +3,23 @@ import numpy as np, pandas as pd
 import dask
 import zarr, json, shutil, os, copy
 from dask import array as da
+import dask_image.ndmeasure as ndmeasure
+import dask as da
 import s3fs
 from skimage.transform import resize as skresize
 import numcodecs
 from rechunker import rechunk
 import shutil, tempfile
+
+from typing import (
+    Union,
+    Tuple,
+    Dict,
+    Any,
+    Iterable,
+    List,
+    Optional
+)
 
 def index_nth_dimension(array,
                         dimensions = 2, # a scalar or iterable
@@ -20,8 +32,6 @@ def index_nth_dimension(array,
         dimensions = [dimensions]
     if intervals is None or np.isscalar(intervals):
         intervals = np.repeat(intervals, len(dimensions))
-    print(f'here {intervals}')
-    print(dimensions)
     assert len(intervals) == len(dimensions) ### KALDIM
     interval_dict = {item: interval for item, interval in zip(dimensions, intervals)}
     shape = array.shape
@@ -136,3 +146,10 @@ def rescale(zarray,   ### Input is a single zarr array. Maybe divide this into t
             darrays.append(nresdask)
         res = darrays
     return res
+
+
+def locate_labels(label_img,
+                  ) -> dict:
+    df = ndmeasure.find_objects(label_img).compute()
+    dlbl = df.T.to_dict()
+    return dlbl
