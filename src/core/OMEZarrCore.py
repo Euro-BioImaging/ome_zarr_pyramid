@@ -6,8 +6,8 @@ from dask import array as da
 import s3fs
 from skimage.transform import resize as skresize
 from rechunker import rechunk
-from OME_Zarr.src.core import config, utils
-from OME_Zarr.src.core.MetaData import _Meta, _MultiMeta, _ImageLabelMeta
+from src.core import config, utils
+from src.core.MetaData import _Meta, _MultiMeta, _ImageLabelMeta
 from numcodecs import Blosc
 
 from typing import (

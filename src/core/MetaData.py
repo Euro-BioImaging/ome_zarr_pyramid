@@ -1,5 +1,5 @@
 import zarr, warnings, copy
-from OME_Zarr.src.core import config
+from src.core import config
 import numpy as np
 
 from typing import (
