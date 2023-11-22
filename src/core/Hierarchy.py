@@ -242,8 +242,8 @@ class Hybrid(BaseReader, ZarrayManipulations, DataMovement):
         if not 'zarr_paths_abs' in self.__dict__:
             raise AttributeError()
         if not 'grs' in self.__dict__:
-            self.grs = {}
-        for pth, spth in zip(self.zarr_paths, self.zarr_paths_abs):
+            self.grs, self.sub = {}, {}
+        for pth, spth, rpth in zip(self.zarr_paths, self.zarr_paths_abs, self.zarr_paths_rel):
             gr = BaseReader(spth)
             if spth == self.grpath:
                 grp = self
@@ -259,6 +259,9 @@ class Hybrid(BaseReader, ZarrayManipulations, DataMovement):
                 jn = os.path.join(*pth_split[1:])
                 self.__setattr__(jn, grp)
             self.grs[pth] = grp
+            # print(f'this is rpth:{rpth}')
+            if len(rpth) > 0:
+                self.sub[rpth] = grp
 
 class Collection(BaseReader, DataMovement):
     def __init__(self,
@@ -293,7 +296,7 @@ class Collection(BaseReader, DataMovement):
             raise AttributeError()
         if not 'grs' in self.__dict__:
             self.grs = {}
-        for pth, spth in zip(self.zarr_paths, self.zarr_paths_abs):
+        for pth, spth, rpth in zip(self.zarr_paths, self.zarr_paths_abs, self.zarr_paths_rel):
             gr = BaseReader(spth)
             if spth == self.grpath:
                 grp = self
@@ -309,6 +312,9 @@ class Collection(BaseReader, DataMovement):
                 jn = os.path.join(*pth_split[1:])
                 self.__setattr__(jn, grp)
             self.grs[pth] = grp
+            # print(f'this is rpth:{rpth}')
+            if len(rpth) > 0:
+                self.sub[rpth] = grp
 
 #########################################################################################################################################################
 #########################################################################################################################################################
@@ -349,9 +355,11 @@ class OMEZarrSample:
     def add_datasets(self,
                      num_arrpaths = 3,
                      top_shape = (300, 300, 300),
-                     chunks = (100, 100, 100)
+                     chunks = (100, 100, 100),
+                     axes = 'zyx',
+                     units = ['micrometer'] * 3
                      ):
-        self.specify_axes(shape = top_shape)
+        self.specify_axes(axes = axes, units = units)
         self.scales = [(2 ** i) for i in range(num_arrpaths)]
         self.shapes = [np.array(top_shape) // item for item in self.scales]
         for i, shape in enumerate(self.shapes):
@@ -361,20 +369,28 @@ class OMEZarrSample:
                              chunks = chunks
                              )
     def specify_axes(self,
-                     order: str = 'tczyx',
-                     shape: Iterable = (300, 300, 300)
+                     axes: str = 'zyx',
+                     units: Iterable = ['micrometer'] * 3
                      ):
-        self.axis_order = order[-len(shape):]
-        self.grp.attrs['multiscales'][0]['axes'] = [{"name": n, "type": config.type_map[n]} for n in self.axis_order]
+        self.axis_order = axes
+        self.unit_order = units
+        print(f'look: {self.unit_order}')
+        self.grp.attrs['multiscales'][0]['axes'] = [{"name": n, "type": config.type_map[n], "unit": u} for n, u in zip(self.axis_order, self.unit_order)]
 
 class OMEZarr(Hybrid, DataMovement): ### TODO: Bunun repr methodunu olustur.
-    def __init__(self, gr_or_path):
+    def __init__(self,
+                 gr_or_path,
+                 shape_of_new: Union[Iterable, None] = (500, 500, 500),
+                 chunks_of_new: Union[Iterable, None] = (96, 96, 96),
+                 axis_order = 'zyx',
+                 unit_order = ['micrometer'] * 3
+                 ):
         self._grstore = None
         self.set_input(gr_or_path)
         if self.path_has_group():
             self.read()
         else:
-            self.new()
+            self.new(shape = shape_of_new, chunks = chunks_of_new, axis_order = axis_order, unit_order = unit_order)
     def set_input(self, gr_or_path):
         if isinstance(gr_or_path, (str, Path, zarr.Group)):
             self.gr_or_path = gr_or_path
@@ -408,10 +424,13 @@ class OMEZarr(Hybrid, DataMovement): ### TODO: Bunun repr methodunu olustur.
             raise TypeError('Type of the OME-Zarr could not be resolved.')
     def new(self,
             num_arrpaths: int = 1,
-            shape: Iterable = (500, 500, 500)
+            shape: Iterable = (500, 500, 500),
+            chunks: Iterable = (96, 96, 96),
+            axis_order: str = 'zyx',
+            unit_order: Union[Iterable, None] = None
             ):
         ozs = OMEZarrSample(self.gr_or_path)
-        ozs.add_datasets(num_arrpaths = num_arrpaths, top_shape = shape)
+        ozs.add_datasets(num_arrpaths = num_arrpaths, top_shape = shape, chunks = chunks, axes = axis_order, units = unit_order)
         self.set_input(ozs.grp)
         self.read()
         # MultiScales.__init__(self, ozs.store.path)

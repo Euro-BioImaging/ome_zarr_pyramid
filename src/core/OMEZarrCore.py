@@ -151,6 +151,11 @@ class ZarrayCore(_MultiMeta, _ImageLabelMeta): ### _MultiMeta and _MultiScales a
                ):
         return (self.array_meta[pth]['chunks'])
 
+    def shape(self,
+              pth: Union[str, int] = '0'
+              ):
+        return (self.array_meta[pth]['shape'])
+
     def compressor(self,
                    pth: Union[str, int] = '0'
                    ):
@@ -160,6 +165,11 @@ class ZarrayCore(_MultiMeta, _ImageLabelMeta): ### _MultiMeta and _MultiScales a
               pth: Union[str, int] = '0'
               ):
         return self.array_meta[pth]['dtype']
+
+    def dimension_separator(self,
+                              pth: Union[str, int] = '0'
+                           ):
+        return (self.array_meta[pth]['dimension_separator'])
 
     def __set_array_meta(self,
                          pth: Union[int, str],
@@ -461,13 +471,14 @@ class ZarrayManipulations(ZarrayCore):
                 ):
         self.rebase(newdir = self.grpath, subset = subset)
 
+
     ########################### Scale-related methods #####################################
 
-    def _set_array(self, ### TODO: A LITTLE BIT CHECKED BUT STILL REQUIRES MORE WORKING ON.
+    def set_array(self, ### TODO: A LITTLE BIT CHECKED BUT STILL REQUIRES MORE WORKING ON.
                    pth: Union[str, int],
                    arr: Union[np.ndarray, zarr.Array, da.Array],
                    scale: Iterable,
-                   zarr_meta: Union[Dict, None] = None
+                   zarr_meta: Union[Dict, None] = None,
                    ):
         """
         Set an array to a path in the OME_Zarr hierarchy.
@@ -475,31 +486,33 @@ class ZarrayManipulations(ZarrayCore):
         """
         if zarr_meta is None:
             print("A new array is being set without providing the zarray metadata."
-                  "Arbitrary zarr metadata is being assumed.")
-            zarr_meta = {'chunks': (100, 100, 100),
-                         'shape': (500, 500, 500),
-                         'compressor': Blosc(cname='lz4',
-                                             clevel=5,
-                                             blocksize=0),
-                         'dtype': np.dtype('float64'),
-                         'dimension_separator': '.'
+                  "Zarr metadata with the highest resolution is being assumed.")
+            zarr_meta = {'chunks': self.chunks(),
+                         'shape': self.shape(),
+                         'compressor': self.compressor(),
+                         'dtype': self.dtype(),
+                         'dimension_separator': self.dimension_separator()
                          }
         self.add_dataset(pth, scale)
         self.__mobilise(self.grpath, paths=[pth], zarr_meta=zarr_meta, new_arrays=[arr])
         self.sort_paths()
 
-    def add_layer(self, ### TODO: KALDIM. ÖNEMLI BIR NOKTA.
-                  scale: Iterable = (2, 2, 2)
-                  ):
-        path_hr = self.resolution_paths[0]
-        path_lr = self.resolution_paths[-1]
-        layer = self.layers[path_hr]
-        shape = np.array(layer.shape).flatten()
-        assert len(shape) == len(scale), "Scale length must be exactly the same as the number of array dimensions."
-        scl = np.array(scale).flatten()
-        newshape = shape // scl
-        newpth = int(path_lr) + 1
-        self._set_array(newpth, )
+    # def add_layer(self, ### TODO: KALDIM. ÖNEMLI BIR NOKTA.
+    #               scale: Iterable = (2, 2, 2)
+    #               ):
+    #     path_hr = self.resolution_paths[0]
+    #     path_lr = self.resolution_paths[-1]
+    #     layer = self.layers[path_hr]
+    #     shape = np.array(layer.shape).flatten()
+    #     assert len(shape) == len(scale), "Scale length must be exactly the same as the number of array dimensions."
+    #     scl = np.array(scale).flatten()
+    #     newshape = shape // scl
+    #     newpth = int(path_lr) + 1
+    #     self._set_array(newpth,
+    #                     layer,
+    #                     scl,
+    #
+    #                     )
 
     # def rescale(self, ### TODO
     #             n_scales = 5,

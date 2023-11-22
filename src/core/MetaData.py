@@ -75,6 +75,11 @@ class _MultiMeta(_Meta):
             return config.NotMultiscalesException
 
     @property
+    def identifier(self):
+        if self.has_name:
+            return ''.join(self.multimeta[0]['name'].split('.')[:-1])
+
+    @property
     def axis_order(self):
         try:
             if self.has_axes:
@@ -85,10 +90,34 @@ class _MultiMeta(_Meta):
             return config.NotMultiscalesException
 
     @property
+    def unit_list(self):
+        try:
+            if self.has_axes:
+                l = []
+                for item in self.multimeta[0]['axes']:
+                    if 'unit' in item.keys():
+                        l.append(item['unit'])
+                    else:
+                        default_unit = config.unit_map[item['name']]
+                        l.append(default_unit)
+                return l
+            else:
+                return config.AxisNotFoundException
+        except:
+            return config.NotMultiscalesException
+
+    @property
     def ndim(self):
         return len(self.axis_order)
 
-    def add_axis(self,
+    def axis_scale_map(self,
+                       pth
+                       ):
+        axes = self.axis_order
+        scales = self.get_scale(pth)
+        return {i: j for i, j  in zip(axes, scales)}
+
+    def add_axis(self, ### PLUG THIS TO THE DATASET SECTION, USE A DOWNSCALE FACTOR FOR DIFFERENT RESOLUTIONS
                  name: str,
                  unit: str = None,
                  index: int = -1,
@@ -111,17 +140,17 @@ class _MultiMeta(_Meta):
         axis = axmake(name, unit)
         self.multimeta[0]['axes'].insert(index, axis)
 
-    # def del_axis(self,
-    #              name: str
-    #              ):
-    #     if name not in self.axis_order:
-    #         raise ValueError(f'The axis "{name}" does not exist.')
-    #     idx = self.axis_order.index(name)
-    #     self.multimeta[0]['axes'].pop(idx)
-    #     for pth in self.resolution_paths:
-    #         scale = self.get_scale(pth)
-    #         scale.pop(idx)
-    #         self.set_scale(pth, scale)
+    def del_axis(self,
+                 name: str
+                 ):
+        if name not in self.axis_order:
+            raise ValueError(f'The axis "{name}" does not exist.')
+        idx = self.axis_order.index(name)
+        self.multimeta[0]['axes'].pop(idx)
+        for pth in self.resolution_paths:
+            scale = self.get_scale(pth)
+            scale.pop(idx)
+            self.set_scale(pth, scale)
 
     @property
     def resolution_paths(self):
