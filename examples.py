@@ -4,6 +4,7 @@ import pandas as pd
 from src.core import utils
 # from OME_Zarr.src.OMEZarr import OMEZarr
 from src.core.Hierarchy import OMEZarr
+from src.process import Utilities as utils
 
 import numpy as np
 import dask.array as da
@@ -28,6 +29,9 @@ data1 = OMEZarr(basepath)
 
 lbl0 = da.array.from_zarr(data1.labels.original.layers['0'])
 
+
+
+utils.apply_projection('data/filament.zarr', 'data/res')
 
 
 slcs = utils.locate_labels(lbl0)

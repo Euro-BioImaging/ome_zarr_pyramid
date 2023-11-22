@@ -295,7 +295,7 @@ class Collection(BaseReader, DataMovement):
         if not 'zarr_paths_abs' in self.__dict__:
             raise AttributeError()
         if not 'grs' in self.__dict__:
-            self.grs = {}
+            self.grs, self.sub = {}, {}
         for pth, spth, rpth in zip(self.zarr_paths, self.zarr_paths_abs, self.zarr_paths_rel):
             gr = BaseReader(spth)
             if spth == self.grpath:
