@@ -1,2 +1,2 @@
 recursive-include configs *
-recursive-include ZarrSeg/configs *
+recursive-include OME_Zarr/configs *
