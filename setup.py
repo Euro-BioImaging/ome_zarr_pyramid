@@ -33,5 +33,9 @@ setuptools.setup(
     packages = setuptools.find_packages(),
     include_package_data=True,
     install_requires = requirements,
-    scripts=["OME_Zarr/ome_zarr_run"]
+    entry_points={'console_scripts':
+                      [
+                          "ome_zarr_run = bin:ome_zarr_run",
+                      ]
+                  }
     )

@@ -1,7 +1,5 @@
 import argparse
 
-print("DOC")
-
 parser = argparse.ArgumentParser()
 
 subparsers = parser.add_subparsers()
@@ -13,3 +11,5 @@ maxproject.add_argument('--output_name', default = None)
 maxproject.add_argument('--resolutions', default = 'all')
 maxproject.add_argument('--label_name', default = None)
 
+if __name__ == '__main__':
+    print('DOC')
