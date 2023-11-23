@@ -11,7 +11,7 @@ import dask.array as da
 import dask.bag as db
 import os, copy
 import numcodecs
-import zarr, napari
+import zarr#, napari
 import dask_image.ndfilters
 import dask_image.ndmorph
 import dask_image.dispatch
@@ -26,6 +26,12 @@ basepath = 'data/filament.zarr'
 
 # newdir = 'data/filament_plus2_labels_extracted.zarr'
 data1 = OMEZarr(basepath)
+
+data1.identifier
+
+data1.multimeta[0]['name'].isalnum()
+'/'.isalnum()
+
 
 lbl0 = da.array.from_zarr(data1.labels.original.layers['0'])
 

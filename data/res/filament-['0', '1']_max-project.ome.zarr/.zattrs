@@ -1,0 +1,45 @@
+{
+    "multiscales": [
+        {
+            "axes": [
+                {
+                    "name": "y",
+                    "type": "space",
+                    "unit": "Slice"
+                },
+                {
+                    "name": "x",
+                    "type": "space",
+                    "unit": "Pixel"
+                }
+            ],
+            "datasets": [
+                {
+                    "coordinateTransformations": [
+                        {
+                            "scale": [
+                                1.0,
+                                1.0
+                            ],
+                            "type": "scale"
+                        }
+                    ],
+                    "path": "0"
+                },
+                {
+                    "coordinateTransformations": [
+                        {
+                            "scale": [
+                                2.007936507936508,
+                                2.0
+                            ],
+                            "type": "scale"
+                        }
+                    ],
+                    "path": "1"
+                }
+            ],
+            "name": "filament-['0', '1']_max-project.ome.zarr"
+        }
+    ]
+}

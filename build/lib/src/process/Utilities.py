@@ -57,7 +57,6 @@ def apply_projection(path_or_omezarr,
     assert projection_type in projections.keys(), f'projection_type must be one of {projections.keys()}'
     resolutions = [str(rsl) for rsl in resolutions]
     if output_name is None: output_name = data.identifier
-    # print(output_name)
     idx = data.axis_order.index(along)
     newshape = list(data.shape())
     newshape.pop(idx)
@@ -65,8 +64,7 @@ def apply_projection(path_or_omezarr,
     newchunks.pop(idx)
     axes = data.axis_order.replace(along, '')
     units = data.unit_list
-    # print(units)
-    oz = OMEZarr(os.path.join(output_directory, f'{output_name}_res-{resolutions}_{projection_type}-project.ome.zarr'),
+    oz = OMEZarr(os.path.join(output_directory, f'{output_name}-{resolutions}_{projection_type}-{along}-project.ome.zarr'),
                  shape_of_new = newshape,
                  chunks_of_new = newchunks,
                  axis_order = axes,
@@ -90,4 +88,4 @@ def apply_projection(path_or_omezarr,
         if along in oz.axis_order:
             oz.del_axis(along)
         oz.set_array(rsl, proj, scale = proj_scale, zarr_meta = zmeta)
-    return oz
+    # return oz

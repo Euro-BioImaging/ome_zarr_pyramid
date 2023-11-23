@@ -77,7 +77,10 @@ class _MultiMeta(_Meta):
     @property
     def identifier(self):
         if self.has_name:
-            return ''.join(self.multimeta[0]['name'].split('.')[:-1])
+            if self.multimeta[0]['name'].isalnum():
+                return ''.join(self.multimeta[0]['name'].split('.')[:-1])
+            else:
+                return ''.join(self.grname.split('.')[:-1])
 
     @property
     def axis_order(self):
