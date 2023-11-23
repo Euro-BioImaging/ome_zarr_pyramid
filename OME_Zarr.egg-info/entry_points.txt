@@ -1,2 +1,0 @@
-[console_scripts]
-apply_projection = src.bin.ome_zarr_run:apply_projection

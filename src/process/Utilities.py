@@ -77,7 +77,7 @@ def apply_projection(path_or_omezarr,
         arr = da.from_zarr(arr_z)
         proj = projections[projection_type](arr, axis = z_ax)
         proj_scale = tuple([scl[i] for i in range(len(scl)) if i != z_ax])
-        zmeta = {'chunks': proj.chunksize,
+        zmeta = {'chunks': newchunks,
                  'shape': proj.shape,
                  'compressor': data.compressor(),
                  'dtype': data.dtype(),
@@ -96,5 +96,8 @@ def subset():
 def split_arrays():
     pass
 
+def update_axis_order():
+    pass
 
-
+def merge_datasets():
+    pass
