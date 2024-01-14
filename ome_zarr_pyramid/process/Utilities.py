@@ -90,6 +90,13 @@ def apply_projection(pyramid: (str, Pyramid) = None,
     pyr = aspyramid(pyramid)
     if resolutions is None:
         resolutions = pyr.resolution_paths
+    elif isinstance(resolutions, int):
+        resolutions = [str(resolutions)]
+    elif isinstance(resolutions, (list, tuple)):
+        resolutions = list(resolutions)
+        for i in range(len(resolutions)):
+            if not isinstance(resolutions[i], str):
+                resolutions[i] = str(i)
     assert projection_type in projections.keys(), f'projection_type must be one of {projections.keys()}'
 
     if output_name is None:
@@ -104,6 +111,7 @@ def apply_projection(pyramid: (str, Pyramid) = None,
         newaxes = newaxes.replace(axis, '')
         newunits.pop(idx)
     oz = Pyramid()
+
     for rsl in resolutions:
         idx = pyr.axis_order.index(axis)
         scl = pyr.get_scale(rsl)
