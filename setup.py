@@ -21,7 +21,7 @@ def readme():
 requirements = parse_requirements('requirements.txt')
 
 setuptools.setup(
-    name = 'OME_Zarr',
+    name = 'ome_zarr_pyramid',
     version = '0.0.1',
     author = 'Bugra Özdemir',
     author_email = 'bugraa.ozdemir@gmail.com',
@@ -35,7 +35,7 @@ setuptools.setup(
     install_requires = requirements,
     entry_points={'console_scripts':
                       [
-                          "apply_projection = src.bin.ome_zarr_run:apply_projection",
+                          "apply_projection = ome_zarr_pyramid.bin.ome_zarr_run:apply_projection",
                       ]
                   }
     )
