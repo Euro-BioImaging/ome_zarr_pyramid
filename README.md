@@ -1,4 +1,4 @@
-# OME-Zarr
+# ome_zarr_pyramid
 
 A generalised object for OME-Zarr layout.
 
