@@ -1,5 +1,6 @@
 import zarr, warnings, copy
 from src.core import config
+from src.core import config, convenience as cnv
 import numpy as np
 
 from typing import (
@@ -120,7 +121,7 @@ class _MultiMeta(_Meta):
         scales = self.get_scale(pth)
         return {i: j for i, j  in zip(axes, scales)}
 
-    def add_axis(self, ### PLUG THIS TO THE DATASET SECTION, USE A DOWNSCALE FACTOR FOR DIFFERENT RESOLUTIONS
+    def _add_axis(self, ### PLUG THIS TO THE DATASET SECTION, USE A DOWNSCALE FACTOR FOR DIFFERENT RESOLUTIONS
                  name: str,
                  unit: str = None,
                  index: int = -1,
@@ -143,6 +144,23 @@ class _MultiMeta(_Meta):
         axis = axmake(name, unit)
         self.multimeta[0]['axes'].insert(index, axis)
 
+    def _add_axis_meta(self,
+                       axis_order,
+                       unit_list = None,
+                       # overwrite: consider adding this
+                       ):
+        if self.has_axes:
+            if len(self.multimeta[0]['axes']) > 0:
+                raise ValueError('The current axis metadata is not empty. Cannot overwrite.')
+        if unit_list is None:
+            unit_list = [None] * len(axis_order)
+        assert len(axis_order) == len(unit_list), 'Unit list and axis order must have the same length.'
+        for i, n in enumerate(axis_order):
+            self._add_axis(name = n,
+                           unit = unit_list[i],
+                           index = i
+                           )
+
     def del_axis(self,
                  name: str
                  ):
@@ -158,7 +176,8 @@ class _MultiMeta(_Meta):
     @property
     def resolution_paths(self):
         try:
-            return [item['path'] for item in self.multimeta[0]['datasets']]
+            paths = [item['path'] for item in self.multimeta[0]['datasets']]
+            return sorted(paths)
         except:
             return config.NotMultiscalesException
 
@@ -205,18 +224,18 @@ class _MultiMeta(_Meta):
             subsets[pth] = copy.deepcopy(subset)
         return subsets
 
-    def add_dataset(self,
+    def _add_dataset(self,
                     path: Union[str, int],
                     transform: Iterable[str],  ### scale values go here.
                     transform_type: str = 'scale'
-                    ):
+                    ): #TODO: Maybe put a validator at the beginning to make sure that the dataset does not already exist.
+        assert path not in self.resolution_paths, 'Path already exists.'
         dataset = {'coordinateTransformations': [{'scale': transform, 'type': transform_type}], 'path': str(path)}
         self.multimeta[0]['datasets'].append(dataset)
-        resolution_paths = [int(pth) for pth in self.resolution_paths]
-        args = np.argsort(resolution_paths)
+        args = np.argsort([int(pth) for pth in self.resolution_paths])
         self.multimeta[0]['datasets'] = [self.multimeta[0]['datasets'][i] for i in args]
 
-    def del_dataset(self,
+    def _del_dataset(self,
                     path: Union[str, int]
                     ):
         idx = self.resolution_paths.index(str(path))
@@ -259,11 +278,11 @@ class _MultiMeta(_Meta):
             pth = pth + '_rescaled'
         for idx in indices:
             scale[idx] *= scale_factor
-        self.add_dataset(pth, scale, 'scale')
+        self._add_dataset(pth, scale, 'scale')
 
     def decrement_scale(self):
         pth = self.resolution_paths[-1]
-        self.del_dataset(pth)
+        self._del_dataset(pth)
 
 
 class _ImageLabelMeta(_Meta):  # TODO: Image-label metadata will be parsed here.

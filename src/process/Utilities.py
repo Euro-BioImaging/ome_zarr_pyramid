@@ -1,6 +1,10 @@
-from src.core.Hierarchy import OMEZarr
+# from src.core.Hierarchy import OMEZarr, MultiScales
 from src.core import utils
+from src.core.Pyramid import Pyramid
+from src.core import config, convenience as cnv
 
+import itertools
+import zarr
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -24,76 +28,232 @@ from typing import (
     Optional
 )
 
-def apply_projection(path_or_omezarr,
-                     output_directory,
-                     output_name = None,
-                     resolutions: Union = 'all',
-                     along = 'z',
-                     projection_type = 'max',
-                     label_name: Union[str, None] = None
+def aspyramid(obj):
+    assert hasattr(obj, 'refpath') & hasattr(obj, 'physical_size')
+    if isinstance(obj, Pyramid):
+        return obj.copy()
+    else:
+        raise TypeError(f"Object is must be an instance of the {Pyramid} class.")
+
+def validate_pyramid_uniformity(pyramids,
+                                resolutions = 'all',
+                                axes = 'all'
+                                ):
+    """
+    Compares pyramids by the following criteria: Axis order, unit order and array shape.
+    Only the layers specified in the resolutions variable are compared.
+    """
+    full_meta = []
+    for pyramid in pyramids:
+        pyr = aspyramid(pyramid)
+        if resolutions == 'all':
+            resolutions = pyr.resolution_paths
+        else:
+            pyr.shrink(resolutions)
+        full_meta.append(pyr.array_meta)
+    indices = np.arange(len(full_meta)).tolist()
+    combinations = list(itertools.combinations(indices, 2))
+    for id1, id2 in combinations:
+        assert pyramids[id1].axis_order == pyramids[id1].axis_order, f'Axis order is not uniform in the pyramid list.'
+        assert pyramids[id1].unit_list == pyramids[id1].unit_list, f'Unit list is not uniform in the pyramid list.'
+        for pth in resolutions:
+            if axes == 'all':
+                assert full_meta[id1][pth]['shape'] == full_meta[id2][pth]['shape'], \
+                    f'If the parameter "axes" is "all", then the array shape must be uniform in all pyramids.'
+            else:
+                dims1 = [pyramids[id1].axis_order.index(it) for it in axes]
+                dims2 = [pyramids[id2].axis_order.index(it) for it in axes]
+                shape1 = [full_meta[id1][pth]['shape'][it] for it in dims1]
+                shape2 = [full_meta[id2][pth]['shape'][it] for it in dims2]
+                assert shape1 == shape2, f'The shape of the two arrays must match except for the concatenation axis.'
+    return pyramids
+
+
+########################### Wrap the I-O operations here ############################
+def io_decorator(func):
+    def perform(*args, input_path = None, output_path = None, overwrite = None, **kwargs):
+        pyr = Pyramid()
+        print(kwargs.keys())
+        if input_path is not None and output_path is not None:
+            pyr.from_zarr(input_path)
+            res = func(pyr, *args, **kwargs)
+            res.to_zarr(output_path, overwrite = overwrite)
+        else:
+            res = func(pyr, *args, **kwargs)
+        return res
+    return perform
+######################################################################################
+
+def apply_projection(pyramid: (str, Pyramid) = None,
+                     output_name: str = None,
+                     resolutions: list[str] = None,
+                     axis: str = 'z',
+                     projection_type: str = 'max',
+                     drop_singlet_axes=True,
                      ):
+    """"""
     projections = {
         'max': da.max,
         'min': da.min,
         'mean': da.mean,
-        'median': da.median
+        'median': da.median,
+        'sum': da.sum
     }
-    if hasattr(path_or_omezarr, 'grname'):
-        inputs = path_or_omezarr
-    elif isinstance(path_or_omezarr, (str, Path)):
-        inputs = OMEZarr(path_or_omezarr)
-    if not inputs.is_multiscales:
-        raise TypeError("Currently, projections can only be applied to multiscales groups.")
-    if label_name is None:
-        data = inputs
-    else:
-        assert inputs.is_label_image, f'Input is not  a label image.'
-        label_path = inputs.labels.base_attrs['labels']
-        assert label_name in label_path, f'The given label_name is not in the label path: {label_path}'
-        labels = inputs.labels
-        data = getattr(labels, label_name)
-    if resolutions == 'all':
-        resolutions = data.resolution_paths
+    pyr = aspyramid(pyramid)
+    if resolutions is None:
+        resolutions = pyr.resolution_paths
     assert projection_type in projections.keys(), f'projection_type must be one of {projections.keys()}'
-    resolutions = [str(rsl) for rsl in resolutions]
-    if output_name is None: output_name = data.identifier
-    idx = data.axis_order.index(along)
-    newshape = list(data.shape())
-    newshape.pop(idx)
-    newchunks = list(data.chunks())
-    newchunks.pop(idx)
-    axes = data.axis_order.replace(along, '')
-    units = data.unit_list
-    oz = OMEZarr(os.path.join(output_directory, f'{output_name}-{resolutions}_{projection_type}-{along}-project.ome.zarr'),
-                 shape_of_new = newshape,
-                 chunks_of_new = newchunks,
-                 axis_order = axes,
-                 unit_order= units
-                 )
-    for rsl in resolutions:
-        z_ax = data.axis_order.index(along)
-        scl = data.get_scale(rsl)
-        arr_z = data[rsl]
-        arr = da.from_zarr(arr_z)
-        proj = projections[projection_type](arr, axis = z_ax)
-        proj_scale = tuple([scl[i] for i in range(len(scl)) if i != z_ax])
-        zmeta = {'chunks': newchunks,
-                 'shape': proj.shape,
-                 'compressor': data.compressor(),
-                 'dtype': data.dtype(),
-                 'dimension_separator': data.dimension_separator()
-                 }
-        if rsl in oz.resolution_paths:
-            oz.del_dataset(rsl)
-        if along in oz.axis_order:
-            oz.del_axis(along)
-        oz.set_array(rsl, proj, scale = proj_scale, zarr_meta = zmeta)
-    # return oz
 
-def subset():
+    if output_name is None:
+        output_name = pyr.tag
+    if axis not in pyr.axis_order:
+        raise ValueError(
+            f"The projection dimension {axis} is not included in the image dimensions, which are {pyr.axis_order}")
+    idx = pyr.axis_order.index(axis)
+    newaxes = pyr.axis_order
+    newunits = pyr.unit_list
+    if drop_singlet_axes:
+        newaxes = newaxes.replace(axis, '')
+        newunits.pop(idx)
+    oz = Pyramid()
+    for rsl in resolutions:
+        idx = pyr.axis_order.index(axis)
+        scl = pyr.get_scale(rsl)
+        arr = pyr[rsl]
+        res = projections[projection_type](arr, axis=idx)
+        if drop_singlet_axes:
+            scl.pop(idx)
+        else:
+            res = da.expand_dims(res, idx)
+
+        oz.add_layer(res, rsl, scale=scl, axis_order=newaxes, unitlist=newunits,
+                     zarr_meta={'chunks': res.chunksize,
+                                'dtype': pyr.dtype,
+                                'compressor': pyr.compressor,
+                                'dimension_separator': pyr.dimension_separator}
+                     )
+
+    return oz.retag(output_name)
+
+def apply_projection_cmd(input_path: str,
+                          output_path: str,
+                          output_name: str = None,
+                          resolutions: list[str] = None,
+                          axis: str = 'z',
+                          projection_type: str = 'max',
+                          drop_singlet_axes: bool = True,
+                          overwrite: bool = False
+                          ):
+    """"""
+    pyr = Pyramid()
+    pyr.from_zarr(input_path)
+    res = apply_projection(pyr,
+                           output_name,
+                           resolutions,
+                           axis,
+                           projection_type,
+                           drop_singlet_axes
+                           )
+    res.to_zarr(output_path, overwrite = overwrite)
+    return
+
+######################################################################################
+
+def concatenate(pyramids: Iterable[Pyramid],
+                 output_name: str = None,
+                 resolutions: Union[str, list] = 'all',
+                 axis: str = 'z',
+                 ):
+    """"""
+    assert len(pyramids) > 0, f'Input list must be of length greater than 0.'
+    if axis == 'all':
+        axes = 'all'
+    else:
+        axes = ''.join([ax for ax in pyramids[0].axis_order if ax != axis])
+    pyramids = validate_pyramid_uniformity(pyramids, resolutions, axes = axes)
+    concat_layers = {}
+    for pyramid in pyramids:
+        for pth in pyramid.resolution_paths:
+            if pth not in concat_layers.keys():
+                concat_layers[pth] = []
+            concat_layers[pth].append(pyramid.layers[pth])
+    pyr = pyramids[0]
+    if resolutions == 'all':
+        resolutions = pyr.resolution_paths
+    if output_name is None:
+        output_name = pyr.tag
+    axes = pyr.axis_order
+    units = pyr.unit_list
+    idx = axes.index(axis)
+    zarr_meta = {}
+    for rsl in resolutions:
+        scl = pyr.get_scale(rsl)
+        layers = concat_layers[rsl]
+        res = da.concatenate(layers, idx, allow_unknown_chunksizes=False)
+        zmeta = {
+                 'array': res,
+                 'axis_order': axes,
+                 'unit_list': units,
+                 'scale': scl,
+                 'chunks': res.chunksize,
+                 'shape': res.shape,
+                 'compressor': pyr.compressor,
+                 'dtype': pyr.dtype,
+                 'dimension_separator': pyr.dimension_separator
+        }
+        zarr_meta[rsl] = zmeta
+    pyr = Pyramid()
+    pyr.from_dict(zarr_meta)
+    return pyr.retag(output_name)
+
+# def _collect_omezarrs(in_path,
+#                       filter_by: Union[str, None] = None
+#                       ):
+#     names = os.listdir(in_path)
+#     if filter_by is not None:
+#         paths = [os.path.join(in_path, name) for name in names if filter_by in name]
+#     else:
+#         paths = [os.path.join(in_path, name) for name in names]
+#     input_list = []
+#     for pth in paths:
+#         try:
+#             input_list.append(OMEZarr(pth))
+#         except:
+#             pass
+#     return input_list
+#
+def split_axes(pyr: Pyramid,
+               axes: str = 'zc',
+               steps: tuple = None
+               ):
+    if steps is None:
+        steps = tuple([1] * len(axes))
+    else:
+        assert len(axes) == len(steps), f'Axes and steps must be of equal length.'
+    axlens = [pyr.axislen(ax) for ax in axes]
+    slices = []
+    for ax, size, step in zip(axes, axlens, steps):
+        splitters = [(i, i+step) for i in range(0, size, step)]
+        slices.append(splitters)
+    combins = list(itertools.product(*slices))
+    subsets = []
+    for combin in combins:
+        slicer = {ax: slc for ax, slc in zip(axes, combin)}
+        subset = pyr.copy().subset(slicer)
+        subsets.append((slicer, subset))
+    # for _, sub in subsets:
+    #     print(sub.shape)
+    return subsets
+
+def split_layers():
     pass
 
-def split_arrays():
+def join_layers(pyramids: list,
+                refpath = '0'
+                ):
+    pass
+
+def subset():
     pass
 
 def update_axis_order():
@@ -101,3 +261,42 @@ def update_axis_order():
 
 def merge_datasets():
     pass
+
+
+
+
+# pyr = Pyramid()
+# # pyr.from_dict({'0': {'array': np.zeros((50, 100, 100))}})
+# pyr.from_zarr('/home/oezdemir/PycharmProjects/test_pyenv/OME_Zarr/data/filament4.zarr')
+# rescaled = pyr.copy().rescale(scale_factor = 2, resolutions = 7)
+# subset = rescaled.copy().subset({'z': (1,)})
+# subset1 = rescaled.copy().subset([(0, 1), (10, 200)]).rescale(2, resolutions = 3)
+# h = subset1 + subset1
+# subset2 = rescaled.copy().subset(0:3,10:20).rescale(2, resolutions = 3)
+
+
+# rescaled.to_zarr('/home/oezdemir/PycharmProjects/test_pyenv/OME_Zarr/data/rescaled1.zarr')
+# rescaled1 = pyr.rescale(scale_factor = 1.5, resolutions = 3)
+# rescaled2 =  pyr.rescale(scale_factor = 3, resolutions = 3)
+
+
+# pyr._array_meta_['0']['compressor'] = pyr.layers['0']._meta['compressor']
+
+# basepath1 = 'OME_Zarr/data/filament3.zarr'
+# respath1 =  'OME_Zarr/data/res3.zarr'
+# #
+# pyr = Pyramid()
+# pyr.from_zarr(basepath1)
+# pyr.rechunk((12, 36, 72))
+# pyr.rechunk((30, 100, 100))
+# pyr.to_zarr(respath1, True)
+#
+# pyr2 = pyr + pyr
+# pyr3 = pyr - pyr
+#
+# np.sum(pyr[0]).compute()
+# np.sum(pyr2[0]).compute()
+# np.sum(pyr3[0]).compute()
+#
+# pyr.mean('1')
+# pyr2.mean('1')

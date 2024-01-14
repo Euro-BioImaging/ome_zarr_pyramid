@@ -8,7 +8,7 @@ from skimage.transform import resize as skresize
 from rechunker import rechunk
 from src.core import config, utils
 from src.core.MetaData import _Meta, _MultiMeta, _ImageLabelMeta
-from src.core.OMEZarrCore import ZarrayCore, ZarrayManipulations
+from src.core.Pyramid import Pyramid
 
 from typing import (
     Union,
@@ -19,22 +19,6 @@ from typing import (
     List,
     Optional
 )
-
-""" 
-
-OME-Zarr components:
-
-Voxel: anything that has hierarchy of multi-resolution layers of pixel/voxel data. Must contain multiscales metadata. 
-
-LabelVoxel: an instance of Voxel that additionally has image-label metadata. Inherits Voxel
-
-Multiseries: a collection of multiple Voxel instances. Validated by having more than one Voxel instance in the path.
-
-MultiseriesGeneric: a collection of multiple Voxel instances, along with specified paths in the metadata. Inherits Multiseries.
-
-MultiseriesLabel: a collection of multiple LabelVoxel instances. Must contain label paths metadata. Inherits MultiseriesGeneric.
-
-"""
 
 class Input(zarr.Group):
     def __init__(self,
@@ -134,90 +118,40 @@ class HierarchyValidator(_Meta):
     def is_undefined_multiscales(self):
         return self.is_multiscales and not self.is_image and not self.is_label_image
 
-
-class DataMovement:
-    """ Template methods to extract or move subsets of data """
-    def extract(self,
-                newdir: str = None,
-                paths: Iterable = None,
-                subset: Union[dict, None] = None,
-                include_subdirs: bool = False,
-                overwrite: bool = True,
-                zarr_meta: Union[Dict, None] = None
-                ): # TODO: apply the _rebase method to selected multiscales paths in the omezarr.
-        subdirs, subdirs_rel = [self.grname], ['']
-        if include_subdirs:
-            subdirs = self.zarr_paths; subdirs_rel = self.zarr_paths_rel
-        for key, relkey in zip(subdirs, subdirs_rel):
-            gr = self.grs[key]
-            newpath = os.path.join(newdir, relkey)
-            if gr.is_multiscales:
-                print(f"zarr path is {newpath}")
-                subset_copy = copy.deepcopy(subset)
-                print(f"subset being passed to _extract is {subset_copy}")
-                gr._extract(newpath, paths, subset_copy, overwrite, zarr_meta)
-            elif gr.is_true_collection:
-                grp = zarr.group(newpath)
-                print(newpath)
-                for key, value in gr.attrs.items():
-                    print(key, value)
-                    grp.attrs[key] = value
-    def rebase(self,
-               newdir: str = None,
-               paths: Iterable = None,
-               subset: Union[dict, None] = None,
-               include_subdirs = False,
-               overwrite: bool = True,
-               zarr_meta: Union[Dict, None] = None
-               ):
-        self.extract(newdir, paths, subset, include_subdirs, overwrite, zarr_meta)
-        self.grs = {}
-        self.__init__(newdir)
-    def export_roi(self,
-                   label_no: int = None,
-                   bounding_box: Union[Iterable[slice], Iterable[tuple]] = None
-                   ): # TODO: Burada dikkat et, dict de alabilirsin bu parametreyi.
-        pass
-
 #########################################################################################################################################################
 # TODO:################################# Type-specific readers. Add specific metadata parsers to these classes ##########################################
 #########################################################################################################################################################
 
-class BaseReader(Input, HierarchyValidator, DataMovement):
+class BaseReader(Input, HierarchyValidator):
     def __init__(self,
                  gr_or_path: Union[str, Path]
                  ):
         Input.__init__(self, gr_or_path)
 
-class MultiScales(BaseReader, ZarrayManipulations, DataMovement):
+class MultiScales(BaseReader, Pyramid):
     def __init__(self,
                  gr_or_path: Union[str, Path]
                  ):
         BaseReader.__init__(self, gr_or_path)
-        ZarrayCore.__init__(self)
-    @property
-    def layers(self):
-        return dict(self.arrays())
+        Pyramid.__init__(self)
+        self.from_zarr(self.grpath)
     def rebase_multiscales(self, newpath): # TODO: this method is not clear.
         BaseReader.__init__(self, newpath)
-        ZarrayCore.__init__(self)
+        Pyramid.__init__(self)
 
-
-class Hybrid(BaseReader, ZarrayManipulations, DataMovement):
+class Hybrid(BaseReader, Pyramid):
     def __init__(self,
                  gr_or_path: Union[str, Path]
                  ):
         BaseReader.__init__(self, gr_or_path)
-        ZarrayCore.__init__(self)
+        Pyramid.__init__(self)
         self._collect_group_paths()
         self._collect_groups()
+        self.from_zarr(self.grpath)
 
-    @property
-    def layers(self):
-        return dict(self.arrays())
     def rebase_multiscales(self, newpath): # TODO: this method is not clear. Fix it.
         BaseReader.__init__(self, newpath)
-        ZarrayCore.__init__(self)
+        Pyramid.__init__(self)
     def _collect_group_paths(self,
                               ):
         self.zarr_paths_abs = []
@@ -263,7 +197,7 @@ class Hybrid(BaseReader, ZarrayManipulations, DataMovement):
             if len(rpth) > 0:
                 self.sub[rpth] = grp
 
-class Collection(BaseReader, DataMovement):
+class Collection(BaseReader):
     def __init__(self,
                  gr_or_path: Union[str, Path]
                  ):
@@ -319,96 +253,19 @@ class Collection(BaseReader, DataMovement):
 #########################################################################################################################################################
 #########################################################################################################################################################
 
-class OMEZarrSample:
-    def __init__(self,
-                 pth: Union[str, Path],
-                 ):
-        grp = zarr.open_group(pth, mode = 'a')
-        grp.attrs['multiscales'] = [{'axes': [],
-                                     'datasets': [],
-                                     'name': "/"
-                                     }]
-        self.grp = grp
-        self.store = self.grp.store
-        self.resolution_paths = []
-    @property
-    def multimeta(self):
-        return self.grp.attrs['multiscales']
-    def add_dataset(self,
-                    array_shape,
-                    path: Union[str, int],
-                    scale: Iterable[str],  ### scale values go here.
-                    transform_type: str = 'scale',
-                    chunks=(96, 96, 96),
-                    ):
-        self.resolution_paths.append(path)
-        transform = [scale] * len(array_shape)
-        dataset = {'coordinateTransformations': [{'scale': transform, 'type': transform_type}], 'path': str(path)}
-        self.multimeta[0]['datasets'].append(dataset)
-        resolution_paths = [int(pth) for pth in self.resolution_paths]
-        args = np.argsort(resolution_paths)
-        self.multimeta[0]['datasets'] = [self.multimeta[0]['datasets'][i] for i in args]
-        self.grp.attrs['multiscales'] = self.multimeta
-        ################
-        array = zarr.zeros(array_shape, chunks = chunks)
-        self.grp.create_dataset(name = str(path), data = array)
-    def add_datasets(self,
-                     num_arrpaths = 3,
-                     top_shape = (300, 300, 300),
-                     chunks = (100, 100, 100),
-                     axes = 'zyx',
-                     units = ['micrometer'] * 3
-                     ):
-        self.specify_axes(axes = axes, units = units)
-        self.scales = [(2 ** i) for i in range(num_arrpaths)]
-        self.shapes = [np.array(top_shape) // item for item in self.scales]
-        for i, shape in enumerate(self.shapes):
-            self.add_dataset(shape,
-                             path = f'{i}',
-                             scale = self.scales[i],
-                             chunks = chunks
-                             )
-    def specify_axes(self,
-                     axes: str = 'zyx',
-                     units: Iterable = ['micrometer'] * 3
-                     ):
-        self.axis_order = axes
-        self.unit_order = units
-        print(f'look: {self.unit_order}')
-        self.grp.attrs['multiscales'][0]['axes'] = [{"name": n, "type": config.type_map[n], "unit": u} for n, u in zip(self.axis_order, self.unit_order)]
-
-class OMEZarr(Hybrid, DataMovement): ### TODO: Bunun repr methodunu olustur.
+class OMEZarr(Hybrid): ### TODO: Bunun repr methodunu olustur.
     def __init__(self,
                  gr_or_path,
-                 shape_of_new: Union[Iterable, None] = (500, 500, 500),
-                 chunks_of_new: Union[Iterable, None] = (96, 96, 96),
-                 axis_order = 'zyx',
-                 unit_order = ['micrometer'] * 3
                  ):
         self._grstore = None
         self.set_input(gr_or_path)
-        if self.path_has_group():
-            self.read()
-        else:
-            self.new(shape = shape_of_new, chunks = chunks_of_new, axis_order = axis_order, unit_order = unit_order)
+        self.read()
     def set_input(self, gr_or_path):
         if isinstance(gr_or_path, (str, Path, zarr.Group)):
             self.gr_or_path = gr_or_path
         else:
             raise TypeError(f"The input must be either of the types: {str, Path, zarr.Group}")
-    @property
-    def grstore(self):
-        if isinstance(self.gr_or_path, (str, Path)):
-            self._grstore = zarr.DirectoryStore(self.gr_or_path)
-        elif isinstance(self.gr_or_path, zarr.Group):
-            self._grstore = self.gr_or_path.store
-        if self._grstore is None:
-            raise TypeError(f"The input must be either of the types: {str, Path, zarr.Group}")
-        return self._grstore
-    def path_has_group(self):
-        return zarr.storage.contains_group(self.grstore)
     def read(self):
-        assert self.path_has_group(), "Path does not contain a zarr group."
         data = BaseReader(self.gr_or_path)
         self.non_resolved = False
         if data.is_hybrid_collection:
@@ -422,17 +279,16 @@ class OMEZarr(Hybrid, DataMovement): ### TODO: Bunun repr methodunu olustur.
             MultiScales.__init__(self, self.gr_or_path)
         else:
             raise TypeError('Type of the OME-Zarr could not be resolved.')
-    def new(self,
-            num_arrpaths: int = 1,
-            shape: Iterable = (500, 500, 500),
-            chunks: Iterable = (96, 96, 96),
-            axis_order: str = 'zyx',
-            unit_order: Union[Iterable, None] = None
-            ):
-        ozs = OMEZarrSample(self.gr_or_path)
-        ozs.add_datasets(num_arrpaths = num_arrpaths, top_shape = shape, chunks = chunks, axes = axis_order, units = unit_order)
-        self.set_input(ozs.grp)
-        self.read()
-        # MultiScales.__init__(self, ozs.store.path)
+    # def new(self,
+    #         num_arrpaths: int = 1,
+    #         shape: Iterable = (500, 500, 500),
+    #         chunks: Iterable = (96, 96, 96),
+    #         axis_order: str = 'zyx',
+    #         unit_order: Union[Iterable, None] = None
+    #         ):
+    #     ozs = OMEZarrSample(self.gr_or_path)
+    #     ozs.add_datasets(num_arrpaths = num_arrpaths, top_shape = shape, chunks = chunks, axes = axis_order, units = unit_order)
+    #     self.set_input(ozs.grp)
+    #     self.read()
 
 
