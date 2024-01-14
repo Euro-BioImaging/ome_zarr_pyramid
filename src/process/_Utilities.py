@@ -69,6 +69,19 @@ def validate_pyramid_uniformity(pyramids,
     return pyramids
 
 
+########################### Wrap the I-O operations here ############################
+def io_decorator(func):
+    def perform(*args, input_path = None, output_path = None, overwrite = None, **kwargs):
+        pyr = Pyramid()
+        print(kwargs.keys())
+        if input_path is not None and output_path is not None:
+            pyr.from_zarr(input_path)
+            res = func(pyr, *args, **kwargs)
+            res.to_zarr(output_path, overwrite = overwrite)
+        else:
+            res = func(pyr, *args, **kwargs)
+        return res
+    return perform
 ######################################################################################
 
 def apply_projection(pyramid: (str, Pyramid) = None,
