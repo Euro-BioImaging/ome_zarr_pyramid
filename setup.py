@@ -35,7 +35,7 @@ setuptools.setup(
     install_requires = requirements,
     entry_points={'console_scripts':
                       [
-                          "apply_projection = ome_zarr_pyramid.bin.ome_zarr_run:apply_projection",
+                          "apply_projection = ome_zarr_pyramid.bin.runners:apply_projection",
                       ]
                   }
     )
