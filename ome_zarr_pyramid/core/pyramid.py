@@ -7,7 +7,7 @@ from dask import array as da
 from dask_image import ndmorph, ndinterp, ndfilters
 import s3fs
 from skimage.transform import resize as skresize
-from rechunker import rechunk
+# from rechunker import rechunk
 from ome_zarr_pyramid.core import config, convenience as cnv
 from numcodecs import Blosc
 
