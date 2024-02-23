@@ -13,7 +13,7 @@ import s3fs
 from skimage.transform import resize as skresize
 from skimage import measure
 import numcodecs
-from rechunker import rechunk
+# from rechunker import rechunk
 import shutil, tempfile
 
 from typing import (
