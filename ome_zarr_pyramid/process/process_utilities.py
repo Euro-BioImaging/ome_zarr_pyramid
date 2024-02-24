@@ -3,7 +3,6 @@ import warnings
 
 from ome_zarr_pyramid.core.pyramid import Pyramid
 from ome_zarr_pyramid.core import config, convenience as cnv
-from ome_zarr_pyramid.process.parameter_control import FilterParams, BaseParams, aspyramid
 
 import itertools
 import zarr
@@ -20,6 +19,14 @@ import dask_image.dispatch
 import dask_image.ndmeasure as ndmeasure
 import dask
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
+
+def aspyramid(obj):
+    print(obj)
+    assert hasattr(obj, 'refpath') & hasattr(obj, 'physical_size')
+    if isinstance(obj, Pyramid):
+        return obj.copy()
+    else:
+        raise TypeError(f"Object is must be an instance of the {Pyramid} class.")
 
 def validate_pyramid_uniformity(pyramids,
                                 resolutions = 'all',
@@ -53,49 +60,3 @@ def validate_pyramid_uniformity(pyramids,
                 shape2 = [full_meta[id2][pth]['shape'][it] for it in dims2]
                 assert shape1 == shape2, f'The shape of the two arrays must match except for the concatenation axis.'
     return pyramids
-
-class ArrayManipulation:
-    def __init__(self,
-                 input: Pyramid = None,
-                 resolutions: list[str] = None,
-                 drop_singlet_axes: bool = True,
-                 output_name: str = 'nomen',
-                 **kwargs
-                 ):
-        self.set_input(input, resolutions, drop_singlet_axes, output_name)
-        # super().__setattr__("base_params", base_params)
-        # self.run_cycle(**base_params._params, **kwargs)
-    @property
-    def input(self):
-        return self._base_params.input
-    def set_input(self,
-                  input: Pyramid = None,
-                  resolutions: list[str] = None,
-                  drop_singlet_axes: bool = True,
-                  output_name: str = 'nomen'
-                  ):
-        base_params = BaseParams(input, resolutions, drop_singlet_axes, output_name)
-        super().__setattr__("_base_params", base_params)
-    def run(self, **kwargs):
-        super().__setattr__("output", self.input.copy())
-        print(f"No function selected.")
-    def get_output(self):
-        if self._base_params.drop_singlet_axes:
-            self.output.drop_singlet_axes()
-        self.output.retag(self._base_params.output_name)
-        return self.output
-    def run_cycle(self,
-                  **kwargs
-                  ):
-        func_kwargs = {}
-        for key, value in kwargs.items():
-            print(self._base_params._params.keys())
-            if key in self._base_params._params.keys():
-                self._base_params._update_param(key, value)
-            else:
-                func_kwargs[key] = value
-        # func_kwargs = {key: value for key in kwargs.keys() if key not in self.base_params.keys()}
-        self.run(**func_kwargs)
-        self.get_output()
-        print("One cycle run.")
-

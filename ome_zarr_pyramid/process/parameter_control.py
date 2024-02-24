@@ -3,24 +3,15 @@ import warnings
 
 from ome_zarr_pyramid.core.pyramid import Pyramid
 from ome_zarr_pyramid.core import config, convenience as cnv
-from ome_zarr_pyramid.process import process_utilities as utils
+from ome_zarr_pyramid.process import process_utilities as putils
 
 import itertools
 import inspect
 import importlib
 import zarr
-import pandas as pd
-from pathlib import Path
 import numpy as np
-import dask.array as da
-import dask.bag as db
 import os, copy
 import numcodecs
-import dask_image.ndfilters
-import dask_image.ndmorph
-import dask_image.dispatch
-import dask_image.ndmeasure as ndmeasure
-import dask
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 
 def get_functions_with_params(module_name):
@@ -40,14 +31,6 @@ def get_functions_with_params(module_name):
             pass
     return functions
 
-def aspyramid(obj):
-    print(obj)
-    assert hasattr(obj, 'refpath') & hasattr(obj, 'physical_size')
-    if isinstance(obj, Pyramid):
-        return obj.copy()
-    else:
-        raise TypeError(f"Object is must be an instance of the {Pyramid} class.")
-
 class BaseParams:
     def __init__(self,
                  input: Pyramid = None,
@@ -55,13 +38,13 @@ class BaseParams:
                  drop_singlet_axes: bool = True,
                  output_name: str = 'nomen'
                  ):
-        input = aspyramid(input)
+        input = putils.aspyramid(input)
         if output_name is None:
             output_name = input.tag
         if resolutions is None:
             resolutions = input.resolution_paths
         base_params = {'input': input,
-                       'resolutions': resolutions,
+                       'resolutions': [cnv.asstr(rsl) for rsl in resolutions],
                        'drop_singlet_axes': drop_singlet_axes,
                        'output_name': output_name
                        }
