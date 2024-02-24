@@ -7,7 +7,7 @@ from dask import array as da
 from dask_image import ndmorph, ndinterp, ndfilters
 import s3fs
 from skimage.transform import resize as skresize
-# from rechunker import rechunk
+from rechunker import rechunk
 from ome_zarr_pyramid.core import config, convenience as cnv
 from numcodecs import Blosc
 
@@ -193,6 +193,7 @@ class Multimeta: ### Unify with ImageLabelMeta
     def get_scale(self,
                   pth: Union[str, int]
                   ):
+        pth = cnv.asstr(pth)
         idx = self.resolution_paths.index(pth)
         return self.multimeta[0]['datasets'][idx]['coordinateTransformations'][0]['scale']
 
@@ -946,10 +947,11 @@ class Pyramid(Multimeta, Operations):
                 self._arrays[pth] = layer
 
     def _add_layer(self,
-                   pth: str,
+                   pth: (str, int),
                    zarr_meta: dict = None # essential for overriding existing array metadata
                    ):
         """Add new array_meta to specific path."""
+        pth = cnv.asstr(pth)
         assert pth in self.resolution_paths, f'Path {pth} does not exist in the current path list. First use add_layer method.'
         # if zarr_meta is None:
         #     assert isinstance(self.layers[pth], zarr.Array), f'If input is not a zarr.Array, then the zarr_meta must be provided.'
@@ -957,7 +959,7 @@ class Pyramid(Multimeta, Operations):
         for metakey in arrmeta_keys:
             if isinstance(self.layers[pth], zarr.Array):
                 if metakey in self.layers[pth]._meta:
-                    print(self.layers[pth])
+                    # print(self.layers[pth])
                     if metakey == 'compressor':
                         self.array_meta[pth][metakey] = self.layers[pth].compressor
                     else:
