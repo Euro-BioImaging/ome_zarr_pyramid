@@ -1,5 +1,5 @@
 import fire
-from ome_zarr_pyramid.process import array_manipulation as manip
+from ome_zarr_pyramid.process import image_operations as imop
 
 # def _SeparateFlagArgs(args):
 #     try:
@@ -14,5 +14,5 @@ from ome_zarr_pyramid.process import array_manipulation as manip
 # fire.core.parser.SeparateFlagArgs = _SeparateFlagArgs
 
 def apply_projection():
-    _ = fire.Fire(manip.apply_projection_cmd)
+    _ = fire.Fire(imop.apply_projection_cmd)
 

@@ -13,7 +13,7 @@ import s3fs
 from skimage.transform import resize as skresize
 from skimage import measure
 import numcodecs
-from rechunker import rechunk
+# from rechunker import rechunk
 import shutil, tempfile
 
 from typing import (
@@ -25,6 +25,14 @@ from typing import (
     List,
     Optional
 )
+
+def asstr(s):
+    if isinstance(s, str):
+        return s
+    elif isinstance(s, int):
+        return str(s)
+    else:
+        raise TypeError(f"Input must be either of types {str, int}")
 
 def asdask(data, chunks = 'auto'):
     assert isinstance(data, (da.Array, zarr.Array, np.ndarray)), f'data must be of type: {da.Array, zarr.Array, np.ndarray}'

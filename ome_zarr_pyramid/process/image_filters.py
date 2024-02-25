@@ -3,7 +3,8 @@ import warnings
 
 from ome_zarr_pyramid.core.pyramid import Pyramid
 from ome_zarr_pyramid.core import config, convenience as cnv
-from ome_zarr_pyramid.process import process_utilities as utils
+from ome_zarr_pyramid.process import process_utilities as pputils
+from ome_zarr_pyramid.process.process_core import BaseProtocol
 from ome_zarr_pyramid.process.parameter_control import FilterParams, BaseParams
 
 import itertools
@@ -25,7 +26,7 @@ import dask
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from functools import wraps
 
-################################### UTILITIES #########################################
+################################### MODULE UTILITIES ######################################
 
 def apply_to_pyramid(pyr,
                      resolutions,
@@ -68,7 +69,7 @@ def get_functions_with_params(module_name):
             pass
     return functions
 
-################################### CLASSES ############################################
+################################### MODULE CLASSES ########################################
 
 class _ImageFilters:
     def __init__(self,
@@ -96,14 +97,14 @@ class _ImageFilters:
         filter = getattr(dask_image.ndfilters, self.filter_name)
         return filter(*args, **kwargs)
 
-class ImageFilters(utils.ArrayManipulation, _ImageFilters):
+class ImageFilters(BaseProtocol, _ImageFilters):
     def __init__(self,
                  *args,
                  filter_name: str = "gaussian",
                  **kwargs
                  ):
             _ImageFilters.__init__(self, filter_name=filter_name, **kwargs)
-            utils.ArrayManipulation.__init__(self, *args, **kwargs)
+            BaseProtocol.__init__(self, *args, **kwargs)
     @property
     def base_params(self):
         return self._base_params._params
@@ -112,6 +113,11 @@ class ImageFilters(utils.ArrayManipulation, _ImageFilters):
                      value
                      ): ### TODO!!!
         pass
+    def update_filter(self,
+                      filter_name,
+                      **kwargs
+                      ): ### TODO!!!
+        pass
     def run(self, **kwargs):
         for key, value in kwargs.items():
             if key not in self.filter_params.keys():
@@ -119,12 +125,6 @@ class ImageFilters(utils.ArrayManipulation, _ImageFilters):
                 print(f"The defined parameters are: {self.filter_params}")
             elif value != self.filter_params[key]:
                 self._filter_params._update_param(key, value)
-        # for key, value in self.filter_params.items():
-        #     if key == "image":
-        #         pass
-        #     else:
-        #         if value is None:
-        #             raise ValueError(f"The value for the parameter {key} cannot be None.")
         output = apply_to_pyramid(self.input, self._base_params.resolutions, self.filter, self.filter_params)
         super().__setattr__("output", output)
 
@@ -144,6 +144,8 @@ class ImageFilters(utils.ArrayManipulation, _ImageFilters):
 #     if "write_to" in kwargs.keys():
 #         output.to_zarr(kwargs["write_to"])
 #     return output
+
+#### MAYBE SEPARATE THE WRAPPED FUNCTIONS BELOW TO A DIFFERENT MODULE AND TURN THIS MODULE INTO A BASE_FILTERS MODULE
 
 def filter_wrapper(filter_name):
     def decorator(func):
@@ -180,34 +182,33 @@ def median_filter(pyr_or_path, **kwargs):
     pass
 
 #
-cpath = f"/home/oezdemir/PycharmProjects/test_pyenv/data/astronaut_channel_0.zarr"
-oz = Pyramid()
-oz.from_zarr(cpath)
-res = gaussian_laplace(oz, sigma = (0.2, 1, 1))
-
+# cpath = f"/home/oezdemir/PycharmProjects/test_pyenv/data/astronaut_channel_0.zarr"
+# oz = Pyramid()
+# oz.from_zarr(cpath)
+# res = gaussian_laplace(oz, sigma = (0.2, 1, 1))
+#
 
 # h = BaseParams(oz, ['0'], True, 'nomen')
 
 # imfilt = ImageFilters(oz, resolutions = ['0'], filter_name="gaussian", output_name = 'nomen2', sigma = (0.2, 2, 2))
 # hh = imfilt._filter_collection
+# dir(imfilt)
 # imfilt.run_cycle(output_name = 'whatever', sigma = (0.2, 1, 1))
 # dir(imfilt._base_params)
-# # imfilt.filter_name = "gaussian"
+# imfilt.filter_name = "median"
 # imfilt.sigma = 2
-
-
 
 # bpath = f"/home/oezdemir/PycharmProjects/test_pyenv/data/filament.zarr"
 
 # boz = Pyramid()
 # boz.from_zarr(cpath)
 #
-# h = utils.ArrayManipulation(oz, resolutions = ['0', '1'])
+# h = BaseProtocol(oz, resolutions = ['0', '1'])
 # h.filter_name = None
 # h = oz.copy()
-# utils.aspyramid(oz)
+# putils.aspyramid(oz)
 
-# imfilt = utils.ArrayManipulation(oz, resolutions = ['0'], filter_name="gaussian", sigma = (0.2, 2, 2))
+# imfilt = BaseProtocol(oz, resolutions = ['0'], filter_name="gaussian", sigma = (0.2, 2, 2))
 
 # imfilt = ImageFilters(oz, resolutions = ['0'], filter_name="gaussian", sigma = (0.2, 2, 2))
 # imfilt.sigma = 2

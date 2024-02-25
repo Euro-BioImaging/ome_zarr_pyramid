@@ -60,57 +60,57 @@ def validate_pyramid_uniformity(pyramids,
                 shape2 = [full_meta[id2][pth]['shape'][it] for it in dims2]
                 assert shape1 == shape2, f'The shape of the two arrays must match except for the concatenation axis.'
     return pyramids
-
-class ArrayManipulation:
-    def __init__(self,
-                 pyr: Pyramid = None,
-                 resolutions: list[str] = None,
-                 drop_singlet_axes: bool = True,
-                 output_name: str = 'nomen',
-                 **kwargs
-                 ):
-        self.params = kwargs
-        if pyr is None:
-            warnings.warn(f"The input object is not of type Pyramid.")
-        else:
-            self.set_input(pyr, resolutions, drop_singlet_axes, output_name)
-        self.run(**kwargs)
-        self.get_output()
-        print("One cycle run.")
-    def __setattr__(self,
-                    key,
-                    value
-                    ):
-        setattr(self, key, value)
-        self.__init__(self.pyr,
-                      self.resolutions,
-                      self.drop_singlet_axes,
-                      self.output_name,
-                      **self.params
-                      )
-
-    def set_input(self,
-                  pyr: Pyramid = None,
-                  resolutions: list[str] = None,
-                  drop_singlet_axes: bool = True,
-                  output_name: str = 'nomen'
-                  ):
-        self.pyr = aspyramid(pyr)
-        if output_name is None:
-            output_name = self.pyr.tag
-        self.output_name = output_name
-        if resolutions is None:
-            resolutions = self.pyr.resolution_paths
-        self.resolutions = resolutions
-        self.drop_singlet_axes = drop_singlet_axes
-    def run(self, **kwargs):
-        print(f"No function selected.")
-    def get_output(self):
-        if self.drop_singlet_axes:
-            self.pyr.drop_singlet_axes()
-        self.pyr.retag(self.output_name)
-        return self.pyr
-
+#
+# class ArrayManipulation:
+#     def __init__(self,
+#                  pyr: Pyramid = None,
+#                  resolutions: list[str] = None,
+#                  drop_singlet_axes: bool = True,
+#                  output_name: str = 'nomen',
+#                  **kwargs
+#                  ):
+#         self.params = kwargs
+#         if pyr is None:
+#             warnings.warn(f"The input object is not of type Pyramid.")
+#         else:
+#             self.set_input(pyr, resolutions, drop_singlet_axes, output_name)
+#         self.run(**kwargs)
+#         self.get_output()
+#         print("One cycle run.")
+#     def __setattr__(self,
+#                     key,
+#                     value
+#                     ):
+#         setattr(self, key, value)
+#         self.__init__(self.pyr,
+#                       self.resolutions,
+#                       self.drop_singlet_axes,
+#                       self.output_name,
+#                       **self.params
+#                       )
+#
+#     def set_input(self,
+#                   pyr: Pyramid = None,
+#                   resolutions: list[str] = None,
+#                   drop_singlet_axes: bool = True,
+#                   output_name: str = 'nomen'
+#                   ):
+#         self.pyr = aspyramid(pyr)
+#         if output_name is None:
+#             output_name = self.pyr.tag
+#         self.output_name = output_name
+#         if resolutions is None:
+#             resolutions = self.pyr.resolution_paths
+#         self.resolutions = resolutions
+#         self.drop_singlet_axes = drop_singlet_axes
+#     def run(self, **kwargs):
+#         print(f"No function selected.")
+#     def get_output(self):
+#         if self.drop_singlet_axes:
+#             self.pyr.drop_singlet_axes()
+#         self.pyr.retag(self.output_name)
+#         return self.pyr
+#
 
 
 
