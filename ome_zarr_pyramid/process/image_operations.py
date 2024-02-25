@@ -74,6 +74,17 @@ class ApplyProjection(BaseProtocol):
 
 
 ######################################################################################
+# TODO: Make operations similar to filters
+class _ImageOperations:
+    pass
+
+class ImageOperations(BaseProtocol, _ImageOperations):
+    def run(self):
+        pass
+
+
+
+######################################################################################
 
 def apply_projection_cmd(input_path: str,
                           output_path: str,

@@ -1008,6 +1008,7 @@ class Pyramid(Multimeta, Operations):
                   unitlist: str = None
                   ):
         """Depends on the _add_dataset method. Helps update the array_meta"""
+        pth = cnv.asstr(pth)
         assert isinstance(arr, (da.Array, zarr.Array, np.ndarray)), f'Input array must be either of types zarr.Array, dask.array.Array, numpy.ndarray'
         if not self.has_axes:
             if axis_order is None:
