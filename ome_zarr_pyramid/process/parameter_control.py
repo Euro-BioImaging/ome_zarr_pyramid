@@ -4,6 +4,7 @@ import warnings
 from ome_zarr_pyramid.core.pyramid import Pyramid
 from ome_zarr_pyramid.core import config, convenience as cnv
 from ome_zarr_pyramid.process import process_utilities as putils
+from ome_zarr_pyramid.process import custom_operations
 
 import itertools
 import inspect
@@ -33,18 +34,18 @@ def get_functions_with_params(module_name):
 
 class BaseParams:
     def __init__(self,
-                 input: Pyramid = None,
-                 resolutions: list[str] = None,
-                 drop_singlet_axes: bool = True,
-                 output_name: str = 'nomen'
+                 #input: Pyramid = None,
+                 resolutions: int = None,
+                 drop_singlet_axes: bool = None,
+                 output_name: str = None
                  ):
-        input = putils.aspyramid(input)
-        if output_name is None:
-            output_name = input.tag
-        if resolutions is None:
-            resolutions = input.resolution_paths
-        base_params = {'input': input,
-                       'resolutions': [cnv.asstr(rsl) for rsl in resolutions],
+        # input = putils.aspyramid(input)
+        # if output_name is None:
+        #     output_name = input.tag
+        # if resolutions is None:
+        #     resolutions = input.resolution_paths
+        base_params = {#'input': input,
+                       'resolutions': resolutions,
                        'drop_singlet_axes': drop_singlet_axes,
                        'output_name': output_name
                        }
@@ -99,10 +100,54 @@ class FilterParams:
         raise ValueError("Parameters cannot be updated by assignment.")
 
 
+class OperationParams:
+    def __init__(self,
+                 module_name,
+                 filter_name,
+                 **kwargs
+                 ):
+
+        module_map = {
+            'dask': "ome_zarr_pyramid.process.custom_operations",
+            'dask_ndfilters': 'dask_image.ndfilters'
+        }
+        super().__setattr__("_module_map", module_map)
+        super().__setattr__("_module_name", module_name)
+        super().__setattr__("_module_path", self._module_map[module_name])
+        meta = get_functions_with_params(self._module_map[module_name])
+        super().__setattr__("_meta", meta)
+        self._set_filter(filter_name)
+        for key, value in kwargs.items():
+            if key in self._params.keys():
+                self._update_param(key, value)
+    def _set_filter(self,
+                    filter_name
+                    ):
+        filter_params = copy.deepcopy(self._meta[filter_name])
+        super().__setattr__("_filter_name", filter_name)
+        super().__setattr__("_params", filter_params)
+        for key, value in filter_params.items():
+            super().__setattr__(key, value)
+    def _update_param(self,
+                      name,
+                      value
+                      ):
+        if name not in self._params.keys():
+            raise ValueError(f"The parameter {name} is not defined for the filter {self._filter_name}")
+        self._params[name] = value
+        super().__setattr__(name, value)
+    def __setattr__(self,
+                    key,
+                    value
+                    ):
+        raise ValueError("Parameters cannot be updated by assignment.")
+
 # bp = BaseParams()
 # bp._params
 # fp = FilterParams("gaussian")
 # fp._params
+
+# op = OperationParams('projection')
 
 # pc = FilterParams("gaussian")
 # pc._update_param("sigma", 2)

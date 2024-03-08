@@ -2,6 +2,9 @@ s3fs
 numpy
 scikit-image
 zarr
+dask
 dask-image
 matplotlib
+rechunker
 fire
+

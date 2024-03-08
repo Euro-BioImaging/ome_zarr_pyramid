@@ -60,3 +60,5 @@ def validate_pyramid_uniformity(pyramids,
                 shape2 = [full_meta[id2][pth]['shape'][it] for it in dims2]
                 assert shape1 == shape2, f'The shape of the two arrays must match except for the concatenation axis.'
     return pyramids
+
+
