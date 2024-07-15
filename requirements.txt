@@ -1,7 +1,1 @@
 s3fs
-numpy
-scikit-image
-zarr
-dask-image
-matplotlib
-fire

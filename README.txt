@@ -1,1 +1,1 @@
-A command line tool to perform basic operations such as reading, writing and autothresholding OME-Zarr data.
+A command line tool to perform basic operations such as reading, writing and filtering OME-Zarr data.
