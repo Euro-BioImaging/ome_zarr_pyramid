@@ -4,12 +4,10 @@
 """
 
 import setuptools
-from ome_zarr_pyramid.process import image_filters as imfilt
-from ome_zarr_pyramid.process.parameter_control import get_functions_with_params
+# from ome_zarr_pyramid.process.process_utilities import get_functions_with_params
 
 # with open("README.md", "r", encoding="utf-8") as fh:
 #     long_description = fh.read()
-
 
 def parse_requirements(filename):
     with open(filename, encoding='utf-8') as fid:
@@ -22,13 +20,9 @@ def readme():
 
 requirements = parse_requirements('requirements.txt')
 
-func_location = f"ome_zarr_pyramid.bin.runners"
-functions = get_functions_with_params(func_location)
-scripts = [f"{func_name} = {func_location}:{func_name}" for func_name in functions]
-
 setuptools.setup(
     name = 'ome_zarr_pyramid',
-    version = '0.0.2',
+    version = '0.0.3',
     author = 'Bugra Özdemir',
     author_email = 'bugraa.ozdemir@gmail.com',
     description = 'A package for reading, writing and processing OME-Zarr datasets',
@@ -39,6 +33,12 @@ setuptools.setup(
     packages = setuptools.find_packages(),
     include_package_data=True,
     install_requires = requirements,
-    entry_points={'console_scripts': scripts
+    entry_points={'console_scripts': [
+                                      "operations = ome_zarr_pyramid.bin.runners:operations",
+                                      "filters = ome_zarr_pyramid.bin.runners:filters",
+                                      "threshold = ome_zarr_pyramid.bin.runners:threshold",
+                                      "label = ome_zarr_pyramid.bin.runners:label",
+                                      "aggregative = ome_zarr_pyramid.bin.runners:aggregative",
+                                    ]
                   }
     )

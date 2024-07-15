@@ -18,6 +18,8 @@ import dask_image.ndmorph
 import dask_image.dispatch
 import dask_image.ndmeasure as ndmeasure
 import dask
+from functools import wraps
+import importlib, inspect
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 
 def aspyramid(obj):
@@ -60,5 +62,74 @@ def validate_pyramid_uniformity(pyramids,
                 shape2 = [full_meta[id2][pth]['shape'][it] for it in dims2]
                 assert shape1 == shape2, f'The shape of the two arrays must match except for the concatenation axis.'
     return pyramids
+
+
+def pyramids_are_elementwise_compatible(pyr1, pyr2): pass
+
+def get_functions_with_params(module_name):
+    module = importlib.import_module(module_name)
+    functions = {}
+    for name, obj in inspect.getmembers(module, inspect.isfunction):
+        try:
+            signature = inspect.signature(obj)
+            parameters = {}
+            for param_name, param in signature.parameters.items():
+                if param.default != inspect.Parameter.empty:
+                    parameters[param_name] = param.default
+                else:
+                    parameters[param_name] = None
+            functions[name] = parameters
+        except ValueError:  # Unable to get signature
+            pass
+    return module, functions
+
+def on_pyramid(module_path,
+               filter_name
+               ):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(input,
+                    **kwargs
+                    ):
+            # input validation - make sure all parameters match
+            module, funclist = get_functions_with_params(module_path)
+            arguments = funclist[filter_name]
+            ### get the Pyramid object.
+            if isinstance(input, Pyramid): # maybe also validate the pyramid here
+                pyr = input
+            else:
+                assert isinstance(input, str), "If input is not a Pyramid, a path to an OME-Zarr dataset must be given."
+                pyr = Pyramid()
+                pyr.from_zarr(input, include_imglabels=False)
+            func_kwargs = {key: value for key, value in kwargs.items() if
+                           key not in ['output_path']}  # add other parameters that are not function-specific.
+            for key in func_kwargs.keys():
+                if key not in arguments.keys():
+                    raise ValueError(f"The parameter '{key}' is not defined for the function '{filter_name}'.\n"
+                                     f"The valid parameters are '{arguments.keys()}'")
+            if 'axis' in func_kwargs.keys():
+                func_kwargs['axis'] = pyr.index(func_kwargs['axis'])
+            # run operation
+            # print(f"kwargs: {kwargs.keys()}")
+            filter = getattr(module, filter_name)
+            output = apply_to_pyramid(pyr, filter, **func_kwargs)
+            # postprocessing
+            if 'output_path' in kwargs.keys():
+                output.to_zarr(kwargs['output_path'])
+            return output
+        return wrapper
+    return decorator
+
+
+
+
+
+
+
+
+
+
+
+
 
 

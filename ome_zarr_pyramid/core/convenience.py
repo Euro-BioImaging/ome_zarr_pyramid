@@ -4,12 +4,11 @@ import warnings
 import numpy as np, pandas as pd
 from matplotlib import pyplot as plt
 import matplotlib as mpl
-import dask
-import zarr, json, shutil, os, copy
+import zarr, json, shutil, os, copy, zarr
 from dask import array as da
 from dask_image import ndmorph, ndinterp, ndfilters
 import dask
-import s3fs
+# import s3fs
 from skimage.transform import resize as skresize
 from skimage import measure
 import numcodecs
@@ -58,6 +57,22 @@ def includes(group1: Union[Iterable, str, int, float],
     gr2 = parse_as_list(group2)
     return all([item in gr1 for item in gr2])
 
+def insert_at_indices(iterable1, iterable2, indices):
+    if not hasattr(iterable1, '__len__'):
+        iterable1 = [iterable1]
+    if not hasattr(iterable2, '__len__'):
+        iterable2 = [iterable2]
+    if not hasattr(indices, '__len__'):
+        indices = [indices]
+    endlen = (len(iterable1) + len(iterable2))
+    end_indices = [None] * endlen
+    other_indices = [i for i in range(endlen) if i not in indices]
+    for i, j in zip(other_indices, iterable1):
+        end_indices[i] = j
+    for i, j in zip(indices, iterable2):
+        end_indices[i] = j
+    return end_indices
+
 def index_nth_dimension(array,
                         dimensions = 2, # a scalar or iterable
                         intervals = None # a scalar, an iterable of scalars, a list of tuple or None
@@ -96,6 +111,38 @@ def transpose_dict(dictionary):
 def argsorter(s):
     return sorted(range(len(s)), key = lambda k: s[k])
 
+
+######## ARRAY UTILITIES BELOW
+
+def copy_zarray(zarray):
+    copied = zarr.zeros_like(zarray)
+    copied[:] = zarray[:]
+    return copied
+
+def copy_array(array):
+    if isinstance(array, zarr.Array):
+        copied = copy_zarray(array)
+    elif isinstance(array, (da.Array, np.array)):
+        copied = array.copy()
+    return copied
+#
+# def concatenate_zarrays(collection,
+#                         axis: int = 0
+#                         ):
+#     zarray = copy_zarray(collection[0])
+#     for z in collection[1:]:
+#         zarray.append(z, axis = axis)
+#     return zarray
+
+def insert_zarray(collection,
+                  axis: int = 0
+                  ):
+    zarray = copy_zarray(collection[0])
+    for z in collection[1:]:
+        zarray.append(z, axis = axis)
+    return zarray
+
+######## GROUP UTILITIES BELOW
 def is_generic_collection(group):
     res = False
     basepath = group.store.path
@@ -149,6 +196,36 @@ def get_collection_paths(directory,
         return out, multiscales_paths, arraypaths
     return out
 
+
+def rescale_to_shapes(zarray,   ### Input is a single zarr array. Maybe divide this into two functions or methods, 1) get scales, 2) rescale
+                      axis_order,
+                      new_shapes
+                      ) -> Iterable[da.Array]:
+    """ Rescale an array to given shapes """
+    arr = asdask(zarray)
+    shape = np.array(arr.shape)
+    ret = {}
+    for pth, new_shape in new_shapes.items():
+        matrix = np.zeros((arr.ndim + 1, arr.ndim + 1))
+        matrix[arr.ndim, arr.ndim] = 1
+        for j in axis_order:
+            idx = axis_order.index(j)
+            # print(new_shape)
+            matrix[idx, idx] = shape[idx] / new_shape[idx]
+        output_shape = new_shape
+        image_transformed = ndinterp.affine_transform(
+                            arr,
+                            matrix = matrix,
+                            output_shape = output_shape,
+                            output_chunks = arr.chunksize
+                            )
+        ret[pth] = image_transformed
+    return ret
+
+# arr = oz.layers['0']
+# new_shapes = {'1': [29, 120, 120], '0': [29, 60, 60]}
+# newarr = rescale_to_shapes(arr, axis_order='zyx', new_shapes=new_shapes)
+
 def rescale(zarray,   ### Input is a single zarr array. Maybe divide this into two functions or methods, 1) get scales, 2) rescale
             zscale,
             axis_order,
@@ -157,7 +234,7 @@ def rescale(zarray,   ### Input is a single zarr array. Maybe divide this into t
             scale_factor = 2
             ) -> Iterable[da.Array]:
     """ Rescale an array with given resolutions and scale factor """
-    print(f'input array type: {type(zarray)}')
+    # print(f'input array type: {type(zarray)}')
     arr = asdask(zarray)
     zscale = np.array(zscale).astype(float)
     scale_fact = np.ones_like(zscale)
