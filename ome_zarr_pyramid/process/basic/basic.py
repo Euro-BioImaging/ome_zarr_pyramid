@@ -1,4 +1,3 @@
-import napari
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyToPyramid
 # from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
