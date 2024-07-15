@@ -6,7 +6,7 @@ from matplotlib import pyplot as plt
 import matplotlib as mpl
 import zarr, json, shutil, os, copy, zarr
 from dask import array as da
-from dask_image import ndmorph, ndinterp, ndfilters
+# from dask_image import ndmorph, ndinterp, ndfilters
 import dask
 # import s3fs
 from skimage.transform import resize as skresize
@@ -196,78 +196,77 @@ def get_collection_paths(directory,
         return out, multiscales_paths, arraypaths
     return out
 
-
-def rescale_to_shapes(zarray,   ### Input is a single zarr array. Maybe divide this into two functions or methods, 1) get scales, 2) rescale
-                      axis_order,
-                      new_shapes
-                      ) -> Iterable[da.Array]:
-    """ Rescale an array to given shapes """
-    arr = asdask(zarray)
-    shape = np.array(arr.shape)
-    ret = {}
-    for pth, new_shape in new_shapes.items():
-        matrix = np.zeros((arr.ndim + 1, arr.ndim + 1))
-        matrix[arr.ndim, arr.ndim] = 1
-        for j in axis_order:
-            idx = axis_order.index(j)
-            # print(new_shape)
-            matrix[idx, idx] = shape[idx] / new_shape[idx]
-        output_shape = new_shape
-        image_transformed = ndinterp.affine_transform(
-                            arr,
-                            matrix = matrix,
-                            output_shape = output_shape,
-                            output_chunks = arr.chunksize
-                            )
-        ret[pth] = image_transformed
-    return ret
+# def rescale_to_shapes(zarray,   ### Input is a single zarr array. Maybe divide this into two functions or methods, 1) get scales, 2) rescale
+#                       axis_order,
+#                       new_shapes
+#                       ) -> Iterable[da.Array]:
+#     """ Rescale an array to given shapes """
+#     arr = asdask(zarray)
+#     shape = np.array(arr.shape)
+#     ret = {}
+#     for pth, new_shape in new_shapes.items():
+#         matrix = np.zeros((arr.ndim + 1, arr.ndim + 1))
+#         matrix[arr.ndim, arr.ndim] = 1
+#         for j in axis_order:
+#             idx = axis_order.index(j)
+#             # print(new_shape)
+#             matrix[idx, idx] = shape[idx] / new_shape[idx]
+#         output_shape = new_shape
+#         image_transformed = ndinterp.affine_transform(
+#                             arr,
+#                             matrix = matrix,
+#                             output_shape = output_shape,
+#                             output_chunks = arr.chunksize
+#                             )
+#         ret[pth] = image_transformed
+#     return ret
 
 # arr = oz.layers['0']
 # new_shapes = {'1': [29, 120, 120], '0': [29, 60, 60]}
 # newarr = rescale_to_shapes(arr, axis_order='zyx', new_shapes=new_shapes)
 
-def rescale(zarray,   ### Input is a single zarr array. Maybe divide this into two functions or methods, 1) get scales, 2) rescale
-            zscale,
-            axis_order,
-            resolutions = 7,
-            planewise = True,
-            scale_factor = 2
-            ) -> Iterable[da.Array]:
-    """ Rescale an array with given resolutions and scale factor """
-    # print(f'input array type: {type(zarray)}')
-    arr = asdask(zarray)
-    zscale = np.array(zscale).astype(float)
-    scale_fact = np.ones_like(zscale)
-    for ax in axis_order:
-        idx = axis_order.index(ax)
-        if planewise:
-            if ax in 'yx':
-                scale_fact[idx] = scale_factor
-        else:
-            scale_fact[idx] = scale_factor
-    div = np.round(np.vstack([scale_fact ** item for item in np.arange(resolutions)]), 3)
-    shape = np.array(zarray.shape)
-    new_shapes = shape // div
-    new_shapes[new_shapes < 1] = 1
-    #### until here make one function
-    ret = {}
-    for i, new_shape in enumerate(new_shapes):
-        matrix = np.zeros((arr.ndim + 1, arr.ndim + 1))
-        matrix[arr.ndim, arr.ndim] = 1
-        scl = [None] * len(axis_order)
-        for j in axis_order:
-            idx = axis_order.index(j)
-            matrix[idx, idx] = shape[idx] / new_shape[idx]
-            scl[idx] = (shape[idx] / new_shape[idx]) * zscale[idx]
-        output_shape = new_shape
-        image_transformed = ndinterp.affine_transform(
-                            arr,
-                            matrix = matrix,
-                            output_shape = output_shape,
-                            output_chunks = arr.chunksize
-                            )
-        ret[str(i)] = (image_transformed, scl)
-    return ret
+# def rescale(zarray,   ### Input is a single zarr array. Maybe divide this into two functions or methods, 1) get scales, 2) rescale
+#             zscale,
+#             axis_order,
+#             resolutions = 7,
+#             planewise = True,
+#             scale_factor = 2
+#             ) -> Iterable[da.Array]:
+#     """ Rescale an array with given resolutions and scale factor """
+#     # print(f'input array type: {type(zarray)}')
+#     arr = asdask(zarray)
+#     zscale = np.array(zscale).astype(float)
+#     scale_fact = np.ones_like(zscale)
+#     for ax in axis_order:
+#         idx = axis_order.index(ax)
+#         if planewise:
+#             if ax in 'yx':
+#                 scale_fact[idx] = scale_factor
+#         else:
+#             scale_fact[idx] = scale_factor
+#     div = np.round(np.vstack([scale_fact ** item for item in np.arange(resolutions)]), 3)
+#     shape = np.array(zarray.shape)
+#     new_shapes = shape // div
+#     new_shapes[new_shapes < 1] = 1
+#     #### until here make one function
+#     ret = {}
+#     for i, new_shape in enumerate(new_shapes):
+#         matrix = np.zeros((arr.ndim + 1, arr.ndim + 1))
+#         matrix[arr.ndim, arr.ndim] = 1
+#         scl = [None] * len(axis_order)
+#         for j in axis_order:
+#             idx = axis_order.index(j)
+#             matrix[idx, idx] = shape[idx] / new_shape[idx]
+#             scl[idx] = (shape[idx] / new_shape[idx]) * zscale[idx]
+#         output_shape = new_shape
+#         image_transformed = ndinterp.affine_transform(
+#                             arr,
+#                             matrix = matrix,
+#                             output_shape = output_shape,
+#                             output_chunks = arr.chunksize
+#                             )
+#         ret[str(i)] = (image_transformed, scl)
+#     return ret
 
 def locate_labels(label_img,
                   ) -> dict:
