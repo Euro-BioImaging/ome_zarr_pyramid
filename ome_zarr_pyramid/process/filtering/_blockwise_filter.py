@@ -1,15 +1,10 @@
-import warnings, time, shutil, tempfile
-
-import napari
-from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
-from ome_zarr_pyramid.process.core._blockwise_general import BlockwiseRunner, LazyFunction, FunctionProfiler
-
-import zarr
+import warnings, time, shutil, tempfile, os, copy, inspect, zarr
 import numpy as np
-import os, copy, inspect
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 import numcodecs; numcodecs.blosc.use_threads = False
 
+from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.process.core._blockwise_general import BlockwiseRunner, LazyFunction, FunctionProfiler
 
 class FilterProfiler(FunctionProfiler):
     def __init__(self, func):
