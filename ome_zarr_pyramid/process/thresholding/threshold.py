@@ -4,6 +4,7 @@ from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from skimage import transform, filters
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.process.basic.basic import _WrapperBase
 from ome_zarr_pyramid.process.thresholding.multiscale_apply_threshold import ApplyThresholdToPyramid, ApplyThresholdAndRescale
 from ome_zarr_pyramid.process.thresholding import _global_threshold as gt, _local_threshold as lt
 
@@ -159,5 +160,4 @@ class Threshold(_WrapperBase, ApplyThresholdAndRescale):
                           out = out,
                           **global_threshold_params
                           )
-
 

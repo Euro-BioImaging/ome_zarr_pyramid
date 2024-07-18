@@ -5,6 +5,7 @@ from scipy import ndimage as ndi
 from skimage import transform, filters
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.process.basic.basic import _WrapperBase
 from ome_zarr_pyramid.process.morphology.multiscale_apply_label import ApplyLabelToPyramid, ApplyLabelAndRescale
 
 

@@ -6,6 +6,7 @@ import numpy as np
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.process.basic.basic import _WrapperBase
 from ome_zarr_pyramid.process.aggregative.multiscale_apply_aggregative import ApplyAggregativeToPyramid, ApplyAggregativeAndRescale
 from ome_zarr_pyramid.process.aggregative import _aggregative_functions as aggf
 
