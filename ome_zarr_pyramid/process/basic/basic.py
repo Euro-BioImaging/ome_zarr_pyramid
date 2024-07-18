@@ -1,5 +1,5 @@
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
-from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyAndRescale
+from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyAndRescale, ApplyToPyramid
 # from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
 
 import zarr, warnings
@@ -45,7 +45,7 @@ class _WrapperBase:
     def set(self, **kwargs):
         for key, value in kwargs.items():
             if key == 'scale_factor':
-                self.scale_factor = scale_factor
+                self.scale_factor = kwargs.get('scale_factor')
             elif key in self.zarr_params.keys():
                 self.zarr_params[key] = value
             else:
@@ -53,7 +53,7 @@ class _WrapperBase:
         return self
 
 
-class UFunc(_WrapperBase, ApplyAndRescale): # TODO: add a project folder generator and auto-naming of temporary files. They should be auto-deletable.
+class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid): # TODO: add a project folder generator and auto-naming of temporary files. They should be auto-deletable.
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
@@ -83,13 +83,22 @@ class UFunc(_WrapperBase, ApplyAndRescale): # TODO: add a project folder generat
             self.set(store = out)
         if isinstance(input, str):
             input = Pyramid().from_zarr(input)
-        ApplyAndRescale.__init__(self,
-                                 input,
-                                 *args,
-                                 func = func,
-                                 **self.zarr_params,
-                                 **kwargs
-                                 )
+        if self.scale_factor is None:
+            ApplyToPyramid.__init__(self,
+                                     input,
+                                     *args,
+                                     func=func,
+                                     **self.zarr_params,
+                                     **kwargs
+                                     )
+        else:
+            ApplyAndRescale.__init__(self,
+                                     input,
+                                     *args,
+                                     func = func,
+                                     **self.zarr_params,
+                                     **kwargs
+                                     )
         return self.add_layers()
 
     def absolute(self, x, out = None):
@@ -522,3 +531,4 @@ class BasicOperations(UFunc):
 
     def delete(self, input, obj, axis, out=None):
         return self.__run(input=input, func=np.delete, obj=obj, axis=axis, out=out)
+
