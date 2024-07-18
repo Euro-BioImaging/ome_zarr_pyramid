@@ -1,5 +1,5 @@
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
-from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyToPyramid
+from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyAndRescale
 # from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
 
 import zarr, warnings
@@ -41,16 +41,19 @@ class _WrapperBase:
             'n_jobs': n_jobs,
             'monoresolution': monoresolution,
         }
+        self.scale_factor = scale_factor
     def set(self, **kwargs):
         for key, value in kwargs.items():
-            if key in self.zarr_params.keys():
+            if key == 'scale_factor':
+                self.scale_factor = scale_factor
+            elif key in self.zarr_params.keys():
                 self.zarr_params[key] = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
         return self
 
 
-class UFunc(_WrapperBase, ApplyToPyramid): # TODO: add a project folder generator and auto-naming of temporary files. They should be auto-deletable.
+class UFunc(_WrapperBase, ApplyAndRescale): # TODO: add a project folder generator and auto-naming of temporary files. They should be auto-deletable.
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
@@ -80,7 +83,7 @@ class UFunc(_WrapperBase, ApplyToPyramid): # TODO: add a project folder generato
             self.set(store = out)
         if isinstance(input, str):
             input = Pyramid().from_zarr(input)
-        ApplyToPyramid.__init__(self,
+        ApplyAndRescale.__init__(self,
                                  input,
                                  *args,
                                  func = func,
@@ -299,6 +302,9 @@ class UFunc(_WrapperBase, ApplyToPyramid): # TODO: add a project folder generato
     def isnat(self, x, out=None):
         return self.__run(input=x, func=np.isnat, out=out)
 
+    def relocate(self, x, out=None):
+        return self.__run(input=x, func=None, out=out)
+
     def fabs(self, x, out=None):
         return self.__run(input=x, func=np.fabs, out=out)
 
@@ -371,7 +377,7 @@ class BasicOperations(UFunc):
             self.zarr_params['n_jobs'] = 1
         if isinstance(input, str):
             input = Pyramid().from_zarr(input)
-        ApplyToPyramid.__init__(self,
+        ApplyAndRescale.__init__(self,
                                  input,
                                  *args,
                                  func = func,
@@ -381,7 +387,7 @@ class BasicOperations(UFunc):
         return self.add_layers()
 
     def __run_with_dask(self):
-        """TODO: Some functions require dask to be run. Connect this to a different module.
+        """TODO: Some functions require dask. Connect this to a different module.
         """
         pass
 
@@ -516,41 +522,3 @@ class BasicOperations(UFunc):
 
     def delete(self, input, obj, axis, out=None):
         return self.__run(input=input, func=np.delete, obj=obj, axis=axis, out=out)
-
-
-# inpath = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data/filament.zarr"
-# opath1 = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data/processed1.zarr"
-# opath2 = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data/processed2.zarr"
-# opath3 = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data/processed3.zarr"
-#
-# ops = BasicOperations(n_jobs = 1, output_dtype = int)
-# res1 = ops.max(inpath, axis = 'z')
-# # grad1 = ops.gradient(inpath, axis = 'y')
-# arr1 = zarr.full((100, 100), 3, chunks = (20, 20))
-# pyr1 = Pyramid().add_layer(arr1, '0', (1, 1))
-# grad1 = ops.gradient(pyr1, axis = 'y')
-# mult = ops.multiply(grad1, 2)
-
-# diff1 = ops.diff(pyr1, axis = 'y')
-# h = np.diff(pyr1[0], axis = 0)
-
-
-# ufunc = UFunc(n_jobs = 1, output_dtype = int)
-# # res1 = ufunc.absolute(inpath, out = None)
-# # # res2 = ufunc.absolute(inpath, out = opath1)
-# # pyr = Pyramid().from_zarr(inpath)
-# # res3 = ufunc.add(pyr, pyr, out = None)
-#
-# arr1 = zarr.full((100, 100), 3, chunks = (20, 20))
-# arr2 = zarr.full((100, 100), 4, chunks = (20, 20))
-#
-# pyr1 = Pyramid().add_layer(arr1, '0', (1, 1))
-# pyr2 = Pyramid().add_layer(arr2, '0', (1, 1))
-# # res3 = ufunc.hypot(pyr1, pyr2, out = opath3)
-# # res4 = ufunc.hypot(pyr1, pyr2, out = None)
-# # np.max(res3[0])
-# # np.max(res4[0])
-# res5 = ufunc.add(pyr1, pyr2, out = None)
-# res6 = ufunc.clip(res5, 0, 6)
-# np.max(res5[0])
-# np.max(res6[0])
