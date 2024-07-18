@@ -286,12 +286,7 @@ class ApplyAndRescale(ApplyToPyramid):
 
     def parse_subset_indices(self):
         subset_ids = {i: None for i in self.input.resolution_paths}
-        if self.subset_indices is not None:
-            sub_ids = [(0, size) for size in self.input.shape]
-            for i, ax in enumerate(self.input.axis_order):
-                if ax in self.subset_indices.keys():
-                    sub_ids[i] = self.subset_indices[ax]
-            subset_ids[self.input.refpath] = sub_ids
+        subset_ids[self.input.refpath] = self.subset_indices[self.input.refpath]
         return subset_ids
 
     def _write_single_layer(self, # Override this upon inheritance.
@@ -340,7 +335,6 @@ class ApplyAndRescale(ApplyToPyramid):
 
         syncdir = tempfile.mkdtemp()
         block_overlap_sizes = self.block_overlap_sizes
-        # print(downscaling)
         for i, (pth, scale_factor) in enumerate(scale_factors.items()):
             if self.store is not None:
                 arraypath = os.path.join(self.store, pth)
