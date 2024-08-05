@@ -249,6 +249,8 @@ class Multimeta: ### Unify with ImageLabelMeta
                         pth: Union[str, int],
                         translation
                         ):
+        if isinstance(translation, np.ndarray):
+            translation = translation.tolist()
         idx = self.resolution_paths.index(pth)
         if len(self.multimeta[0]['datasets'][idx]['coordinateTransformations']) < 2:
             self.multimeta[0]['datasets'][idx]['coordinateTransformations'].append({'translation': None, 'type': 'translation'})
@@ -900,7 +902,7 @@ class Pyramid(Multimeta, Operations):
             new_translation = list(dct.values())
         new_translation = np.array(new_translation)
         # translations = {}
-        for key, scale_factor in self.scale_factors.items():
+        for key, scale_factor in self.scales.items():
             # div = np.divide(new_translation, scale_factor)
             # div[np.isinf(div)] = 0
             # div[np.isnan(div)] = 0
@@ -1070,12 +1072,12 @@ class Pyramid(Multimeta, Operations):
         self.compute()
         self.to_dask()
 
-    def save_binary(self, fpath, overwrite):
+    def save_binary(self, fpath, region_sizes, overwrite, verbose = False):
         for pth, arr in self.layers.items():
             if hasattr(arr, 'write_binary'): # means it is blockwise
                 self._arrays[pth] = arr.output
             elif isinstance(arr, zarr.Array):
-                self._arrays[pth] = arr.output
+                self._arrays[pth] = arr
             elif isinstance(arr, da.Array):
                 self.save_dask_layer(fpath,
                                      pth = pth,
@@ -1092,10 +1094,14 @@ class Pyramid(Multimeta, Operations):
                 overwrite: bool = False,
                 include_imglabels = False,
                 region_sizes = None,
-                verbose = False
+                verbose = False,
+                only_meta = False
                 ):
         grp = zarr.open_group(fpath, mode='a')
-        self.save_binary(fpath, overwrite)
+        if only_meta:
+            pass
+        else:
+            self.save_binary(fpath, region_sizes, overwrite)
         grp.attrs['multiscales'] = self.multimeta
         # if include_imglabels:
         #     labelgrp = grp.create_group('labels', overwrite=overwrite)
