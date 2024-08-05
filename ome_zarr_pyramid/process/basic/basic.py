@@ -143,6 +143,9 @@ class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid): # TODO: add a projec
     def reciprocal(self, x, out=None):
         return self.__run(input=x, func=np.reciprocal, out=out)
 
+    def zeros_like(self, x, out=None):
+        return self.__run(input=x, func=np.zeros_like, out=out)
+
     def ones_like(self, x, out=None):
         return self.__run(input=x, func=np.ones_like, out=out)
 
@@ -396,7 +399,7 @@ class BasicOperations(UFunc):
         return self.add_layers()
 
     def __run_with_dask(self):
-        """TODO: Some functions require dask. Connect this to a different module.
+        """TODO: Some functions benefits from dask. Connect this to a different module.
         """
         pass
 
