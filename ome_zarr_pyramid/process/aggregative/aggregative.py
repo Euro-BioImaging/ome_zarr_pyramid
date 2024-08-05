@@ -1,7 +1,7 @@
 # TODO: Change the module name to ndimage or nd_manipulate and then add the classes Aggregative and Dispersive both here.
 # TODO: Maybe change the directory (not the module) to ndimage that should contain the modules aggregative and dispersive.
 
-import zarr, warnings, glob
+import zarr, warnings, glob, os
 import numpy as np
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 

@@ -1,18 +1,29 @@
 """Wrappers for bfconvert and bioformats2raw to be run from python environment. """
-
+import os.path, os, glob
 import subprocess, re, shlex
 from typing import Optional, List
 import fire
+from joblib import Parallel, delayed, parallel_backend
+from multiprocessing import Pool
+
 
 intlist = lambda s: [int(x) for x in re.findall(r'\b\d+\b', s)]
+
+def run_command(cmd, use_shell = False):
+    result = subprocess.run(cmd, shell=use_shell, capture_output=True, text=True)
+    return result
 
 class Converter:
     def __init__(self,
                  execute: bool = True,
-                 use_shell: bool = False
+                 use_shell: bool = False,
+                 n_jobs = 8,
+                 require_sharedmem = None
                  ):
         self.execute = execute
         self.use_shell = use_shell
+        self.n_jobs = n_jobs
+        self.require_sharedmem = require_sharedmem
     def as_cmd(self,
                    ):
         self.execute = False
@@ -44,8 +55,6 @@ class Converter:
                   compression: Optional[str] = None,
                   resolution_scale: Optional[str] = None,
                   resolutions: Optional[str] = None,
-                  # execute: bool = False,
-                  # use_shell: bool = False
                   ):
         cmd = ["bfconvert"]
         if noflat is not None:
@@ -109,14 +118,7 @@ class Converter:
                     no_nested: bool = None,
                     drop_series: bool = None,
                     overwrite: bool = None,
-                    # execute: bool = False,
-                    # use_shell: bool = False
                     ):
-        # param_names = self.to_omezarr.__code__.co_varnames[:self.to_omezarr.__code__.co_argcount]
-        # self.params
-        # for param_name in param_names:
-        #     param_value = vars(self).get(param_name)
-        #     print(f"{param_name} = {param_value}")
 
         cmd = ["bioformats2raw"]
 
@@ -155,6 +157,116 @@ class Converter:
                 self.cmd = shlex.split(self.cmd)
             subprocess.run(self.cmd, shell=self.use_shell)
             return
+
+    def to_ometiffs(self,
+                    input_dir: str,
+                    output_dir: str,
+                    pattern: str = '*',
+                    noflat: Optional[bool] = None,
+                    series: Optional[str] = None,
+                    timepoint: Optional[str] = None,
+                    channel: Optional[str] = None,
+                    z_slice: Optional[str] = None,
+                    idx_range: Optional[str] = None,
+                    autoscale: Optional[bool] = None,
+                    crop: Optional[str] = None,
+                    compression: Optional[str] = None,
+                    resolution_scale: Optional[str] = None,
+                    resolutions: Optional[str] = None,
+                    ):
+        globpattern = os.path.join(input_dir, pattern)
+        inpaths = glob.glob(globpattern)
+        outpaths = []
+        for inpath in inpaths:
+            name = os.path.basename(inpath)
+            namebase, _ = os.path.splitext(name)
+            newname = namebase + '.ome.tiff'
+            newpath = os.path.join(output_dir, newname)
+            outpaths.append(newpath)
+        os.makedirs(output_dir, exist_ok = True)
+        cmds = []
+        for inpath, outpath in zip(inpaths, outpaths):
+            cmd = self.as_cmd().to_ometiff(inpath,
+                                            outpath,
+                                            noflat = noflat,
+                                            series = series,
+                                            timepoint = timepoint,
+                                            channel = channel,
+                                            z_slice = z_slice,
+                                            idx_range = idx_range,
+                                            autoscale = autoscale,
+                                            crop = crop,
+                                            compression = compression,
+                                            resolution_scale = resolution_scale,
+                                            resolutions = resolutions
+                                            )
+            if not self.use_shell:
+                cmd = shlex.split(self.cmd)
+            cmds.append(cmd)
+        with Parallel(n_jobs=self.n_jobs, require=self.require_sharedmem) as parallel:
+            _ = parallel(
+                delayed(run_command)
+                    (
+                    cmd,
+                    use_shell = self.use_shell
+                )
+                for i, cmd in enumerate(cmds)
+            )
+
+    def to_omezarrs(self,
+                    input_dir: str,
+                    output_dir: str,
+                    pattern: str = '*',
+                    resolutions: int = None,
+                    min_image_size: int = None,
+                    chunk_z: int = None,
+                    chunk_y: int = None,
+                    chunk_x: int = None,
+                    downsample_type: str = None,
+                    compression: str = None,
+                    max_workers: int = None,
+                    no_nested: bool = None,
+                    drop_series: bool = None,
+                    overwrite: bool = None,
+                    ):
+        globpattern = os.path.join(input_dir, pattern)
+        inpaths = glob.glob(globpattern)
+        outpaths = []
+        for inpath in inpaths:
+            name = os.path.basename(inpath)
+            namebase, _ = os.path.splitext(name)
+            newname = namebase + '.zarr'
+            newpath = os.path.join(output_dir, newname)
+            outpaths.append(newpath)
+        os.makedirs(output_dir, exist_ok = True)
+        cmds = []
+        for inpath, outpath in zip(inpaths, outpaths):
+            cmd = self.as_cmd().to_omezarr(inpath,
+                                            outpath,
+                                            resolutions = resolutions,
+                                            min_image_size = min_image_size,
+                                            chunk_z = chunk_z,
+                                            chunk_y = chunk_y,
+                                            chunk_x = chunk_x,
+                                            downsample_type = downsample_type,
+                                            compression = compression,
+                                            max_workers = max_workers,
+                                            no_nested = no_nested,
+                                            drop_series = drop_series,
+                                            overwrite = overwrite
+                                            )
+            if not self.use_shell:
+                cmd = shlex.split(self.cmd)
+            cmds.append(cmd)
+        with Parallel(n_jobs=self.n_jobs, require=self.require_sharedmem) as parallel:
+            _ = parallel(
+                delayed(run_command)
+                    (
+                    cmd,
+                    use_shell = self.use_shell
+                )
+                for i, cmd in enumerate(cmds)
+            )
 
 def run():
     fire.Fire(Converter)
