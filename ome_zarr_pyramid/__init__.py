@@ -8,9 +8,11 @@ from ome_zarr_pyramid.process.thresholding import threshold
 from ome_zarr_pyramid.process.thresholding.threshold import Threshold
 from ome_zarr_pyramid.process.morphology import labeling
 from ome_zarr_pyramid.process.morphology.labeling import Label
+from ome_zarr_pyramid.process.converters import Converter
 from ome_zarr_pyramid.core.pyramid import Pyramid, LabelPyramid, PyramidCollection
 
 __all__ = ['aggregative', 'basic', 'filters', 'threshold', 'labeling',
            'Aggregative', 'BasicOperations', 'Filters', 'Threshold', 'Label',
+           'Converter',
            'Pyramid', 'LabelPyramid', 'PyramidCollection'
            ]
