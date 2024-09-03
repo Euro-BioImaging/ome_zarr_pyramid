@@ -9,65 +9,28 @@ from ome_zarr_pyramid.process.thresholding.multiscale_apply_threshold import App
 from ome_zarr_pyramid.process.thresholding import _global_threshold as gt, _local_threshold as lt
 
 
-class _WrapperBase:
-    def __init__(self,
-                 scale_factor=None, ### TODO: Do we need it?
-                 min_block_size=None,
-                 block_overlap_sizes=None,
-                 subset_indices: dict = None,
-                 ### zarr parameters
-                 store: str = None,
-                 compressor='auto',
-                 dimension_separator=None,
-                 output_dtype=None,
-                 overwrite=False,
-                 ###
-                 n_jobs = None,
-                 monoresolution=False,
-                 ):
-        self.zarr_params = {
-            # 'scale_factor': scale_factor,
-            'min_block_size': min_block_size,
-            'block_overlap_sizes': block_overlap_sizes,
-            'subset_indices': subset_indices,
-            ### zarr parameters
-            'store': store,
-            'compressor': compressor,
-            'dimension_separator': dimension_separator,
-            'dtype': output_dtype,
-            'overwrite': overwrite,
-            ###
-            'n_jobs': n_jobs,
-            'monoresolution': monoresolution,
-        }
-    def set(self, **kwargs):
-        for key, value in kwargs.items():
-            if key in self.zarr_params.keys():
-                self.zarr_params[key] = value
-            else:
-                raise TypeError(f"No such parameter as {key} exists.")
-        return self
-
 
 class Threshold(_WrapperBase, ApplyThresholdAndRescale):
-    # TODO: add a project folder generator and auto-naming of temporary files. They should also be auto-deletable.
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
                  block_overlap_sizes=None,
-                 subset_indices: dict = None,
+                 input_subset_indices: dict = None,
                  ### zarr parameters
-                 store: str = None,
-                 compressor='auto',
-                 dimension_separator=None,
+                 output_store: str = None,
+                 output_compressor='auto',
+                 output_chunks: Union[tuple, list] = None,
+                 output_dimension_separator=None,
                  output_dtype=None,
                  overwrite=False,
                  ###
-                 n_jobs=None,
-                 monoresolution=False,
+                 n_jobs = None,
+                 select_layers='all'
                  ):
-        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, subset_indices,
-                              store, compressor, dimension_separator, output_dtype, overwrite, n_jobs, monoresolution)
+        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+                              output_store, output_compressor, output_chunks, output_dimension_separator,
+                              output_dtype, overwrite, n_jobs, select_layers)
+
         self._global_threshold_params_ = {'global_thresholder': filters.threshold_multiotsu,
                                           'classes': 3,
                                           'nbins': 256,
@@ -160,4 +123,5 @@ class Threshold(_WrapperBase, ApplyThresholdAndRescale):
                           out = out,
                           **global_threshold_params
                           )
+
 

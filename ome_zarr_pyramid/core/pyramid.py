@@ -13,6 +13,8 @@ from numcodecs import Blosc
 # from ome_zarr_pyramid.core.Hierarchy import OMEZarr, OMEZarrSample
 # from ome_zarr_pyramid.core.Hierarchy import MultiScales
 from ome_zarr_pyramid.core import config, convenience as cnv
+from ome_zarr_pyramid.utils import multiscale_utils as mutils
+from ome_zarr_pyramid.utils import assignment_utils as asutils
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 
 def validate_multimeta(grp):
@@ -223,11 +225,32 @@ class Multimeta: ### Unify with ImageLabelMeta
         return self.multimeta[0]['datasets'][idx]['coordinateTransformations'][0]['scale']
 
     def set_scale(self,
-                  pth: Union[str, int],
-                  scale
+                  pth: Union[str, int] = 'auto',
+                  scale = 'auto',
+                  hard = False
                   ):
+        if isinstance(scale, tuple):
+            scale = list(scale)
+        elif hasattr(scale, 'tolist'):
+            scale = scale.tolist()
+        if pth == 'auto':
+            pth = self.refpath
+        if scale == 'auto':
+            pth = self.scales[pth]
         idx = self.resolution_paths.index(pth)
         self.multimeta[0]['datasets'][idx]['coordinateTransformations'][0]['scale'] = scale
+        if hard:
+            self.gr.attrs['multiscales'] = self.multimeta
+        return
+
+    def update_scales(self,
+                      reference_scale,
+                      hard = True
+                      ):
+        for pth, factor in self.scale_factors.items():
+            new_scale = np.multiply(factor, reference_scale)
+            self.set_scale(pth, new_scale, hard)
+        return self
 
     @property
     def scales(self):
@@ -588,8 +611,6 @@ class ImageLabelMeta:
 # meta.sort_labels()
 
 class Operations:
-    def convolve(self):
-        return self
     def __add__(self, # TODO: support scalar
                 other
                 ):
@@ -752,8 +773,7 @@ class Pyramid(Multimeta, Operations):
             for pth in self.resolution_paths:
                 if pth not in self._array_meta_.keys():
                     self._array_meta_[pth] = {}
-        self._omezarr_root = None
-
+        # self._pyramid_root = None
     # def methodWrapper(self,
     #                   method
     #                   ):
@@ -762,10 +782,23 @@ class Pyramid(Multimeta, Operations):
     #                 ):
 
     @property
-    def omezarr_root(self):
-        if self._omezarr_root is None:
-            warnings.warn(f'This pyramid has not been read from an OME-Zarr path.')
-        return self._omezarr_root
+    def refroot(self): # The root of the reference array.
+        if isinstance(self.refarray.store, zarr.DirectoryStore):
+            return self.refarray.store.path
+        else:
+            return None
+
+    @property
+    def pyramid_root(self):
+        if not self.refroot is None:
+            try:
+                arr = zarr.open_array(self.refroot, mode = 'r')
+                return os.path.dirname(self.refroot)
+            except:
+                grp = zarr.open_group(self.refroot, mode = 'r')
+                return self.refroot
+        else:
+            return None
 
     def __str__(self):
         return f"Pyramidal OME-Zarr with {self.nlayers} resolution layers."
@@ -813,16 +846,46 @@ class Pyramid(Multimeta, Operations):
 
     ###TODO: add other dunder methods
 
+    # def copy(self, # TODO
+    #          new_dir
+    #          # paths: Union[list, tuple] = None,
+    #          # label_paths = None, # make a config attribute for this
+    #          # label_resolution_paths = 'all'
+    #          ):
+    #     if paths is None:
+    #         paths = self.resolution_paths
+    #     pyr = Pyramid()
+    #     for pth in paths:
+    #         res = cnv.copy_array(self.layers[pth])
+    #         if not pyr.has_axes:
+    #             pyr.parse_axes(self.axis_order, unit_list=self.unit_list)
+    #         scale = self.get_scale(pth)
+    #         translation = self.get_translation(pth)
+    #         zarr_meta = self.array_meta[pth]
+    #         pyr.add_layer(res, pth, scale, translation, zarr_meta)
+    #         pyr.multimeta[0]['name'] = self.tag
+    #     # if label_paths == 'all':
+    #     #     label_paths = self.label_paths
+    #     # if label_paths is not None:
+    #     #     assert self.has_label_paths, f'No labels pyramid exists.'
+    #     #     assert isinstance(label_paths, (tuple, list)), f"Label_paths must be either of types list or tuple."
+    #     #     assert cnv.includes(self.label_paths, label_paths), f"Some of the specified paths do not exist."
+    #     #     for name in label_paths:
+    #     #         imglabel = self.labels[name]
+    #     #         pyr.add_imglabel(imglabel, name, label_resolution_paths) # TODO: add the method
+    #     return pyr
+
     def copy(self, # TODO
-             paths: Union[list, tuple] = None,
-             label_paths = None, # make a config attribute for this
-             label_resolution_paths = 'all'
+             new_dir,
+             overwrite = False
+             # paths: Union[list, tuple] = None,
+             # label_paths = None, # make a config attribute for this
+             # label_resolution_paths = 'all'
              ):
-        if paths is None:
-            paths = self.resolution_paths
         pyr = Pyramid()
+        paths = self.resolution_paths
         for pth in paths:
-            res = cnv.copy_array(self.layers[pth])
+            res = self.layers[pth]
             if not pyr.has_axes:
                 pyr.parse_axes(self.axis_order, unit_list=self.unit_list)
             scale = self.get_scale(pth)
@@ -830,15 +893,7 @@ class Pyramid(Multimeta, Operations):
             zarr_meta = self.array_meta[pth]
             pyr.add_layer(res, pth, scale, translation, zarr_meta)
             pyr.multimeta[0]['name'] = self.tag
-        if label_paths == 'all':
-            label_paths = self.label_paths
-        if label_paths is not None:
-            assert self.has_label_paths, f'No labels pyramid exists.'
-            assert isinstance(label_paths, (tuple, list)), f"Label_paths must be either of types list or tuple."
-            assert cnv.includes(self.label_paths, label_paths), f"Some of the specified paths do not exist."
-            for name in label_paths:
-                imglabel = self.labels[name]
-                pyr.add_imglabel(imglabel, name, label_resolution_paths) # TODO: add the method
+        pyr.to_zarr(new_dir, overwrite = overwrite)
         return pyr
 
     @property
@@ -936,19 +991,56 @@ class Pyramid(Multimeta, Operations):
         indices = self.index(ax, scalar_sensitive = False)
         return [shape[idx] for idx in indices]
 
-    def from_zarr(self, # add limit to layers
+    @property
+    def gr(self):
+        if hasattr(self, '_gr'):
+            return self._gr
+        else:
+            if self.pyramid_root is not None:
+                # grp = zarr.open_group(fpath, mode='r+')
+                self._gr = zarr.open_group(self.pyramid_root, mode = 'a') # TODO probably needs improvement
+                return self._gr
+            else:
+                return None
+
+    @property
+    def synchronizer(self):
+        if hasattr (self.gr, 'synchronizer'):
+            return self.gr.synchronizer
+        else:
+            return None
+    @property
+    def syncdir(self):
+        ret = None
+        if hasattr (self.gr, 'synchronizer'):
+            if self.gr.synchronizer is not None:
+                ret = self.gr.synchronizer.path
+        return ret
+    def activate_synchronizer(self, syncdir = None): ### !!! TODO !!!!!: tüm senkronizer settinglerini buna bagla yoksa layersdaki arraylar senkronize olmuyor.
+        synchronizer = self._parse_synchronizer(syncdir)
+        self._gr = zarr.open_group(self.pyramid_root, mode = 'r+', synchronizer = synchronizer)
+        for pth in self.resolution_paths:
+            self._arrays[pth] = self.gr[pth]
+        return self
+
+    def from_zarr(self, # add limit to layers ### main pyramid method
                   fpath,
                   include_imglabels = False,
                   resolution_paths = None,
-                  keep_array_type: bool = True
+                  keep_array_type: bool = True,
+                  syncdir = 'same'
                   ):
-        self.fpath = fpath
-        self._omezarr_root = fpath
+        # self.fpath = fpath
+        self._pyramid_root = fpath
         # fpath = 'OME_Zarr/data/filament.zarr'
-        grp = zarr.open_group(fpath, mode='r+')
+        if syncdir == 'same':
+            grp = zarr.open_group(fpath, mode='r+')
+        else:
+            synchronizer = self._parse_synchronizer(syncdir)
+            grp = zarr.open_group(fpath, mode='r+', synchronizer = synchronizer)
         multimeta = validate_multimeta(grp)
         mm = Multimeta(multimeta)
-        self.gr = grp
+        self._gr = grp
         for pth, arr in self.gr.arrays():
             if not self.has_axes:
                 self.parse_axes(mm.axis_order, unit_list=mm.unit_list)
@@ -1076,8 +1168,10 @@ class Pyramid(Multimeta, Operations):
         for pth, arr in self.layers.items():
             if hasattr(arr, 'write_binary'): # means it is blockwise
                 self._arrays[pth] = arr.output
-            elif isinstance(arr, zarr.Array):
-                self._arrays[pth] = arr
+            elif isinstance(arr, zarr.Array): # TODO: this should be probably parallelized
+                # self.gr[pth] = arr
+                zarr.copy(arr, self.gr)
+                self._arrays[pth] = self.gr[pth]
             elif isinstance(arr, da.Array):
                 self.save_dask_layer(fpath,
                                      pth = pth,
@@ -1089,20 +1183,39 @@ class Pyramid(Multimeta, Operations):
                 warnings.warn(f"The data type could not be recognized!")
         return self
 
-    def to_zarr(self, # !!!
+    def _parse_synchronizer(self, syncdir):
+        if syncdir is not None and syncdir != 'same' and syncdir != 'default':
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+        elif syncdir == 'default':
+            syncdir = os.path.expanduser('~') + '/.syncdir'
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+        elif syncdir == 'same':
+            synchronizer = self.synchronizer
+        else:
+            synchronizer = None
+        return synchronizer
+
+    def to_zarr(self, # Pyramid class
                 fpath,
                 overwrite: bool = False,
                 include_imglabels = False,
                 region_sizes = None,
                 verbose = False,
-                only_meta = False
+                only_meta = False,
+                syncdir = 'same'
                 ):
-        grp = zarr.open_group(fpath, mode='a')
+        synchronizer = self._parse_synchronizer(syncdir)
+        if isinstance(fpath, str):
+            store = zarr.DirectoryStore(fpath, dimension_separator = self.dimension_separator)
+        else:
+            store = fpath
+        grp = zarr.open_group(store, mode='a', synchronizer = synchronizer)
+        self._gr = grp
         if only_meta:
             pass
         else:
             self.save_binary(fpath, region_sizes, overwrite)
-        grp.attrs['multiscales'] = self.multimeta
+        self.gr.attrs['multiscales'] = self.multimeta
         # if include_imglabels:
         #     labelgrp = grp.create_group('labels', overwrite=overwrite)
         #     for label_name in self.label_paths:
@@ -1120,15 +1233,21 @@ class Pyramid(Multimeta, Operations):
             keys = list(datasets[pth])
             assert 'array' in keys, 'dataset must contain an array section.'
             arr = dataset['array']
-            assert isinstance(arr, (np.ndarray, da.Array)), f'Array must be either of the types: {np.ndarray} or {da.Array}.'
+            assert isinstance(arr, (np.ndarray, da.Array, zarr.Array)), f'Array must be either of the types: {np.ndarray} or {da.Array}.'
             if isinstance(arr, np.ndarray):
                 if 'chunks' in keys:
                     arr = da.from_array(arr, chunks = dataset['chunks'])
                 else:
                     arr = da.from_array(arr, chunks = 'auto')
-            if 'chunks' in keys:
-                if dataset['chunks'] != arr.chunksize:
-                    arr = arr.rechunk(dataset['chunks'])
+            elif isinstance(arr, zarr.Array):
+                if 'chunks' in keys:
+                    if dataset['chunks'] != arr.chunks:
+                        warnings.warn(f"The chunk size of the zarr array in the dict does not fit the chunk size of the Pyramid instance!")
+                        warnings.warn(f"Using the chunk size of the zarr array.")
+            elif isinstance(arr, da.Array):
+                if 'chunks' in keys:
+                    if dataset['chunks'] != arr.chunksize:
+                        arr = arr.rechunk(dataset['chunks'])
             if 'dtype' in keys:
                 if dataset['dtype'] != arr.dtype:
                     arr = arr.astype(dataset['dtype'])
@@ -1262,7 +1381,7 @@ class Pyramid(Multimeta, Operations):
                 if metakey in zarr_meta:
                     self.array_meta[pth][metakey] = zarr_meta[metakey]
 
-    def add_layer(self,
+    def add_layer(self, ### separate add_dask_layer, add_zarr_layer, etc.
                   arr: Union[zarr.Array, da.Array],
                   pth: str,
                   scale: Iterable[Union[int, float]],
@@ -1326,7 +1445,8 @@ class Pyramid(Multimeta, Operations):
         self.add_imglabel(lpyr, name)
 
     def del_layer(self,
-                  pth
+                  pth,
+                  hard = False
                   ):
         pth = cnv.asstr(pth)
         del self._arrays[pth]
@@ -1336,11 +1456,15 @@ class Pyramid(Multimeta, Operations):
         del self._array_meta_[pth]
         if self.nlayers == 0:
             self.multimeta[0]['axes'] = []
+        if hard:
+            if isinstance(self.refarray.store, zarr.DirectoryStore):
+                del self.gr[pth]
         return self
 
     def shrink(self,
                paths = None,
-               label_paths = None
+               label_paths = None,
+               hard = False
                ):
         if paths is None:
             paths = [self.refpath]
@@ -1349,7 +1473,7 @@ class Pyramid(Multimeta, Operations):
         paths = [cnv.asstr(s) for s in paths]
         for pth in self.resolution_paths:
             if pth not in paths:
-                self.del_layer(pth)
+                self.del_layer(pth, hard = hard)
         if label_paths is not None:
             if label_paths == 'all': label_paths = self.label_paths
             for lpth in label_paths:
@@ -1521,37 +1645,176 @@ class Pyramid(Multimeta, Operations):
                     self.labels[lpth].recompress(new_compressor, paths)
         return self
 
-    def rescale(self,
-                scale_factor: Union[list, tuple, int, float],
-                resolutions: int = None,
-                planewise: bool = True
-                ):
-        if resolutions is None: resolutions = len(self.resolution_paths)
-        pathlist = [str(i) for i in range(int(self.refpath), int(self.refpath) + resolutions)]
-        for pth in self.resolution_paths:
-            if pth not in pathlist:
-                self.del_layer(pth)
-        refscale = self.get_scale(self.refpath)
-        rescaled = cnv.rescale(self.refarray, refscale, self.axis_order, resolutions, planewise, scale_factor)
-        if self.has_translation:
-            translation = copy.deepcopy(self.get_translation(self.refpath))
-        else:
-            translation = None
-        for pth, (arr, scale) in zip(pathlist, rescaled.values()):
-            if pth in self.array_meta.keys():
-                zarr_meta = self.array_meta[pth]
-            else:
-                zarr_meta = {'dtype': arr.dtype,
-                             'chunks': arr.chunksize,
-                             'shape': arr.shape
-                             }
-            self.add_layer(arr, pth, scale, zarr_meta = zarr_meta, overwrite = True)
-        if translation is not None:
-            self.update_translations(translation)
-        return self
+    # def rescale(self,
+    #             scale_factor: Union[list, tuple, int, float],
+    #             resolutions: int = None,
+    #             planewise: bool = True
+    #             ):
+    #     if resolutions is None: resolutions = len(self.resolution_paths)
+    #     pathlist = [str(i) for i in range(int(self.refpath), int(self.refpath) + resolutions)]
+    #     for pth in self.resolution_paths:
+    #         if pth not in pathlist:
+    #             self.del_layer(pth)
+    #     refscale = self.get_scale(self.refpath)
+    #     rescaled = cnv.rescale(self.refarray, refscale, self.axis_order, resolutions, planewise, scale_factor)
+    #     if self.has_translation:
+    #         translation = copy.deepcopy(self.get_translation(self.refpath))
+    #     else:
+    #         translation = None
+    #     for pth, (arr, scale) in zip(pathlist, rescaled.values()):
+    #         if pth in self.array_meta.keys():
+    #             zarr_meta = self.array_meta[pth]
+    #         else:
+    #             zarr_meta = {'dtype': arr.dtype,
+    #                          'chunks': arr.chunksize,
+    #                          'shape': arr.shape
+    #                          }
+    #         self.add_layer(arr, pth, scale, zarr_meta = zarr_meta, overwrite = True)
+    #     if translation is not None:
+    #         self.update_translations(translation)
+    #     return self
 
     def get_current_scale_factors(self):
-        return {pth: np.divide(self.array_meta[self.refpath]['shape'], self.array_meta[pth]['shape']) for pth in self.array_meta.keys()}
+        return {pth: np.divide(self.array_meta[self.refpath]['shape'], self.array_meta[pth]['shape']).tolist() for pth in self.array_meta.keys()}
+    @property
+    def scale_factors(self):
+        return self.get_current_scale_factors()
+    @property
+    def layer_shapes(self):
+        return {pth: self.array_meta[pth]['shape'] for pth in self.array_meta.keys()}
+
+    def rescale(self,
+                n_layers: Union[Tuple, List],
+                scale_factor: Union[Tuple, List] = None,
+                min_input_block_size: tuple = None,
+                overwrite_layers: bool = False,
+                n_jobs = 8
+                ):
+        """
+        This function rescales the entire Pyramid based on the top resolution layer. Note that if there are already existing
+        resolution layers they might be overriden.
+
+        :param n_layers:
+        :param scale_factor:
+        :param min_input_block_size:
+        :param overwrite_layers:
+        :return:
+        """
+
+        if scale_factor is None:
+            assert '1' in self.resolution_paths
+            scale_factor = self.scale_factors['1']
+        refpath = str(np.arange(n_layers)[0])
+        refarray = self.layers[refpath]
+        refscale = self.scales[refpath]
+        rootpath = self.pyramid_root
+        nlayers = self.nlayers
+        # refarray = pyr.layers[pyr.refpath]
+        # refscale = pyr.scales[pyr.refpath]
+        # rootpath = pyr.pyramid_root
+        # n_layers = 5
+        # scale_factor = (1, 2, 2)
+        # min_input_block_size = (21, 21, 21)
+        # # refarray = zarr.zeros((100, 200, 200), chunks = (20, 20, 20), store = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data3/test1/0")
+        # overwrite_layers = True
+        # # mutils._get_root_path(refarray)
+        # # mutils._get_path_name(refarray)
+        rescaled_layers = mutils.downscale_multiscales(input_array = refarray,
+                                                       rootpath = rootpath,
+                                                       n_layers = n_layers,
+                                                       scale_factor = scale_factor,
+                                                       min_input_block_size = min_input_block_size,
+                                                       overwrite_layers = overwrite_layers,
+                                                       n_jobs = n_jobs
+                                                       )
+        scales = mutils.get_scales_from_rescaled(rescaled = rescaled_layers,
+                                                 refscale = refscale,
+                                                 refpath = '0'
+                                                 )
+
+
+        meta = self.array_meta[refpath]
+        for pth in scales.keys():
+            if pth in self.array_meta.keys():
+                meta = self.array_meta[pth]
+            arr = rescaled_layers[pth]
+            scale = scales[pth]
+            self.add_layer(arr,
+                          pth,
+                          scale = scale,
+                          translation = self.get_translation(pth),
+                          zarr_meta={'dtype': meta['dtype'],
+                                     'chunks': meta['chunks'],
+                                     'shape': arr.shape,
+                                     'compressor': meta['compressor'],
+                                     'dimension_separator': meta['dimension_separator']
+                                     },
+                          axis_order = self.axis_order,
+                          unitlist = self.unit_list,
+                          overwrite = True
+                          )
+        paths = set([self.refpath] + list(scales.keys()))
+        # print(len(paths), nlayers)
+        if len(paths) < nlayers:
+            self.shrink(paths, hard = True)
+        self.gr.attrs['multiscales'] = self.multimeta
+        return self
+
+    def assign(self, # TODO: KALDIM, bunu assigment ve rescaling kullanarak basar.
+               # TODO: Here the biggest danger is race conditions. Think about including synchronizer.
+               # TODO: Maybe consider a quick assignment, which does not use joblib, just streams chunks arr1[:] = arr2[:].
+               # dest: zarr.Array, # This is the top layer of this pyramid
+               source: Union[zarr.Array, np.ndarray, int, float], # This can be another pyramid or simply an array. If another pyramid, its top layer will be used.
+               dest_slice: Union[Dict, Tuple, List],
+               source_slice: Union[Dict, Tuple, List] = None,
+               block_size=None,
+               n_jobs=8,
+               require_sharedmem=None,
+               ):
+        if isinstance(source, Pyramid):
+            source = source.refarray
+        dest = self.refarray # dest is self.
+        dest = asutils.basic_assign(dest = dest,
+                                    source = source,
+                                    dest_slice = dest_slice,
+                                    source_slice = source_slice,
+                                    block_size = block_size, # todo: be careful. Might cause race conditions.
+                                    n_jobs = n_jobs,
+                                    require_sharedmem = require_sharedmem
+                                    )
+        refpath = self.refpath
+        # refarray = self.layers[refpath]
+        refscale = self.scales[refpath]
+        nlayers = self.nlayers
+        meta = self.array_meta[refpath]
+        paths = self.resolution_paths
+        scale_factors = copy.deepcopy(self.scale_factors)
+
+        self.add_layer(dest,
+                       refpath,
+                       scale=refscale,
+                       translation=self.get_translation(refpath),
+                       zarr_meta={'dtype': meta['dtype'],
+                                  'chunks': meta['chunks'],
+                                  'shape': dest.shape,
+                                  'compressor': meta['compressor'],
+                                  'dimension_separator': meta['dimension_separator']
+                                  },
+                       axis_order=self.axis_order,
+                       unitlist=self.unit_list,
+                       overwrite=True
+                       )
+
+        if nlayers == 1:
+            return self
+
+        if '1' in paths:
+            scale_factor = scale_factors['1']
+        else:
+            scale_factor = scale_factors[paths[1]]
+
+        self.rescale(n_layers = nlayers, scale_factor = scale_factor, overwrite_layers = True, n_jobs = n_jobs)
+        return self
 
     def rescale_to_shapes(self, # new_shapes must contain the refpath
                           new_shapes
@@ -1972,7 +2235,7 @@ class PyramidCollection: # Change to PyramidIO
         if input in [None, []]:
             pass
         else:
-            input = [pyr.copy() for pyr in input]
+            input = [pyr for pyr in input]
             for pyr in input:
                 self.add_pyramid(pyr,
                                  stringent = stringent
@@ -2270,6 +2533,58 @@ class PyramidCollection: # Change to PyramidIO
     # def stack(self):
     #     pass
 
+# fpath = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data3/filament.zarr"
+# pyr = Pyramid().from_zarr(fpath)
+# pyr.shrink(['0'], hard = True)
+# pyr.rescale(4, overwrite_layers = True)
+
+# pyr.rescale(3, overwrite_layers = True)
+
+# pyr.rescale(5, scale_factor = (1, 3, 4), overwrite_layers = True)
+# pyr.layer_shapes
+# import inspect
+# inspect.signature(pyr.rescale)
+
+# import napari
+# v = napari.Viewer()
+# v.open(pyr.pyramid_root, plugin="napari-ome-zarr")
+
+# arr = pyr.layers['4']
+# arr.store.path
+
+# fpath = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data3/filament.zarr"
+# opath = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data3/filament2.zarr"
+#
+# synchdir = f"/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data3/sync"
+# # # gr = zarr.open_group(fpath, synchronizer = synchronizer)
+# # # gr.synchronizer.path
+# #
+# pyr1 = Pyramid().from_zarr(fpath)
+# pyr2 = pyr1.copy(new_dir = opath)
+# # pyr1.synchronizer
+# # pyr2.synchronizer
+# pyr2.activate_synchronizer(synchdir) ### Layersdaki arraylerin synchronizerlari görünmüyor ama aslinda varlar. gr icinden girmek gerekiyor arraylere.
+# pyr2.gr['0'].synchronizer
+# pyr2.layers['0'].synchronizer
 
 
+# pyr2 = pyr1.to_zarr(opath, verbose = True, syncdir = f'/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data3/syncdir')
+#
+# pyr1.synchronizer
+# pyr2.synchronizer
+
+
+
+#
+# pyr1.assign(pyr2,
+#             dest_slice = ((0, 10), (100, 200), (150, 200)),
+#             source_slice = ((10, 20), (110, 210), (100, 150))
+#             )
+# #
+# pyr2.assign(pyr1,
+#             dest_slice = ((0, 10), (100, 200), (150, 200)),
+#             source_slice = ((10, 20), (110, 210), (100, 150))
+#             )
+# #
+# np.max(pyr2.layers['0'])
 

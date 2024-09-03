@@ -116,7 +116,7 @@ class Converter:
                     compression: str = None,
                     max_workers: int = None,
                     no_nested: bool = None,
-                    drop_series: bool = None,
+                    use_bioformats2raw_layout: bool = False,
                     overwrite: bool = None,
                     ):
 
@@ -140,7 +140,7 @@ class Converter:
             cmd += [" --max_workers", ' %s' % max_workers]
         if no_nested is not None:
             cmd += [" --no-nested"]
-        if drop_series is not None:
+        if use_bioformats2raw_layout in (None, 'None', False, 'False'):
             cmd += [" --scale-format-string", ' %s' % "'%2$d'"]
         if overwrite is not None:
             cmd += [" --overwrite"]
@@ -226,7 +226,7 @@ class Converter:
                     compression: str = None,
                     max_workers: int = None,
                     no_nested: bool = None,
-                    drop_series: bool = None,
+                    use_bioformats2raw_layout: bool = False,
                     overwrite: bool = None,
                     ):
         globpattern = os.path.join(input_dir, pattern)
@@ -252,7 +252,7 @@ class Converter:
                                             compression = compression,
                                             max_workers = max_workers,
                                             no_nested = no_nested,
-                                            drop_series = drop_series,
+                                            use_bioformats2raw_layout = use_bioformats2raw_layout,
                                             overwrite = overwrite
                                             )
             if not self.use_shell:
@@ -276,3 +276,16 @@ def to_omezarr():
 
 def to_ometiff():
     fire.Fire(Converter().as_exec().from_cmdlist().to_ometiff)
+
+
+# pattern = '*'
+# input_dir = f'/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data1/pff'
+# output_dir1 = f'/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data1/zarrs1'
+# output_dir2 = f'/home/oezdemir/PycharmProjects/dask_distributed/ome_zarr_pyramid/data1/tiffs1'
+# cvt = Converter()
+# cvt.to_omezarrs(input_dir = input_dir, output_dir = output_dir1, pattern = pattern, use_bioformats2raw_layout = True, max_workers = 1
+#                 )
+#
+# cvt.to_ometiffs(input_dir = input_dir, output_dir = output_dir2, pattern = pattern
+#                 )
+

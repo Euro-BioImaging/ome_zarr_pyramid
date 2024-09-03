@@ -81,6 +81,7 @@ class ApplyToPyramid:
                  ### zarr parameters
                  store: str = None,
                  compressor='auto',
+                 chunks = None,
                  dimension_separator = None,
                  dtype=None,
                  overwrite=False,
@@ -88,7 +89,7 @@ class ApplyToPyramid:
                  func=None,
                  runner = None,
                  n_jobs = None,
-                 monoresolution = False,
+                 select_layers = 'all',
                  **kwargs
                 ):
         assert isinstance(input, (Pyramid, PyramidCollection))
@@ -100,11 +101,16 @@ class ApplyToPyramid:
         self.min_block_size = min_block_size
         self.subset_indices = _parse_subset_indices(self.input, subset_indices)
         ### zarr parameters
+        self.select_layers = select_layers
         self.store = store
         if compressor is None:
             self.compressor = self.input.compressor
         else:
             self.compressor = compressor
+        if chunks is None:
+            self.chunks = self.input.chunks
+        else:
+            self.chunks = chunks
         if dimension_separator is None:
             self.dimension_separator = self.input.dimension_separator
         else:
@@ -119,8 +125,8 @@ class ApplyToPyramid:
             self.n_jobs = multiprocessing.cpu_count() // 2
         else:
             self.n_jobs = n_jobs
-        if monoresolution:
-            self.input.shrink(self.input.refpath)
+        # if monoresolution:
+        #     self.input.shrink(self.input.refpath)
         self.blockwises = {}
 
     def set_function(self, func): # Override upon inheritance.
@@ -138,6 +144,17 @@ class ApplyToPyramid:
         else:
             self.args = _parse_args(*args)
             self.kwargs = kwargs
+
+    def parse_resolution_paths(self):
+        if self.select_layers == 'all':
+            paths = self.input.resolution_paths
+        elif isinstance(self.select_layers, int):
+            paths = [str(pth) for pth in np.arange(self.select_layers)]
+        elif isinstance(self.select_layers, (tuple, list)):
+            paths = [str(pth) for pth in self.select_layers]
+        else:
+            raise ValueError(f"Resolution layers could not be detected.")
+        return paths
 
     def _write_single_layer(self, # Override upon inheritance.
                             # out,
@@ -171,10 +188,13 @@ class ApplyToPyramid:
 
 
     def add_layers(self):
+        paths = self.parse_resolution_paths()
+
         self.output = Pyramid()
 
         syncdir = tempfile.mkdtemp()
-        for i, (pth, layer) in enumerate(self.input.layers.items()):
+        for i, pth in enumerate(paths):
+            layer = self.input.layers[pth]
             if self.store is not None:
                 arraypath = os.path.join(self.store, pth)
             else:
@@ -193,6 +213,7 @@ class ApplyToPyramid:
                                     subset_indices = self.subset_indices[pth],
                                     store = arraypath,
                                     compressor = self.compressor,
+                                    chunks = self.chunks,
                                     dimension_separator = self.dimension_separator,
                                     dtype = self.dtype,
                                     overwrite = self.overwrite,
@@ -216,7 +237,7 @@ class ApplyToPyramid:
                                              None, sequential, None)
 
             self.blockwises[pth] = blockwise
-        self.output.to_zarr(self.store, overwrite = self.overwrite)
+        self.output.to_zarr(self.store, overwrite = self.overwrite, syncdir = 'default')
         if self.output.refarray.synchronizer is not None:
             synchpath = os.path.dirname(self.output.refarray.synchronizer.path)
             shutil.rmtree(synchpath)
@@ -233,6 +254,7 @@ class ApplyAndRescale(ApplyToPyramid):
                  ### zarr parameters
                  store: str = None,
                  compressor='auto',
+                 chunks = None,
                  dimension_separator = None,
                  dtype=None,
                  overwrite=False,
@@ -240,7 +262,7 @@ class ApplyAndRescale(ApplyToPyramid):
                  func=None,
                  runner = None,
                  n_jobs = None,
-                 monoresolution = False,
+                 select_layers = 'all',
                  **kwargs
                 ):
         ApplyToPyramid.__init__(self,
@@ -251,13 +273,14 @@ class ApplyAndRescale(ApplyToPyramid):
                                 subset_indices = subset_indices,
                                 store = store,
                                 compressor = compressor,
+                                chunks = chunks,
                                 dimension_separator = dimension_separator,
                                 dtype = dtype,
                                 overwrite = overwrite,
                                 func = func,
                                 runner = runner,
                                 n_jobs = n_jobs,
-                                monoresolution = monoresolution,
+                                select_layers = select_layers,
                                 **kwargs
                                 )
 
@@ -333,9 +356,16 @@ class ApplyAndRescale(ApplyToPyramid):
         downscaling = {i: True for i in self.input.resolution_paths}
         downscaling[self.input.refpath] = False
 
+        ###
+        paths = self.parse_resolution_paths()
+        ###
+
         syncdir = tempfile.mkdtemp()
         block_overlap_sizes = self.block_overlap_sizes
-        for i, (pth, scale_factor) in enumerate(scale_factors.items()):
+
+        # for i, (pth, scale_factor) in enumerate(scale_factors.items()):
+        for i, pth in enumerate(paths):
+            # print(f"Current scale factor is: {scale_factor}")
             if self.store is not None:
                 arraypath = os.path.join(self.store, pth)
             else:
@@ -353,6 +383,7 @@ class ApplyAndRescale(ApplyToPyramid):
                                     subset_indices=subset_ids[pth],
                                     store=arraypath,
                                     compressor=self.compressor,
+                                    chunks = self.chunks,
                                     dimension_separator=self.dimension_separator,
                                     dtype=self.dtype,
                                     overwrite=self.overwrite,
@@ -375,6 +406,10 @@ class ApplyAndRescale(ApplyToPyramid):
             layer = self._write_single_layer(
                                              blockwise, pth, meta,
                                              scales, sequential, downscaling[pth])
+            # print(f"Now the blockwise no {i} being run.")
+            # print(f"Is sequential: {sequential}")
+            # print(f"Layer shape after: {layer.shape}")
+            # print(f"downscaling: {downscaling[pth]}")
             self.blockwises[pth] = blockwise
             block_overlap_sizes = None
         self.output.to_zarr(self.store, overwrite=self.overwrite)
@@ -382,4 +417,5 @@ class ApplyAndRescale(ApplyToPyramid):
             synchpath = os.path.dirname(self.output.refarray.synchronizer.path)
             shutil.rmtree(synchpath)
         return self.output
+
 

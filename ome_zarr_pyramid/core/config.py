@@ -9,6 +9,22 @@ unit_map = {
     'x': 'Pixel'
 }
 
+scale_factor_map = {
+    't': 1,
+    'c': 1,
+    'z': 1,
+    'y': 2,
+    'x': 2
+}
+
+scale_map = {
+    't': 1,
+    'c': 1,
+    'z': 1,
+    'y': 1,
+    'x': 1
+}
+
 type_map = {
     't': 'time',
     'c': 'channel',

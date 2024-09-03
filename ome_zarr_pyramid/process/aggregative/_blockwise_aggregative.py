@@ -33,6 +33,7 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
                  ### zarr parameters for the output
                  store = None,
                  compressor = 'auto',
+                 chunks = None,
                  dimension_separator = '/',
                  dtype = None,
                  overwrite = False,
@@ -59,6 +60,7 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
                                  ### zarr parameters for the output
                                  store = store,
                                  compressor = compressor,
+                                 chunks = chunks,
                                  dimension_separator = dimension_separator,
                                  dtype = dtype,
                                  overwrite = overwrite,
@@ -73,15 +75,14 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
         self.shapes = agg._get_shapes_from_arraylist(self.input_collection)
         if 'axis' in self.func.parsed.keys():
             axis = self.func.parsed['axis'][0][0]
-        if self.func.name in ['concatenate_zarrs']:
-            self._output_shape = agg._get_final_shape_for_concatenation(self.shapes, axis=axis)
+        if self.func.name in ['concatenate_zarrs']: # TODO: add block here
+            self._output_shape = agg._get_final_shape_for_concatenation(self.shapes, axis=axis) # TODO: add block here
         self.func.parse_params(arraylist = self.input_collection)
 
-    def _create_slices(self,
+    def _create_slices(self, # TODO: maybe enable using smaller slices here.
                        slicing_direction = 'forwards'
                        ):
-        if self.func.name in ['concatenate_zarrs',
-                              ]:
+        if self.func.name in ['concatenate_zarrs']:
             in_slcs, out_slcs = [], []
             start = 0
             axis = self.func.parsed['axis'][0][0]
@@ -105,7 +106,7 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
                          reducer_slc = None):
         block = self.input_collection[i]
         try:
-            self.output[output_slc] = block
+            self.output[output_slc] = block # TODO: is this memory expensive? Output_slc can be very large. Maybe use smaller slices?
         except:
             print('#')
             print(f"Block no {i}")
@@ -117,3 +118,25 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
             print(f"Error at block no {i}")
             print('###')
         return self.output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
