@@ -47,7 +47,7 @@ class ApplyAggregativeToPyramid(ApplyToPyramid):
                         **kwargs
                         )
 
-    def set_function(self, func):  # overriding with FilterProfiler
+    def set_function(self, func):
         self.profiler = AggregativeProfiler(func)
         self.lazyfunc = LazyFunction(func, profiler=AggregativeProfiler)
 
@@ -95,7 +95,7 @@ class ApplyAggregativeAndRescale(ApplyAndRescale):
                         **kwargs
                         )
 
-    def set_function(self, func):  # overriding with FilterProfiler
+    def set_function(self, func):
         self.profiler = AggregativeProfiler(func)
         self.lazyfunc = LazyFunction(func, profiler=AggregativeProfiler)
 

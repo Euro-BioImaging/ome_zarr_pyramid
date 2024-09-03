@@ -7,22 +7,16 @@ from ome_zarr_pyramid.process import process_utilities as putils
 from ome_zarr_pyramid.process.core._blockwise_general import BlockwiseRunner, LazyFunction, FunctionProfiler
 from ome_zarr_pyramid.process.aggregative import _aggregative_functions as agg
 
-class AggregativeProfiler(FunctionProfiler):  # Automate this further in coordination with the FunctionProfiler.
+class AggregativeProfiler(FunctionProfiler):
     def __init__(self, func):
         FunctionProfiler.__init__(self, func)
         self.sample = [zarr.zeros((2, 3))] * 3
         self.try_run()
-    def try_run(self): # TODO: unify with the method in FunctionProfiler
+    def try_run(self):
         self.functype = 'expansive'
 
 
 class BlockwiseAggregativeRunner(BlockwiseRunner):
-    """
-    1: set a reference array
-    2: subset all
-    3: run aggregative function on subsets
-    4: rescale aggregated array
-    """
     def __init__(self,
                  input_collection: List[zarr.Array],
                  *args,
@@ -33,6 +27,7 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
                  ### zarr parameters for the output
                  store = None,
                  compressor = 'auto',
+                 chunks = None,
                  dimension_separator = '/',
                  dtype = None,
                  overwrite = False,
@@ -59,6 +54,7 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
                                  ### zarr parameters for the output
                                  store = store,
                                  compressor = compressor,
+                                 chunks = chunks,
                                  dimension_separator = dimension_separator,
                                  dtype = dtype,
                                  overwrite = overwrite,
@@ -80,8 +76,7 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
     def _create_slices(self,
                        slicing_direction = 'forwards'
                        ):
-        if self.func.name in ['concatenate_zarrs',
-                              ]:
+        if self.func.name in ['concatenate_zarrs']:
             in_slcs, out_slcs = [], []
             start = 0
             axis = self.func.parsed['axis'][0][0]
@@ -96,8 +91,6 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
             self.input_slices = in_slcs
             self.output_slices = out_slcs
             self.reducer_slices = out_slcs
-        # elif self.func.name in ['stack_zarrs']:
-        #     pass
         else:
             super()._create_slices(slicing_direction)
 
@@ -117,3 +110,25 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
             print(f"Error at block no {i}")
             print('###')
         return self.output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

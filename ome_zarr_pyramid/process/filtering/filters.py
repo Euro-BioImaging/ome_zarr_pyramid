@@ -10,24 +10,26 @@ from ome_zarr_pyramid.process.filtering.multiscale_apply_filter import ApplyFilt
 from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
 
 
-class Filters(_WrapperBase, ApplyFilterAndRescale): # TODO: add a project folder generator and auto-naming of temporary files. They should be auto-deletable.
+class Filters(_WrapperBase, ApplyFilterAndRescale):
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
                  block_overlap_sizes=None,
-                 subset_indices: dict = None,
+                 input_subset_indices: dict = None,
                  ### zarr parameters
-                 store: str = None,
-                 compressor='auto',
-                 dimension_separator=None,
+                 output_store: str = None,
+                 output_compressor='auto',
+                 output_chunks: Union[tuple, list] = None,
+                 output_dimension_separator=None,
                  output_dtype=None,
                  overwrite=False,
                  ###
-                 n_jobs=None,
-                 monoresolution=False,
+                 n_jobs = None,
+                 select_layers='all'
                  ):
-        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, subset_indices,
-                              store, compressor, dimension_separator, output_dtype, overwrite, n_jobs, monoresolution)
+        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+                              output_store, output_compressor, output_chunks, output_dimension_separator,
+                              output_dtype, overwrite, n_jobs, select_layers)
 
     def __run(self,
             input: Union[str, Pyramid],

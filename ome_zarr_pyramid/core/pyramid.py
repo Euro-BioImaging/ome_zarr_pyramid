@@ -13,6 +13,8 @@ from numcodecs import Blosc
 # from ome_zarr_pyramid.core.Hierarchy import OMEZarr, OMEZarrSample
 # from ome_zarr_pyramid.core.Hierarchy import MultiScales
 from ome_zarr_pyramid.core import config, convenience as cnv
+from ome_zarr_pyramid.utils import multiscale_utils as mutils
+from ome_zarr_pyramid.utils import assignment_utils as asutils
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 
 def validate_multimeta(grp):
@@ -32,7 +34,7 @@ def validate_img_labelmeta(grp):
     return img_label_meta
 
 def validate_labelsmeta(grp):
-    return
+    raise NotImplementedError(f"This function is not yet implemented.")
 
 def pyramids_are_similar(pyr1, pyr2):
     assert isinstance(pyr1, Pyramid)
@@ -43,9 +45,9 @@ def pyramids_are_similar(pyr1, pyr2):
     return True
 
 def validate_datasets(datasets):
-    pass
+    raise NotImplementedError(f"This function is not yet implemented.")
 
-class Multimeta: ### Unify with ImageLabelMeta
+class Multimeta:
     def __init__(self,
                  multimeta = None
                  ):
@@ -74,10 +76,8 @@ class Multimeta: ### Unify with ImageLabelMeta
     def is_imglabel(self):
         try:
             func = self.__getattribute__('set_image_label_metadata')
-            # print('function runs')
             return func()
         except:
-            # print('has no such function.')
             return False
 
     @property
@@ -183,7 +183,7 @@ class Multimeta: ### Unify with ImageLabelMeta
 
     def add_dataset(self,
                     path: Union[str, int],
-                    scale: Iterable[Union[int, float]], # scale is mandatory
+                    scale: Iterable[Union[int, float]],
                     translation: Iterable[Union[int, float]] = None,
                     overwrite: bool = False
                     ):
@@ -223,11 +223,32 @@ class Multimeta: ### Unify with ImageLabelMeta
         return self.multimeta[0]['datasets'][idx]['coordinateTransformations'][0]['scale']
 
     def set_scale(self,
-                  pth: Union[str, int],
-                  scale
+                  pth: Union[str, int] = 'auto',
+                  scale = 'auto',
+                  hard = False
                   ):
+        if isinstance(scale, tuple):
+            scale = list(scale)
+        elif hasattr(scale, 'tolist'):
+            scale = scale.tolist()
+        if pth == 'auto':
+            pth = self.refpath
+        if scale == 'auto':
+            pth = self.scales[pth]
         idx = self.resolution_paths.index(pth)
         self.multimeta[0]['datasets'][idx]['coordinateTransformations'][0]['scale'] = scale
+        if hard:
+            self.gr.attrs['multiscales'] = self.multimeta
+        return
+
+    def update_scales(self,
+                      reference_scale,
+                      hard = True
+                      ):
+        for pth, factor in self.scale_factors.items():
+            new_scale = np.multiply(factor, reference_scale)
+            self.set_scale(pth, new_scale, hard)
+        return self
 
     @property
     def scales(self):
@@ -245,7 +266,7 @@ class Multimeta: ### Unify with ImageLabelMeta
         idx = self.resolution_paths.index(pth)
         return self.multimeta[0]['datasets'][idx]['coordinateTransformations'][1]['translation']
 
-    def set_translation(self, # TODO: Better validation for translation metadata is needed.
+    def set_translation(self,
                         pth: Union[str, int],
                         translation
                         ):
@@ -357,7 +378,7 @@ class ImageLabelMeta:
         print('Try such function')
         return self.set_image_label_metadata()
 
-    def set_image_label_metadata(self, ### TODO: BUNU TAMIR ET. BOZUK SU ANDA.
+    def set_image_label_metadata(self,
                                   img_labeldict: dict = None
                                   ):
         if img_labeldict is None:
@@ -367,7 +388,6 @@ class ImageLabelMeta:
             self._img_label_meta = img_labeldict
         else:
             self._img_label_meta = cnv.turn2json(img_labeldict)
-        # print(f"Hier: {self._img_label_meta}")
         if not cnv.is_valid_json(self._img_label_meta):
             warnings.warn(f"The object is not a valid json.")
             return False
@@ -588,8 +608,6 @@ class ImageLabelMeta:
 # meta.sort_labels()
 
 class Operations:
-    def convolve(self):
-        return self
     def __add__(self, # TODO: support scalar
                 other
                 ):
@@ -752,20 +770,25 @@ class Pyramid(Multimeta, Operations):
             for pth in self.resolution_paths:
                 if pth not in self._array_meta_.keys():
                     self._array_meta_[pth] = {}
-        self._omezarr_root = None
-
-    # def methodWrapper(self,
-    #                   method
-    #                   ):
-    #     def wrapper(self,
-    #
-    #                 ):
 
     @property
-    def omezarr_root(self):
-        if self._omezarr_root is None:
-            warnings.warn(f'This pyramid has not been read from an OME-Zarr path.')
-        return self._omezarr_root
+    def refroot(self): # The root of the reference array.
+        if isinstance(self.refarray.store, zarr.DirectoryStore):
+            return self.refarray.store.path
+        else:
+            return None
+
+    @property
+    def pyramid_root(self):
+        if not self.refroot is None:
+            try:
+                arr = zarr.open_array(self.refroot, mode = 'r')
+                return os.path.dirname(self.refroot)
+            except:
+                grp = zarr.open_group(self.refroot, mode = 'r')
+                return self.refroot
+        else:
+            return None
 
     def __str__(self):
         return f"Pyramidal OME-Zarr with {self.nlayers} resolution layers."
@@ -798,11 +821,13 @@ class Pyramid(Multimeta, Operations):
                     key,
                     value
                     ):
-        """Connected to the add_layer method. Add only if the resolution path already exists.
-            CANNOT CREATE A NEW RESOLUTION LAYER.
-            Update the array meta with the new chunks and data type.
-            This can also be a zarr data. Then update zarr metadata accordingly.
-            """
+        """TODO:
+        Connected to the add_layer method. Add only if the resolution path already exists.
+        CANNOT CREATE A NEW RESOLUTION LAYER.
+        Update the array meta with the new chunks and data type.
+        This can also be a zarr data. Then update zarr metadata accordingly.
+        """
+        raise NotImplementedError(f"This method is not yet implemented.")
 
     def __delitem__(self,
                     key: Union[str, int] # add slice support
@@ -811,18 +836,19 @@ class Pyramid(Multimeta, Operations):
         if isinstance(key, int): key = str(key)
         return self.del_layer(key)
 
-    ###TODO: add other dunder methods
+    ### TODO: add other dunder methods
 
-    def copy(self, # TODO
-             paths: Union[list, tuple] = None,
-             label_paths = None, # make a config attribute for this
-             label_resolution_paths = 'all'
+    def copy(self,
+             new_dir,
+             overwrite = False
+             # paths: Union[list, tuple] = None,
+             # label_paths = None, # make a config attribute for this
+             # label_resolution_paths = 'all'
              ):
-        if paths is None:
-            paths = self.resolution_paths
         pyr = Pyramid()
+        paths = self.resolution_paths
         for pth in paths:
-            res = cnv.copy_array(self.layers[pth])
+            res = self.layers[pth]
             if not pyr.has_axes:
                 pyr.parse_axes(self.axis_order, unit_list=self.unit_list)
             scale = self.get_scale(pth)
@@ -830,15 +856,7 @@ class Pyramid(Multimeta, Operations):
             zarr_meta = self.array_meta[pth]
             pyr.add_layer(res, pth, scale, translation, zarr_meta)
             pyr.multimeta[0]['name'] = self.tag
-        if label_paths == 'all':
-            label_paths = self.label_paths
-        if label_paths is not None:
-            assert self.has_label_paths, f'No labels pyramid exists.'
-            assert isinstance(label_paths, (tuple, list)), f"Label_paths must be either of types list or tuple."
-            assert cnv.includes(self.label_paths, label_paths), f"Some of the specified paths do not exist."
-            for name in label_paths:
-                imglabel = self.labels[name]
-                pyr.add_imglabel(imglabel, name, label_resolution_paths) # TODO: add the method
+        pyr.to_zarr(new_dir, overwrite = overwrite)
         return pyr
 
     @property
@@ -852,8 +870,12 @@ class Pyramid(Multimeta, Operations):
 
     @property
     def refarray(self):
-        """The path to the full-resolution array."""
+        """The full-resolution array."""
         return self.layers[self.refpath]
+
+    @property
+    def refscale(self):
+        return self.scales[self.refpath]
 
     @property
     def shape(self):
@@ -879,16 +901,6 @@ class Pyramid(Multimeta, Operations):
     def physical_size(self):
         return self.layer_meta[self.refpath]['physical_size']
 
-    # @property
-    # def scale_factors(self):
-    #     sfs = {}
-    #     refshape = np.array(self.array_meta[self.refpath]['shape'])
-    #     for key in self.array_meta.keys():
-    #         shape = self.array_meta[key]['shape']
-    #         scale_factor = refshape / np.array(shape)
-    #         sfs[key] = scale_factor
-    #     return sfs
-
     def update_translations(self,
                             new_translation: (dict, list, tuple) # translation for ref path
                             ):
@@ -901,12 +913,7 @@ class Pyramid(Multimeta, Operations):
                     dct[ax] = 0 # not translated along this axis
             new_translation = list(dct.values())
         new_translation = np.array(new_translation)
-        # translations = {}
         for key, scale_factor in self.scales.items():
-            # div = np.divide(new_translation, scale_factor)
-            # div[np.isinf(div)] = 0
-            # div[np.isnan(div)] = 0
-            # self.set_translation(key, div.tolist())
             self.set_translation(key, new_translation)
         return self
 
@@ -936,19 +943,54 @@ class Pyramid(Multimeta, Operations):
         indices = self.index(ax, scalar_sensitive = False)
         return [shape[idx] for idx in indices]
 
-    def from_zarr(self, # add limit to layers
+    @property
+    def gr(self):
+        if hasattr(self, '_gr'):
+            return self._gr
+        else:
+            if self.pyramid_root is not None:
+                self._gr = zarr.open_group(self.pyramid_root, mode = 'a')
+                return self._gr
+            else:
+                return None
+
+    @property
+    def synchronizer(self):
+        if hasattr (self.gr, 'synchronizer'):
+            return self.gr.synchronizer
+        else:
+            return None
+    @property
+    def syncdir(self):
+        ret = None
+        if hasattr (self.gr, 'synchronizer'):
+            if self.gr.synchronizer is not None:
+                ret = self.gr.synchronizer.path
+        return ret
+    def activate_synchronizer(self, syncdir = None):
+        synchronizer = self._parse_synchronizer(syncdir)
+        self._gr = zarr.open_group(self.pyramid_root, mode = 'r+', synchronizer = synchronizer)
+        for pth in self.resolution_paths:
+            self._arrays[pth] = self.gr[pth]
+        return self
+
+    #  main pyramid method
+    def from_zarr(self, # TODO: add limit to layers
                   fpath,
                   include_imglabels = False,
                   resolution_paths = None,
-                  keep_array_type: bool = True
+                  keep_array_type: bool = True,
+                  syncdir = 'same'
                   ):
-        self.fpath = fpath
-        self._omezarr_root = fpath
-        # fpath = 'OME_Zarr/data/filament.zarr'
-        grp = zarr.open_group(fpath, mode='r+')
+        self._pyramid_root = fpath
+        if syncdir == 'same':
+            grp = zarr.open_group(fpath, mode='r+')
+        else:
+            synchronizer = self._parse_synchronizer(syncdir)
+            grp = zarr.open_group(fpath, mode='r+', synchronizer = synchronizer)
         multimeta = validate_multimeta(grp)
         mm = Multimeta(multimeta)
-        self.gr = grp
+        self._gr = grp
         for pth, arr in self.gr.arrays():
             if not self.has_axes:
                 self.parse_axes(mm.axis_order, unit_list=mm.unit_list)
@@ -960,7 +1002,6 @@ class Pyramid(Multimeta, Operations):
             if not 'labels' in self.gr.keys():
                 warnings.warn(f'No groups named "labels" exist.')
             self._labels_root = os.path.join(fpath, 'labels')
-            # print(self._labels_root)
             label_paths = list(self.gr['labels'].group_keys())
             for name in label_paths:
                 pyr = LabelPyramid()
@@ -1015,7 +1056,6 @@ class Pyramid(Multimeta, Operations):
         shape = list(self.array_meta[pth]['shape'])
         if region_sizes is None:
             region_sizes = {ax: 1 if ax in 'tc' else shape[self.index(ax)] for ax in self.axis_order}
-        # print(region_sizes)
         axes = self.axis_order
         slices = []
         for ax in axes:
@@ -1054,30 +1094,30 @@ class Pyramid(Multimeta, Operations):
                 print(f"The region {i + 1} of a total of {total} from layer {pth} is saved.")
         return
 
-    def compute(self, paths = None): ### make sure all methods can sense np array and perform a checkpoint before running.
-        if paths is None:
-            paths = self.layers.keys()
-        for pth in paths:
-            self._arrays[pth] = self.layers[pth].compute()
-        return self
+    # def compute(self, paths = None):
+    #     if paths is None:
+    #         paths = self.layers.keys()
+    #     for pth in paths:
+    #         self._arrays[pth] = self.layers[pth].compute()
+    #     return self
 
-    def to_dask(self):
-        arrmeta = copy.deepcopy(self.array_meta)
-        for pth, array in self.layers.items():
-            if isinstance(array, np.ndarray):
-                self._arrays[pth] = da.from_array(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
+    # def to_dask(self):
+    #     arrmeta = copy.deepcopy(self.array_meta)
+    #     for pth, array in self.layers.items():
+    #         if isinstance(array, np.ndarray):
+    #             self._arrays[pth] = da.from_array(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
 
-    def checkpoint(self):
-        """compute and switch back to dask"""
-        self.compute()
-        self.to_dask()
+    # def checkpoint(self):
+    #     self.compute()
+    #     self.to_dask()
 
     def save_binary(self, fpath, region_sizes, overwrite, verbose = False):
         for pth, arr in self.layers.items():
             if hasattr(arr, 'write_binary'): # means it is blockwise
                 self._arrays[pth] = arr.output
             elif isinstance(arr, zarr.Array):
-                self._arrays[pth] = arr
+                zarr.copy(arr, self.gr)
+                self._arrays[pth] = self.gr[pth]
             elif isinstance(arr, da.Array):
                 self.save_dask_layer(fpath,
                                      pth = pth,
@@ -1086,23 +1126,42 @@ class Pyramid(Multimeta, Operations):
                                      verbose = verbose
                                      )
             else:
-                warnings.warn(f"The data type could not be recognized!")
+                warnings.warn(f"The data type for path {pth} could not be recognized!")
         return self
 
-    def to_zarr(self, # !!!
+    def _parse_synchronizer(self, syncdir):
+        if syncdir is not None and syncdir != 'same' and syncdir != 'default':
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+        elif syncdir == 'default':
+            syncdir = os.path.expanduser('~') + '/.syncdir'
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+        elif syncdir == 'same':
+            synchronizer = self.synchronizer
+        else:
+            synchronizer = None
+        return synchronizer
+
+    def to_zarr(self, # Pyramid class
                 fpath,
                 overwrite: bool = False,
                 include_imglabels = False,
                 region_sizes = None,
                 verbose = False,
-                only_meta = False
+                only_meta = False,
+                syncdir = 'same'
                 ):
-        grp = zarr.open_group(fpath, mode='a')
+        synchronizer = self._parse_synchronizer(syncdir)
+        if isinstance(fpath, str):
+            store = zarr.DirectoryStore(fpath, dimension_separator = self.dimension_separator)
+        else:
+            store = fpath
+        grp = zarr.open_group(store, mode='a', synchronizer = synchronizer)
+        self._gr = grp
         if only_meta:
             pass
         else:
             self.save_binary(fpath, region_sizes, overwrite)
-        grp.attrs['multiscales'] = self.multimeta
+        self.gr.attrs['multiscales'] = self.multimeta
         # if include_imglabels:
         #     labelgrp = grp.create_group('labels', overwrite=overwrite)
         #     for label_name in self.label_paths:
@@ -1113,22 +1172,27 @@ class Pyramid(Multimeta, Operations):
         return self
 
     def from_dict(self,
-                  datasets: dict, ### compressor, dtype ve dimension_separator ekle
+                  datasets: dict
                ):
-        # pyr = Pyramid()
         for pth, dataset in datasets.items():
             keys = list(datasets[pth])
             assert 'array' in keys, 'dataset must contain an array section.'
             arr = dataset['array']
-            assert isinstance(arr, (np.ndarray, da.Array)), f'Array must be either of the types: {np.ndarray} or {da.Array}.'
+            assert isinstance(arr, (np.ndarray, da.Array, zarr.Array)), f'Array must be either of the types: {np.ndarray} or {da.Array}.'
             if isinstance(arr, np.ndarray):
                 if 'chunks' in keys:
                     arr = da.from_array(arr, chunks = dataset['chunks'])
                 else:
                     arr = da.from_array(arr, chunks = 'auto')
-            if 'chunks' in keys:
-                if dataset['chunks'] != arr.chunksize:
-                    arr = arr.rechunk(dataset['chunks'])
+            elif isinstance(arr, zarr.Array):
+                if 'chunks' in keys:
+                    if dataset['chunks'] != arr.chunks:
+                        warnings.warn(f"The chunk size of the zarr array in the dict does not fit the chunk size of the Pyramid instance!")
+                        warnings.warn(f"Using the chunk size of the zarr array.")
+            elif isinstance(arr, da.Array):
+                if 'chunks' in keys:
+                    if dataset['chunks'] != arr.chunksize:
+                        arr = arr.rechunk(dataset['chunks'])
             if 'dtype' in keys:
                 if dataset['dtype'] != arr.dtype:
                     arr = arr.astype(dataset['dtype'])
@@ -1157,17 +1221,14 @@ class Pyramid(Multimeta, Operations):
                 zarr_meta['dimension_separator'] = dataset['dimension_separator']
             else:
                 zarr_meta['dimension_separator'] = '/'
-            # if 'colors' in keys: # TODO
-
             if not self.has_axes:
                 self.parse_axes(axis_order, unit_list = unitlist)
             self.add_layer(arr, pth, scale, translation, zarr_meta = zarr_meta)
 
     def _validate_and_sync(self): # properly synch dtype
-        """Very important method that syncs any non-fitting dask array metadata to the metadata in the array_meta."""
+        """Method that syncs any non-fitting dask array metadata to the metadata in the array_meta."""
         meta_fields = ['dtype', 'chunks', 'shape']
         for pth, layer in self.layers.items():
-            # print(f"In validation: {self.array_meta[pth]['chunks']}")
             for metakey in meta_fields:
                 metavalue = self.array_meta[pth][metakey]
                 if metakey == 'dtype':
@@ -1209,18 +1270,15 @@ class Pyramid(Multimeta, Operations):
 
     def _add_layer(self,
                    pth: (str, int),
-                   zarr_meta: dict = None # essential for overriding existing array metadata
+                   zarr_meta: dict = None
                    ):
         """Add new array_meta to specific path."""
         pth = cnv.asstr(pth)
         assert pth in self.resolution_paths, f'Path {pth} does not exist in the current path list. First use add_layer method.'
-        # if zarr_meta is None:
-        #     assert isinstance(self.layers[pth], zarr.Array), f'If input is not a zarr.Array, then the zarr_meta must be provided.'
         arrmeta_keys = config.array_meta_keys
         for metakey in arrmeta_keys:
             if isinstance(self.layers[pth], zarr.Array):
                 if metakey in self.layers[pth]._meta:
-                    # print(self.layers[pth])
                     if metakey == 'compressor':
                         self.array_meta[pth][metakey] = self.layers[pth].compressor
                     elif metakey == 'dtype':
@@ -1262,7 +1320,7 @@ class Pyramid(Multimeta, Operations):
                 if metakey in zarr_meta:
                     self.array_meta[pth][metakey] = zarr_meta[metakey]
 
-    def add_layer(self,
+    def add_layer(self, ### TODO: separate into add_dask_layer, add_zarr_layer, etc.
                   arr: Union[zarr.Array, da.Array],
                   pth: str,
                   scale: Iterable[Union[int, float]],
@@ -1326,7 +1384,8 @@ class Pyramid(Multimeta, Operations):
         self.add_imglabel(lpyr, name)
 
     def del_layer(self,
-                  pth
+                  pth,
+                  hard = False
                   ):
         pth = cnv.asstr(pth)
         del self._arrays[pth]
@@ -1336,11 +1395,15 @@ class Pyramid(Multimeta, Operations):
         del self._array_meta_[pth]
         if self.nlayers == 0:
             self.multimeta[0]['axes'] = []
+        if hard:
+            if isinstance(self.refarray.store, zarr.DirectoryStore):
+                del self.gr[pth]
         return self
 
     def shrink(self,
                paths = None,
-               label_paths = None
+               label_paths = None,
+               hard = False
                ):
         if paths is None:
             paths = [self.refpath]
@@ -1349,7 +1412,7 @@ class Pyramid(Multimeta, Operations):
         paths = [cnv.asstr(s) for s in paths]
         for pth in self.resolution_paths:
             if pth not in paths:
-                self.del_layer(pth)
+                self.del_layer(pth, hard = hard)
         if label_paths is not None:
             if label_paths == 'all': label_paths = self.label_paths
             for lpth in label_paths:
@@ -1402,164 +1465,176 @@ class Pyramid(Multimeta, Operations):
                 axis_order = self.axis_order
             self.parse_axes(axis_order, newmeta['unit_list'], overwrite = True)
 
-    def astype(self,
-               new_dtype: Union[np.dtype, type, str],
-               paths: Union[list, str] = None, # if None, update all paths
-               label_paths: List[str] = None
-               ):
-        assert isinstance(np.dtype(new_dtype), (np.dtype, str)) or any(new_dtype == item for item in [int, float]) # TODO: fix
-        try:
-            npdtype = np.dtype(new_dtype)
-            _ = npdtype
-        except:
-            raise TypeError(f'The given data type is not parsable.')
-        if paths is None:
-            paths = self.resolution_paths
-        else:
-            paths = cnv.parse_as_list(paths)
-            assert cnv.includes(self.resolution_paths, paths)
-        for pth in paths:
-            layer = self.layers[pth].astype(new_dtype)
-            zarr_meta = self.array_meta[pth]
-            zarr_meta['dtype'] = new_dtype
-            # translation = self.translations[pth] if self.has_translation else None
-            self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
-        if label_paths is not None:
-            if label_paths == 'all': label_paths = self.label_paths
-            for lpth in label_paths:
-                if lpth in self.label_paths:
-                    self.labels[lpth].astype(new_dtype, paths)
-        return self
+    # def astype(self,
+    #            new_dtype: Union[np.dtype, type, str],
+    #            paths: Union[list, str] = None, # if None, update all paths
+    #            label_paths: List[str] = None
+    #            ):
+    #     assert isinstance(np.dtype(new_dtype), (np.dtype, str)) or any(new_dtype == item for item in [int, float])
+    #     try:
+    #         npdtype = np.dtype(new_dtype)
+    #         _ = npdtype
+    #     except:
+    #         raise TypeError(f'The given data type is not parsable.')
+    #     if paths is None:
+    #         paths = self.resolution_paths
+    #     else:
+    #         paths = cnv.parse_as_list(paths)
+    #         assert cnv.includes(self.resolution_paths, paths)
+    #     for pth in paths:
+    #         layer = self.layers[pth].astype(new_dtype)
+    #         zarr_meta = self.array_meta[pth]
+    #         zarr_meta['dtype'] = new_dtype
+    #         # translation = self.translations[pth] if self.has_translation else None
+    #         self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
+    #     if label_paths is not None:
+    #         if label_paths == 'all': label_paths = self.label_paths
+    #         for lpth in label_paths:
+    #             if lpth in self.label_paths:
+    #                 self.labels[lpth].astype(new_dtype, paths)
+    #     return self
 
-    def asflat(self,
-               paths: Union[list, str] = None,  # if None, update all paths
-               label_paths: List[str] = None, # if None, no label_path is processed. If not None, must be a list of label_paths
-               ):
-        if paths is None:
-            paths = self.resolution_paths
-        else:
-            paths = cnv.parse_as_list(paths)
-            assert cnv.includes(self.resolution_paths, paths)
-        for pth in paths:
-            zarr_meta = self.array_meta[pth]
-            zarr_meta['dimension_separator'] = '.'
-            layer = self.layers[pth]
-            # translation = self.translations[pth] if self.has_translation else None
-            self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
-        if label_paths is not None:
-            if label_paths == 'all': label_paths = self.label_paths
-            for lpth in label_paths:
-                if lpth in self.label_paths:
-                    self.labels[lpth].asflat(paths)
-        return self
-
-    def asnested(self,
-                 paths: Union[list, str] = None,  # if None, update all paths
-                 label_paths: List[str] = None
-                 ):
-        if paths is None:
-            paths = self.resolution_paths
-        else:
-            paths = cnv.parse_as_list(paths)
-            assert cnv.includes(self.resolution_paths, paths)
-        for pth in paths:
-            zarr_meta = self.array_meta[pth]
-            zarr_meta['dimension_separator'] = '/'
-            layer = self.layers[pth]
-            # translation = self.translations[pth] if self.has_translation else None
-            self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
-        if label_paths is not None:
-            if label_paths == 'all': label_paths = self.label_paths
-            for lpth in label_paths:
-                if lpth in self.label_paths:
-                    self.labels[lpth].asnested(paths)
-        return self
-
-    def rechunk(self,
-                new_chunks: Union[list, tuple],
-                paths: Union[list, str] = None,  # if None, update all paths
-                label_paths: List[str] = None
-                ):
-        if paths is None:
-            paths = self.resolution_paths
-        else:
-            paths = cnv.parse_as_list(paths)
-            assert cnv.includes(self.resolution_paths, paths)
-        for pth in paths:
-            zarr_meta = self.array_meta[pth]
-            zarr_meta['chunks'] = new_chunks
-            layer = self.layers[pth].rechunk(new_chunks)
-            # translation = self.translations[pth] if self.has_translation else None
-            self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
-        if label_paths is not None:
-            if label_paths == 'all': label_paths = self.label_paths
-            for lpth in label_paths:
-                if lpth in self.label_paths:
-                    self.labels[lpth].rechunk(new_chunks, paths)
-        return self
-
-    def recompress(self,
-                    new_compressor: str,
-                    paths: Union[list, str] = None,  # if None, update all paths
-                    label_paths: List[str] = None
-                   ):
-        if paths is None:
-            paths = self.resolution_paths
-        else:
-            paths = cnv.parse_as_list(paths)
-            assert cnv.includes(self.resolution_paths, paths)
-        for pth in paths:
-            zarr_meta = self.array_meta[pth]
-            zarr_meta['compressor'] = self.get_compressor(new_compressor)
-            layer = self.layers[pth]
-            # translation = self.translations[pth] if self.has_translation else None
-            self.add_layer(layer, pth, self.scales[pth], self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
-        if label_paths is not None:
-            if label_paths == 'all': label_paths = self.label_paths
-            for lpth in label_paths:
-                if lpth in self.label_paths:
-                    self.labels[lpth].recompress(new_compressor, paths)
-        return self
-
-    def rescale(self,
-                scale_factor: Union[list, tuple, int, float],
-                resolutions: int = None,
-                planewise: bool = True
-                ):
-        if resolutions is None: resolutions = len(self.resolution_paths)
-        pathlist = [str(i) for i in range(int(self.refpath), int(self.refpath) + resolutions)]
-        for pth in self.resolution_paths:
-            if pth not in pathlist:
-                self.del_layer(pth)
-        refscale = self.get_scale(self.refpath)
-        rescaled = cnv.rescale(self.refarray, refscale, self.axis_order, resolutions, planewise, scale_factor)
-        if self.has_translation:
-            translation = copy.deepcopy(self.get_translation(self.refpath))
-        else:
-            translation = None
-        for pth, (arr, scale) in zip(pathlist, rescaled.values()):
-            if pth in self.array_meta.keys():
-                zarr_meta = self.array_meta[pth]
-            else:
-                zarr_meta = {'dtype': arr.dtype,
-                             'chunks': arr.chunksize,
-                             'shape': arr.shape
-                             }
-            self.add_layer(arr, pth, scale, zarr_meta = zarr_meta, overwrite = True)
-        if translation is not None:
-            self.update_translations(translation)
-        return self
+    # def asflat(self,
+    #            paths: Union[list, str] = None,
+    #            label_paths: List[str] = None,
+    #            ):
+    #     if paths is None:
+    #         paths = self.resolution_paths
+    #     else:
+    #         paths = cnv.parse_as_list(paths)
+    #         assert cnv.includes(self.resolution_paths, paths)
+    #     for pth in paths:
+    #         zarr_meta = self.array_meta[pth]
+    #         zarr_meta['dimension_separator'] = '.'
+    #         layer = self.layers[pth]
+    #         # translation = self.translations[pth] if self.has_translation else None
+    #         self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
+    #     if label_paths is not None:
+    #         if label_paths == 'all': label_paths = self.label_paths
+    #         for lpth in label_paths:
+    #             if lpth in self.label_paths:
+    #                 self.labels[lpth].asflat(paths)
+    #     return self
+    #
+    # def asnested(self,
+    #              paths: Union[list, str] = None,  # if None, update all paths
+    #              label_paths: List[str] = None
+    #              ):
+    #     if paths is None:
+    #         paths = self.resolution_paths
+    #     else:
+    #         paths = cnv.parse_as_list(paths)
+    #         assert cnv.includes(self.resolution_paths, paths)
+    #     for pth in paths:
+    #         zarr_meta = self.array_meta[pth]
+    #         zarr_meta['dimension_separator'] = '/'
+    #         layer = self.layers[pth]
+    #         # translation = self.translations[pth] if self.has_translation else None
+    #         self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
+    #     if label_paths is not None:
+    #         if label_paths == 'all': label_paths = self.label_paths
+    #         for lpth in label_paths:
+    #             if lpth in self.label_paths:
+    #                 self.labels[lpth].asnested(paths)
+    #     return self
+    #
+    # def rechunk(self,
+    #             new_chunks: Union[list, tuple],
+    #             paths: Union[list, str] = None,  # if None, update all paths
+    #             label_paths: List[str] = None
+    #             ):
+    #     if paths is None:
+    #         paths = self.resolution_paths
+    #     else:
+    #         paths = cnv.parse_as_list(paths)
+    #         assert cnv.includes(self.resolution_paths, paths)
+    #     for pth in paths:
+    #         zarr_meta = self.array_meta[pth]
+    #         zarr_meta['chunks'] = new_chunks
+    #         layer = self.layers[pth].rechunk(new_chunks)
+    #         # translation = self.translations[pth] if self.has_translation else None
+    #         self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
+    #     if label_paths is not None:
+    #         if label_paths == 'all': label_paths = self.label_paths
+    #         for lpth in label_paths:
+    #             if lpth in self.label_paths:
+    #                 self.labels[lpth].rechunk(new_chunks, paths)
+    #     return self
+    #
+    # def recompress(self,
+    #                 new_compressor: str,
+    #                 paths: Union[list, str] = None,  # if None, update all paths
+    #                 label_paths: List[str] = None
+    #                ):
+    #     if paths is None:
+    #         paths = self.resolution_paths
+    #     else:
+    #         paths = cnv.parse_as_list(paths)
+    #         assert cnv.includes(self.resolution_paths, paths)
+    #     for pth in paths:
+    #         zarr_meta = self.array_meta[pth]
+    #         zarr_meta['compressor'] = self.get_compressor(new_compressor)
+    #         layer = self.layers[pth]
+    #         # translation = self.translations[pth] if self.has_translation else None
+    #         self.add_layer(layer, pth, self.scales[pth], self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
+    #     if label_paths is not None:
+    #         if label_paths == 'all': label_paths = self.label_paths
+    #         for lpth in label_paths:
+    #             if lpth in self.label_paths:
+    #                 self.labels[lpth].recompress(new_compressor, paths)
+    #     return self
 
     def get_current_scale_factors(self):
-        return {pth: np.divide(self.array_meta[self.refpath]['shape'], self.array_meta[pth]['shape']) for pth in self.array_meta.keys()}
+        return {pth: np.divide(self.array_meta[self.refpath]['shape'], self.array_meta[pth]['shape']).tolist()
+                for pth in self.array_meta.keys()}
+    @property
+    def scale_factors(self):
+        return self.get_current_scale_factors()
+    @property
+    def layer_shapes(self):
+        return {pth: self.array_meta[pth]['shape'] for pth in self.array_meta.keys()}
 
-    def rescale_to_shapes(self, # new_shapes must contain the refpath
-                          new_shapes
-                          ):
-        rescaled_layers = cnv.rescale_to_shapes(self.refarray, self.axis_order, new_shapes)
-        scale_factors = {pth: np.divide(self.array_meta[self.refpath]['shape'], new_shapes[pth]) for pth in new_shapes.keys()}
-        scales = {pth: np.multiply(self.get_scale(self.refpath), scale_factors[pth]) for pth in scale_factors.keys()}
-        meta = self.array_meta[self.refpath]
+    def rescale(self,
+                n_layers: Union[Tuple, List],
+                scale_factor: Union[Tuple, List] = None,
+                min_input_block_size: tuple = None,
+                overwrite_layers: bool = False,
+                n_jobs = 8
+                ):
+        """
+        This function rescales the entire Pyramid based on the top resolution layer. Note that if there are already existing
+        resolution layers they might be overriden.
+
+        :param n_layers:
+        :param scale_factor:
+        :param min_input_block_size:
+        :param overwrite_layers:
+        :return:
+        """
+
+        if scale_factor is None:
+            assert '1' in self.resolution_paths
+            scale_factor = self.scale_factors['1']
+        refpath = str(np.arange(n_layers)[0])
+        refarray = self.layers[refpath]
+        refscale = self.scales[refpath]
+        rootpath = self.pyramid_root
+        nlayers = self.nlayers
+
+        rescaled_layers = mutils.downscale_multiscales(input_array = refarray,
+                                                       rootpath = rootpath,
+                                                       n_layers = n_layers,
+                                                       scale_factor = scale_factor,
+                                                       min_input_block_size = min_input_block_size,
+                                                       overwrite_layers = overwrite_layers,
+                                                       n_jobs = n_jobs
+                                                       )
+        scales = mutils.get_scales_from_rescaled(rescaled = rescaled_layers,
+                                                 refscale = refscale,
+                                                 refpath = '0'
+                                                 )
+
+        meta = self.array_meta[refpath]
         for pth in scales.keys():
             if pth in self.array_meta.keys():
                 meta = self.array_meta[pth]
@@ -1567,7 +1642,7 @@ class Pyramid(Multimeta, Operations):
             scale = scales[pth]
             self.add_layer(arr,
                           pth,
-                          scale = scale.tolist(),
+                          scale = scale,
                           translation = self.get_translation(pth),
                           zarr_meta={'dtype': meta['dtype'],
                                      'chunks': meta['chunks'],
@@ -1580,165 +1655,197 @@ class Pyramid(Multimeta, Operations):
                           overwrite = True
                           )
         paths = set([self.refpath] + list(scales.keys()))
-        self.shrink(paths)
+        if len(paths) < nlayers:
+            self.shrink(paths, hard = True)
+        self.gr.attrs['multiscales'] = self.multimeta
         return self
 
-    def subset(self,
-               slices: Union[dict, list, tuple],
-               pth = None,
-               rescale = False
-               ):
-        if pth is None: pth = self.refpath
-        slicedict = {}
-        if isinstance(slices, (list, tuple, slice)):
-            missing_axes = self.axis_order[len(slices):]
-            slcs = []
-            for slc in slices:
-                if isinstance(slc, (tuple, list)):
-                    slcs.append(slice(*slc))
-                elif isinstance(slc, slice):
-                    slcs.append(slc)
-                else:
-                    raise TypeError(f'The input "slices" must be either of types: {tuple}, {list} or {slice}')
-            slcs += [slice(None, None, None) for _ in missing_axes]
-            for ax, slc in zip(self.axis_order, slcs):
-                slicedict[ax] = slc
-        elif isinstance(slices, dict):
-            for ax in self.axis_order:
-                if ax in slices.keys():
-                    if isinstance(slices[ax], (tuple, list)):
-                        slicedict[ax] = slice(*slices[ax])
-                    elif isinstance(slices[ax], slice):
-                        slicedict[ax] = slices[ax]
-                    else:
-                        raise TypeError(f'The input "slices" must be either of types: {tuple}, {list} or {slice}')
-                else:
-                    slicedict[ax] = slice(None, None, None)
-        slicer = tuple([slicedict[ax] for ax in self.axis_order])
-        sliced = self.layers[pth][slicer] # Bunu dask ile yap
-        shapes = {pth: self.array_meta[pth]['shape'] for pth in self.array_meta.keys()}
-        scale_factors = {pth: np.divide(shapes[self.refpath], shapes[pth]) for pth in shapes.keys()}
+    # def rescale_to_shapes(self, # new_shapes must contain the refpath
+    #                       new_shapes
+    #                       ):
+    #     rescaled_layers = cnv.rescale_to_shapes(self.refarray, self.axis_order, new_shapes)
+    #     scale_factors = {pth: np.divide(self.array_meta[self.refpath]['shape'], new_shapes[pth]) for pth in new_shapes.keys()}
+    #     scales = {pth: np.multiply(self.get_scale(self.refpath), scale_factors[pth]) for pth in scale_factors.keys()}
+    #     meta = self.array_meta[self.refpath]
+    #     for pth in scales.keys():
+    #         if pth in self.array_meta.keys():
+    #             meta = self.array_meta[pth]
+    #         arr = rescaled_layers[pth]
+    #         scale = scales[pth]
+    #         self.add_layer(arr,
+    #                       pth,
+    #                       scale = scale.tolist(),
+    #                       translation = self.get_translation(pth),
+    #                       zarr_meta={'dtype': meta['dtype'],
+    #                                  'chunks': meta['chunks'],
+    #                                  'shape': arr.shape,
+    #                                  'compressor': meta['compressor'],
+    #                                  'dimension_separator': meta['dimension_separator']
+    #                                  },
+    #                       axis_order = self.axis_order,
+    #                       unitlist = self.unit_list,
+    #                       overwrite = True
+    #                       )
+    #     paths = set([self.refpath] + list(scales.keys()))
+    #     self.shrink(paths)
+    #     return self
 
-        new_shapes = {}
-        for pth in scale_factors.keys():
-            if pth == self.refpath:
-                continue
-            new_shape = np.around(np.divide(sliced.shape, scale_factors[pth])).astype(int)
-            new_shape[new_shape == 0] = 1
-            new_shapes[pth] = new_shape
-
-        arrmeta = copy.deepcopy(self.array_meta[self.refpath])
-        arrmeta['shape'] = sliced.shape
-
-        self.add_layer(sliced,
-                       self.refpath,
-                       scale = self.get_scale(self.refpath),
-                       translation = self.translations[self.refpath],
-                       zarr_meta = arrmeta,
-                       overwrite = True
-                       )
-        if rescale:
-            self.rescale_to_shapes(new_shapes)
-        else:
-            self.shrink(self.refpath)
-        return self
-
-    def expand_dims(self, ### TODO: KALDIM
-                    new_axis: str,
-                    new_idx: (int, tuple, list),
-                    new_scale: (float, tuple, list) = 1,
-                    new_unit: (str, tuple, list) = None,
-                    downscaling_factor: (int, float) = 1
-                    ):
-        items = [new_idx, new_scale, new_unit]
-        for i, item in enumerate(items):
-            if hasattr(item, '__len__'):
-                if isinstance(item, str):
-                    items[i] = [item]
-            else:
-                items[i] = [item]
-        assert all([ax not in self.axis_order for ax in new_axis]), f"The 'new_axis' parameter cannot include any axis name that already exists in the current axes."
-        if new_unit is None:
-            new_unit = config.unit_map[new_axis]
-        if isinstance(new_unit, str):
-            new_unit = [new_unit]
-        if not hasattr(new_scale, '__len__'):
-            new_idx = [new_idx]
-        if not hasattr(new_scale, '__len__'):
-            new_scale = [new_scale]
-        assert new_axis not in self.axis_order, f'new axis must be different from the already existing axes.'
-        axord = cnv.insert_at_indices(self.axis_order, new_axis, new_idx)
-        axis_order = ''.join(axord)
-        unit_list = cnv.insert_at_indices(self.unit_list, new_unit, new_idx)
-        scales = copy.deepcopy(self.scales)
-        translations = copy.deepcopy(self.translations)
-        for ax in self.axis_order:
-            self.del_axis(ax)
-        self.parse_axes(axis_order = axis_order, unit_list = unit_list, overwrite = False)
-        for i, pth in enumerate(self.resolution_paths):
-            layer = self.layers[pth]
-            arrmeta = copy.deepcopy(self.array_meta[pth])
-            rescaled = [item * downscaling_factor ** i for item in new_scale]
-            scale = cnv.insert_at_indices(scales[pth], rescaled, new_idx)
-            retranslated = [0] * len(new_idx)
-            if translations[pth] is None:
-                translation = None
-            else:
-                translation = cnv.insert_at_indices(translations[pth], retranslated, new_idx)
-            chunks = cnv.insert_at_indices(list(arrmeta['chunks']), 1., new_idx)
-            arrmeta['chunks'] = tuple(chunks)
-            shape = cnv.insert_at_indices(list(arrmeta['shape']), 1, new_idx)
-            arrmeta['shape'] = tuple(shape)
-            layer_ex = da.expand_dims(layer, new_idx)
-            self.add_layer(arr = layer_ex,
-                           pth = pth,
-                           scale = scale,
-                           translation = translation,
-                           zarr_meta = arrmeta,
-                           overwrite = True
-                           )
-
-    def squeeze(self,
-                axis: str = None
-                ):
-        axord = list(self.axis_order)
-        unit_list = self.unit_list
-        shape = self.shape
-        if isinstance(axis, int):
-            indices = [axis]
-        elif axis is None:
-            indices = [idx for idx, val in enumerate(shape) if val != 1]
-        else:
-            assert isinstance(axis, str)
-            inds = self.index(axis, scalar_sensitive = False)
-            indices = [idx for idx, val in enumerate(shape) if (val != 1) or idx not in inds]
-
-        ex_indices = [i for i in range(self.ndim) if i not in indices]
-        axis_order = [axord[idx] for idx in indices]
-        unit_list = [unit_list[idx] for idx in indices]
-        _scales = copy.deepcopy(self.scales)
-        _translations = copy.deepcopy(self.translations)
-        _arrmeta = copy.deepcopy(self.array_meta)
-
-        for ax in self.axis_order:
-            self.del_axis(ax)
-        self.parse_axes(axis_order = axis_order, unit_list = unit_list, overwrite = False)
-        for i, pth in enumerate(self.resolution_paths):
-            layer = da.squeeze(self.layers[pth], axis = tuple(ex_indices))
-            scale = [_scales[pth][idx] for idx in indices]
-            if _translations[pth] is None:
-                translation = None
-            else:
-                translation = [_translations[pth][idx] for idx in indices]
-            _arrmeta['chunks'] = tuple([_arrmeta[pth]['chunks'][idx] for idx in indices])
-            _arrmeta['shape'] = tuple([_arrmeta[pth]['shape'][idx] for idx in indices])
-            self.add_layer(arr = layer,
-                           pth = pth,
-                           scale = scale,
-                           translation = translation,
-                           zarr_meta = _arrmeta,
-                           overwrite = True
-                           )
+    # def subset(self,
+    #            slices: Union[dict, list, tuple],
+    #            pth = None,
+    #            rescale = False
+    #            ):
+    #     if pth is None: pth = self.refpath
+    #     slicedict = {}
+    #     if isinstance(slices, (list, tuple, slice)):
+    #         missing_axes = self.axis_order[len(slices):]
+    #         slcs = []
+    #         for slc in slices:
+    #             if isinstance(slc, (tuple, list)):
+    #                 slcs.append(slice(*slc))
+    #             elif isinstance(slc, slice):
+    #                 slcs.append(slc)
+    #             else:
+    #                 raise TypeError(f'The input "slices" must be either of types: {tuple}, {list} or {slice}')
+    #         slcs += [slice(None, None, None) for _ in missing_axes]
+    #         for ax, slc in zip(self.axis_order, slcs):
+    #             slicedict[ax] = slc
+    #     elif isinstance(slices, dict):
+    #         for ax in self.axis_order:
+    #             if ax in slices.keys():
+    #                 if isinstance(slices[ax], (tuple, list)):
+    #                     slicedict[ax] = slice(*slices[ax])
+    #                 elif isinstance(slices[ax], slice):
+    #                     slicedict[ax] = slices[ax]
+    #                 else:
+    #                     raise TypeError(f'The input "slices" must be either of types: {tuple}, {list} or {slice}')
+    #             else:
+    #                 slicedict[ax] = slice(None, None, None)
+    #     slicer = tuple([slicedict[ax] for ax in self.axis_order])
+    #     sliced = self.layers[pth][slicer] # Bunu dask ile yap
+    #     shapes = {pth: self.array_meta[pth]['shape'] for pth in self.array_meta.keys()}
+    #     scale_factors = {pth: np.divide(shapes[self.refpath], shapes[pth]) for pth in shapes.keys()}
+    #
+    #     new_shapes = {}
+    #     for pth in scale_factors.keys():
+    #         if pth == self.refpath:
+    #             continue
+    #         new_shape = np.around(np.divide(sliced.shape, scale_factors[pth])).astype(int)
+    #         new_shape[new_shape == 0] = 1
+    #         new_shapes[pth] = new_shape
+    #
+    #     arrmeta = copy.deepcopy(self.array_meta[self.refpath])
+    #     arrmeta['shape'] = sliced.shape
+    #
+    #     self.add_layer(sliced,
+    #                    self.refpath,
+    #                    scale = self.get_scale(self.refpath),
+    #                    translation = self.translations[self.refpath],
+    #                    zarr_meta = arrmeta,
+    #                    overwrite = True
+    #                    )
+    #     if rescale:
+    #         self.rescale_to_shapes(new_shapes)
+    #     else:
+    #         self.shrink(self.refpath)
+    #     return self
+    #
+    # def expand_dims(self,
+    #                 new_axis: str,
+    #                 new_idx: (int, tuple, list),
+    #                 new_scale: (float, tuple, list) = 1,
+    #                 new_unit: (str, tuple, list) = None,
+    #                 downscaling_factor: (int, float) = 1
+    #                 ):
+    #     items = [new_idx, new_scale, new_unit]
+    #     for i, item in enumerate(items):
+    #         if hasattr(item, '__len__'):
+    #             if isinstance(item, str):
+    #                 items[i] = [item]
+    #         else:
+    #             items[i] = [item]
+    #     assert all([ax not in self.axis_order for ax in new_axis]), f"The 'new_axis' parameter cannot include any axis name that already exists in the current axes."
+    #     if new_unit is None:
+    #         new_unit = config.unit_map[new_axis]
+    #     if isinstance(new_unit, str):
+    #         new_unit = [new_unit]
+    #     if not hasattr(new_scale, '__len__'):
+    #         new_idx = [new_idx]
+    #     if not hasattr(new_scale, '__len__'):
+    #         new_scale = [new_scale]
+    #     assert new_axis not in self.axis_order, f'new axis must be different from the already existing axes.'
+    #     axord = cnv.insert_at_indices(self.axis_order, new_axis, new_idx)
+    #     axis_order = ''.join(axord)
+    #     unit_list = cnv.insert_at_indices(self.unit_list, new_unit, new_idx)
+    #     scales = copy.deepcopy(self.scales)
+    #     translations = copy.deepcopy(self.translations)
+    #     for ax in self.axis_order:
+    #         self.del_axis(ax)
+    #     self.parse_axes(axis_order = axis_order, unit_list = unit_list, overwrite = False)
+    #     for i, pth in enumerate(self.resolution_paths):
+    #         layer = self.layers[pth]
+    #         arrmeta = copy.deepcopy(self.array_meta[pth])
+    #         rescaled = [item * downscaling_factor ** i for item in new_scale]
+    #         scale = cnv.insert_at_indices(scales[pth], rescaled, new_idx)
+    #         retranslated = [0] * len(new_idx)
+    #         if translations[pth] is None:
+    #             translation = None
+    #         else:
+    #             translation = cnv.insert_at_indices(translations[pth], retranslated, new_idx)
+    #         chunks = cnv.insert_at_indices(list(arrmeta['chunks']), 1., new_idx)
+    #         arrmeta['chunks'] = tuple(chunks)
+    #         shape = cnv.insert_at_indices(list(arrmeta['shape']), 1, new_idx)
+    #         arrmeta['shape'] = tuple(shape)
+    #         layer_ex = da.expand_dims(layer, new_idx)
+    #         self.add_layer(arr = layer_ex,
+    #                        pth = pth,
+    #                        scale = scale,
+    #                        translation = translation,
+    #                        zarr_meta = arrmeta,
+    #                        overwrite = True
+    #                        )
+    #
+    # def squeeze(self,
+    #             axis: str = None
+    #             ):
+    #     axord = list(self.axis_order)
+    #     unit_list = self.unit_list
+    #     shape = self.shape
+    #     if isinstance(axis, int):
+    #         indices = [axis]
+    #     elif axis is None:
+    #         indices = [idx for idx, val in enumerate(shape) if val != 1]
+    #     else:
+    #         assert isinstance(axis, str)
+    #         inds = self.index(axis, scalar_sensitive = False)
+    #         indices = [idx for idx, val in enumerate(shape) if (val != 1) or idx not in inds]
+    #
+    #     ex_indices = [i for i in range(self.ndim) if i not in indices]
+    #     axis_order = [axord[idx] for idx in indices]
+    #     unit_list = [unit_list[idx] for idx in indices]
+    #     _scales = copy.deepcopy(self.scales)
+    #     _translations = copy.deepcopy(self.translations)
+    #     _arrmeta = copy.deepcopy(self.array_meta)
+    #
+    #     for ax in self.axis_order:
+    #         self.del_axis(ax)
+    #     self.parse_axes(axis_order = axis_order, unit_list = unit_list, overwrite = False)
+    #     for i, pth in enumerate(self.resolution_paths):
+    #         layer = da.squeeze(self.layers[pth], axis = tuple(ex_indices))
+    #         scale = [_scales[pth][idx] for idx in indices]
+    #         if _translations[pth] is None:
+    #             translation = None
+    #         else:
+    #             translation = [_translations[pth][idx] for idx in indices]
+    #         _arrmeta['chunks'] = tuple([_arrmeta[pth]['chunks'][idx] for idx in indices])
+    #         _arrmeta['shape'] = tuple([_arrmeta[pth]['shape'][idx] for idx in indices])
+    #         self.add_layer(arr = layer,
+    #                        pth = pth,
+    #                        scale = scale,
+    #                        translation = translation,
+    #                        zarr_meta = _arrmeta,
+    #                        overwrite = True
+    #                        )
 
     # def add_imglabel(self,
     #               pyr,
@@ -1752,18 +1859,14 @@ class Pyramid(Multimeta, Operations):
     #         name = pyr.tag
     #     self.labels[name] = pyr
 
-# oz = Pyramid()
-# oz.from_zarr(f"data/filament.zarr")
-# ozz = oz.copy()
-# ozz.expand_dims('t', 1)
-# ozz.squeeze(axis = 't')
+
 
 
 class LabelPyramid(Pyramid, ImageLabelMeta):
     def __init__(self):
         super().__init__()
 
-    def copy(self, # TODO allow this to modify the Pyramid.
+    def copy(self,
              paths: Union[list, tuple] = None
              ):
         if paths is None:
@@ -1785,8 +1888,6 @@ class LabelPyramid(Pyramid, ImageLabelMeta):
                   keep_array_type: bool = True
                   ):
         super().from_zarr(fpath, False, keep_array_type = True)
-        # print(f"fpath: {fpath}")
-        # print(f"truth: {'image-label' in self.gr.attrs.keys()}")
         assert 'image-label' in self.gr.attrs.keys(), f"The loaded dataset is not a valid image-label object." # TODO Problem burada, gr staging hatali
         self.img_label_meta = dict(self.gr.attrs)['image-label']
         return self
@@ -1842,7 +1943,7 @@ class LabelPyramid(Pyramid, ImageLabelMeta):
                     raise Exception(f"The Pyramid has the axis order: {self.axis_order}."
                                     f" The new layer cannot have a different axis-order.")
         elif not self.has_axes:
-            if axis_order is None: # TODO: There should be a better way to parse this.
+            if axis_order is None:
                 axis_order = config.default_axes[-arr.ndim:]
             self.parse_axes(axis_order, unit_list=unitlist)
         if self.ndim != 0:
@@ -1972,7 +2073,7 @@ class PyramidCollection: # Change to PyramidIO
         if input in [None, []]:
             pass
         else:
-            input = [pyr.copy() for pyr in input]
+            input = [pyr for pyr in input]
             for pyr in input:
                 self.add_pyramid(pyr,
                                  stringent = stringent
@@ -2006,9 +2107,8 @@ class PyramidCollection: # Change to PyramidIO
                     pyr,
                     stringent=False
                     ):
-        # pyr.retag(unique_name_or_number)
         self.pyramids.append(pyr)
-        assert self._validate_pyramidal_collection(self.pyramids) # Change to _validate_and_read or have separate methods for reading and validation
+        assert self._validate_pyramidal_collection(self.pyramids)
         if stringent:
             assert self._paths_are_unique(), f"The resolution paths are not consistent for all Pyramids."
         if not self._paths_are_unique():
@@ -2039,11 +2139,10 @@ class PyramidCollection: # Change to PyramidIO
         return self.pyramids[0].array_meta
 
     def equalise_resolutions(self):
-        # print(f"Resolutions are being equalised.")
         paths = self.resolution_paths
         self.shrink(paths)
 
-    def _validate_pyramidal_collection(self, input): # Change to _validate_and_read
+    def _validate_pyramidal_collection(self, input):
         if input is None:
             input = []
         if isinstance(input, Pyramid):
@@ -2069,7 +2168,7 @@ class PyramidCollection: # Change to PyramidIO
 
     @property
     def has_uniform_axes(
-            self):  ### THESE WILL BE METHODS INSTEAD OF PROPERTIES AND WILL HAVE AN AXIS PARAMETER TO CONTROL WHICH AXES TO COMPARE.
+            self):
         return all([self.axes[0] == item for item in self.axes])
 
     @property
@@ -2107,7 +2206,7 @@ class PyramidCollection: # Change to PyramidIO
         return self.units[0]
 
     @property
-    def scales(self): # Note that the pyramid reader has to validate that the scale and shape are consistent for each layer.
+    def scales(self):
         l = {key: [] for key in self.resolution_paths}
         for key in self.resolution_paths:
             scales = [pyr.scales[key] for pyr in self.pyramids]
@@ -2125,7 +2224,7 @@ class PyramidCollection: # Change to PyramidIO
         return all(checklist)
 
     @property
-    def translations(self): # Note that the pyramid reader has to validate that the scale and shape are consistent for each layer.
+    def translations(self):
         l = {key: [] for key in self.resolution_paths}
         for key in self.resolution_paths:
             translations = [pyr.translations[key] for pyr in self.pyramids]
@@ -2153,7 +2252,7 @@ class PyramidCollection: # Change to PyramidIO
         return [pyr.chunks for pyr in self.pyramids]
 
     @property
-    def has_uniform_chunks(self): ### KALDIM TODO: check also compression and dimension_separator
+    def has_uniform_chunks(self): ### TODO: check also compression and dimension_separator
         return all([self.chunklist[0] == item for item in self.chunklist])
 
     @property
@@ -2177,7 +2276,7 @@ class PyramidCollection: # Change to PyramidIO
         return [pyr.dtype for pyr in self.pyramids]
 
     @property
-    def has_uniform_dtypes(self): ### KALDIM TODO: check also compression and dimension_separator
+    def has_uniform_dtypes(self): ### TODO: check also compression and dimension_separator
         return all([self.dtypes[0] == item for item in self.dtypes])
 
     @property
@@ -2189,7 +2288,7 @@ class PyramidCollection: # Change to PyramidIO
         return [pyr.dimension_separator for pyr in self.pyramids]
 
     @property
-    def has_uniform_dimension_separators(self): ### KALDIM TODO: check also compression and dimension_separator
+    def has_uniform_dimension_separators(self): ### TODO: check also compression and dimension_separator
         return all([self.dimension_separators[0] == item for item in self.dimension_separators])
 
     @property
@@ -2254,22 +2353,11 @@ class PyramidCollection: # Change to PyramidIO
     def extensible_along(self,
                            axis
                            ):
-        res = self.has_uniform_axes_units_scales # Note currently it assumes the zeroth pyramid as reference pyramid. TODO: This needs to be worked upon.
+        res = self.has_uniform_axes_units_scales # Note currently it assumes the zeroth pyramid as reference pyramid.
         axlens = self.axlens_except(axis)
         for axlen in axlens.values():
             if not all([axlen[0] == item for item in axlen]): res = False
         return res
 
-    def match_ref_pyramid(self): pass
-
-    # def concatenate(self,
-    #                 axis
-    #                 ):
-    #     pass
-    #
-    # def stack(self):
-    #     pass
-
-
-
-
+    def match_ref_pyramid(self):
+        raise NotImplementedError(f"This method is not yet implemented.")

@@ -1,5 +1,9 @@
+import inspect
+
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyAndRescale, ApplyToPyramid
+from ome_zarr_pyramid.creation.pyramid_creation import PyramidCreator
+from ome_zarr_pyramid.utils import metadata_utils as meta_utils
 # from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
 
 import zarr, warnings
@@ -12,65 +16,71 @@ from skimage import transform
 
 class _WrapperBase:
     def __init__(self,
-                 scale_factor=None, ### TODO: Do we need it?
+                 scale_factor=None,
                  min_block_size=None,
                  block_overlap_sizes=None,
-                 subset_indices: dict = None,
+                 input_subset_indices: dict = None,
                  ### zarr parameters
-                 store: str = None,  # output group store path # TODO: add a project folder parameter and 'out' then becomes the basename for the output
-                 compressor='auto',  # output compressor
-                 dimension_separator=None,  # output dimension separator
-                 output_dtype=None,  # output datatype
+                 output_store: str = None,
+                 output_compressor='auto',
+                 output_chunks = None,
+                 output_dimension_separator=None,
+                 output_dtype=None,
                  overwrite=False,
                  ###
                  n_jobs = None,
-                 monoresolution=False,
+                 select_layers = 'all'
                  ):
         self.zarr_params = {
             # 'scale_factor': scale_factor,
             'min_block_size': min_block_size,
             'block_overlap_sizes': block_overlap_sizes,
-            'subset_indices': subset_indices,
+            'subset_indices': input_subset_indices,
             ### zarr parameters
-            'store': store,
-            'compressor': compressor,
-            'dimension_separator': dimension_separator,
+            'store': output_store,
+            'compressor': output_compressor,
+            'chunks': output_chunks,
+            'dimension_separator': output_dimension_separator,
             'dtype': output_dtype,
             'overwrite': overwrite,
             ###
             'n_jobs': n_jobs,
-            'monoresolution': monoresolution,
+            'select_layers': select_layers
         }
         self.scale_factor = scale_factor
+
     def set(self, **kwargs):
         for key, value in kwargs.items():
-            if key == 'scale_factor':
+            key_ = key.replace('input_', '')
+            key_ = key_.replace('output_', '')
+            if key_ == 'scale_factor':
                 self.scale_factor = kwargs.get('scale_factor')
-            elif key in self.zarr_params.keys():
-                self.zarr_params[key] = value
+            elif key_ in self.zarr_params.keys():
+                self.zarr_params[key_] = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
         return self
 
 
-class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid): # TODO: add a project folder generator and auto-naming of temporary files. They should be auto-deletable.
+class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid):
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
                  block_overlap_sizes=None,
                  subset_indices: dict = None,
                  ### zarr parameters
-                 store: str = None,  # output group store path
-                 compressor='auto',  # output compressor
-                 dimension_separator=None,  # output dimension separator
-                 output_dtype=None,  # output datatype
+                 store: str = None,
+                 compressor='auto',
+                 chunks=None,
+                 dimension_separator=None,
+                 output_dtype=None,
                  overwrite=False,
                  ###
                  n_jobs=None,
-                 monoresolution=False,
+                 select_layers = 'all'
                  ):
         _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, subset_indices,
-                              store, compressor, dimension_separator, output_dtype, overwrite, n_jobs, monoresolution)
+                              store, compressor, chunks, dimension_separator, output_dtype, overwrite, n_jobs, select_layers)
 
     def __run(self,
             input: Union[str, Pyramid],
@@ -148,6 +158,20 @@ class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid): # TODO: add a projec
 
     def ones_like(self, x, out=None):
         return self.__run(input=x, func=np.ones_like, out=out)
+
+    ### Creation ## TODO: integrate PyramidCreator here.
+
+    def zeros(self, shape, out = None):
+        raise NotImplementedError(f"This method is not yet implemented.")
+
+    def ones(self, out = None):
+        raise NotImplementedError(f"This method is not yet implemented.")
+
+    def rand(self, out = None):
+        raise NotImplementedError(f"This method is not yet implemented.")
+
+    def create(self, out = None):
+        raise NotImplementedError(f"This method is not yet implemented.")
 
     ### Trigonometric
 
@@ -362,19 +386,21 @@ class BasicOperations(UFunc):
                  scale_factor=None,
                  min_block_size=None,
                  block_overlap_sizes=None,
-                 subset_indices: dict = None,
+                 input_subset_indices: dict = None,
                  ### zarr parameters
-                 store: str = None,  # output group store path
-                 compressor='auto',  # output compressor
-                 dimension_separator=None,  # output dimension separator
-                 output_dtype=None,  # output datatype
+                 output_store: str = None,
+                 output_compressor='auto',
+                 output_chunks: Union[tuple, list] = None,
+                 output_dimension_separator=None,
+                 output_dtype=None,
                  overwrite=False,
                  ###
                  n_jobs=None,
-                 monoresolution=False,
+                 select_layers='all',
                  ):
-        UFunc.__init__(self, scale_factor, min_block_size, block_overlap_sizes, subset_indices,
-                              store, compressor, dimension_separator, output_dtype, overwrite, n_jobs, monoresolution)
+        UFunc.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+                        output_store, output_compressor, output_chunks, output_dimension_separator,
+                        output_dtype, overwrite, n_jobs, select_layers)
 
     def __run(self,
             input: Union[str, Pyramid],
@@ -398,10 +424,11 @@ class BasicOperations(UFunc):
                                  )
         return self.add_layers()
 
+
     def __run_with_dask(self):
-        """TODO: Some functions benefits from dask. Connect this to a different module.
+        """TODO: Some functions benefits from dask. Connect this to a dedicated module.
         """
-        pass
+        raise NotImplementedError(f"This method is not yet implemented.")
 
     def max(self, input, axis, out=None):
         return self.__run(input, func=np.max, axis=axis, out=out)
@@ -440,7 +467,6 @@ class BasicOperations(UFunc):
         return self.__run(input=input, func=np.cumsum, axis=axis, out=out)
 
     # def diff(self, input, axis, out=None): # TODO with dask
-    #     assert len(axis) == 1
     #     return self.__run(input=input, func=np.diff, axis=axis, out=out)
 
     def moment(self, input, axis, out=None):
@@ -535,3 +561,5 @@ class BasicOperations(UFunc):
     def delete(self, input, obj, axis, out=None):
         return self.__run(input=input, func=np.delete, obj=obj, axis=axis, out=out)
 
+    def pad(self, pad_width):
+        raise NotImplementedError(f"This method is not yet implemented.")

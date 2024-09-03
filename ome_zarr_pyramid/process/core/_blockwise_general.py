@@ -8,6 +8,7 @@ from joblib import Parallel, delayed, parallel_backend
 import numcodecs; numcodecs.blosc.use_threads = False
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.utils.general_utils import create_like
 
 
 def copy_zarray(zarray):
@@ -22,65 +23,6 @@ def copy_array(array):
         copied = array.copy()
     return copied
 
-def create_like(zarray,
-                store = None, # leave as None for KVStore
-                use_synchronizer  = False,
-                syncdir = None,
-                **kwargs
-                ):
-    # handle different synchronizer scenarios.
-    synchronizer = None
-    if store is None:
-        store = zarr.MemoryStore()
-    elif isinstance(store, str) and not store.startswith('http'):
-        if 'dimension_separator' in kwargs.keys():
-            dimension_separator = kwargs.get('dimension_separator')
-        else:
-            if hasattr(zarray.store, '_dimension_separator'):
-                print("even here")
-                if zarray.store._dimension_separator is None:
-                    dimension_separator = '/'
-                else:
-                    dimension_separator = zarray.store._dimension_separator
-            else:
-                dimension_separator = '/'
-        store = zarr.DirectoryStore(store, dimension_separator = dimension_separator)
-
-    if hasattr(store, 'path'):
-        if isinstance(store.path, str):
-            if use_synchronizer is None:
-                synchronizer = None
-            elif use_synchronizer == 'multiprocessing':
-                if syncdir is None:
-                    raise TypeError()
-                synchronizer = zarr.ProcessSynchronizer(syncdir)
-            elif use_synchronizer == 'multithreading':
-                if syncdir is None:
-                    raise TypeError()
-                synchronizer = zarr.ThreadSynchronizer()
-            else:
-                synchronizer = None
-
-    if 'overwrite' in kwargs.keys():
-        overwrite = kwargs.get("overwrite")
-    else:
-        overwrite = False
-
-    params = {
-        'shape': zarray.shape if 'shape' not in kwargs.keys() else kwargs['shape'],
-        'chunks': zarray.chunks if 'chunks' not in kwargs.keys() else kwargs['chunks'],
-        'dtype': zarray.dtype if 'dtype' not in kwargs.keys() else kwargs['dtype'],
-        'compressor': zarray.compressor if 'compressor' not in kwargs.keys() else kwargs['compressor'],
-    }
-    if hasattr(zarray, 'dimension_separator'):
-        params['dimension_separator'] = zarray.dimension_separator
-
-    res = zarr.create(**params,
-                      store = store,
-                      overwrite = overwrite,
-                      synchronizer = synchronizer
-                      )
-    return res
 
 def passive_func(array, *args, **kwargs):
     return array
@@ -380,6 +322,7 @@ class BlockwiseRunner(Aliases):
                  ### zarr parameters for the output
                  store = None,
                  compressor = 'auto',
+                 chunks = None,
                  dimension_separator = '/',
                  dtype = None,
                  overwrite = False,
@@ -402,10 +345,12 @@ class BlockwiseRunner(Aliases):
         self._set_scale_factor(scale_factor)
         self._set_subset_indices(subset_indices)
         ### zarr parameters
+        self.overwrite = overwrite
         self.compressor = compressor
+        if chunks is not None:
+            self._output_chunks = chunks
         self.dimension_separator = dimension_separator
         self.dtype = dtype
-        self.overwrite = overwrite
         ###
         self.set_params(*args, **kwargs)
         self._handle_axes()
