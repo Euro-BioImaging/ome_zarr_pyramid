@@ -22,13 +22,13 @@ requirements = parse_requirements('requirements.txt')
 
 setuptools.setup(
     name = 'ome_zarr_pyramid',
-    version = '0.0.3',
+    version = '0.0.4',
     author = 'Bugra Özdemir',
     author_email = 'bugraa.ozdemir@gmail.com',
     description = 'A package for reading, writing and processing OME-Zarr datasets',
     long_description = readme(),
     long_description_content_type = "text/markdown",
-    url = 'https://github.com/Euro-BioImaging/OME-Zarr',
+    url = 'https://github.com/Euro-BioImaging/ome_zarr_pyramid',
     # license = 'MIT',
     packages = setuptools.find_packages(),
     include_package_data=True,
