@@ -840,13 +840,14 @@ class Pyramid(Multimeta, Operations):
 
     def copy(self,
              new_dir,
-             overwrite = False
-             # paths: Union[list, tuple] = None,
+             overwrite = False,
+             paths: Union[list, tuple] = None,
              # label_paths = None, # make a config attribute for this
              # label_resolution_paths = 'all'
              ):
         pyr = Pyramid()
-        paths = self.resolution_paths
+        if paths is None:
+            paths = self.resolution_paths
         for pth in paths:
             res = self.layers[pth]
             if not pyr.has_axes:
