@@ -1,5 +1,6 @@
 import zarr, warnings
 import numpy as np
+from pathlib import Path
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from skimage import transform, filters
 
@@ -47,7 +48,7 @@ class Threshold(_WrapperBase, ApplyThresholdAndRescale):
             self.set(store = out)
         if out is None:
             self.zarr_params['n_jobs'] = 1
-        if isinstance(input, str):
+        if isinstance(input, (str, Path)):
             input = Pyramid().from_zarr(input)
         ApplyThresholdAndRescale.__init__(self,
                                          input,

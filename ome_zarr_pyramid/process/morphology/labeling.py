@@ -1,5 +1,6 @@
 import zarr, warnings
 import numpy as np
+from pathlib import Path
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from scipy import ndimage as ndi
 from skimage import transform, filters
@@ -47,7 +48,7 @@ class Label(_WrapperBase, ApplyLabelAndRescale):
             self.set(store = out)
         if out is None:
             self.zarr_params['n_jobs'] = 1
-        if isinstance(input, str):
+        if isinstance(input, (str, Path)):
             input = Pyramid().from_zarr(input)
         ApplyLabelAndRescale.__init__(self,
                                          input,

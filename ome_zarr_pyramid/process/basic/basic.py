@@ -9,6 +9,7 @@ from ome_zarr_pyramid.utils import metadata_utils as meta_utils
 import zarr, warnings
 import numpy as np
 # import dask.array as da
+from pathlib import Path
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from scipy import ndimage as ndi
 from skimage import transform
@@ -413,7 +414,7 @@ class BasicOperations(UFunc):
             self.set(store = out)
         if out is None:
             self.zarr_params['n_jobs'] = 1
-        if isinstance(input, str):
+        if isinstance(input, (str, Path)):
             input = Pyramid().from_zarr(input)
         ApplyAndRescale.__init__(self,
                                  input,
