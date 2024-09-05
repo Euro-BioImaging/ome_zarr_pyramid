@@ -47,6 +47,26 @@ def pyramids_are_similar(pyr1, pyr2):
 def validate_datasets(datasets):
     raise NotImplementedError(f"This function is not yet implemented.")
 
+def aszarr(input: Union[str, Path, zarr.Group, zarr.Array]):
+    assert isinstance(input, (str, Path, zarr.Group, zarr.Array))
+    if isinstance(input, str):
+        input = Path(input)
+    if isinstance(input, (str, Path)):
+        zarrobj = zarr.open(input, mode = 'a')
+    else:
+        zarrobj = input
+    return zarrobj
+
+def _parse_resolution_paths(paths):
+    paths = [str(pth) for pth in paths]
+    for pth in paths:
+        try:
+            _ = str(pth)
+        except:
+            raise TypeError(f"Resolution path names must be numerical.")
+    return paths
+
+
 class Multimeta:
     def __init__(self,
                  multimeta = None
@@ -611,7 +631,9 @@ class Operations:
     def __add__(self, # TODO: support scalar
                 other
                 ):
+        self.to_dask()
         if isinstance(other, Pyramid):
+            other.to_dask()
             pyramids_are_similar(self, other)
         elif isinstance(other, (int, float)):
             pass
@@ -636,7 +658,9 @@ class Operations:
     def __sub__(self,
                 other
                 ):
+        self.to_dask()
         if isinstance(other, Pyramid):
+            other.to_dask()
             pyramids_are_similar(self, other)
         elif isinstance(other, (int, float)):
             pass
@@ -661,7 +685,9 @@ class Operations:
     def __mul__(self,
                 other
                 ):
+        self.to_dask()
         if isinstance(other, Pyramid):
+            other.to_dask()
             pyramids_are_similar(self, other)
         elif isinstance(other, (int, float)):
             pass
@@ -686,7 +712,9 @@ class Operations:
     def __truediv__(self,
                 other
                 ):
+        self.to_dask()
         if isinstance(other, Pyramid):
+            other.to_dask()
             pyramids_are_similar(self, other)
         elif isinstance(other, (int, float)):
             pass
@@ -848,6 +876,7 @@ class Pyramid(Multimeta, Operations):
         pyr = Pyramid()
         if paths is None:
             paths = self.resolution_paths
+        paths = _parse_resolution_paths(paths)
         for pth in paths:
             res = self.layers[pth]
             if not pyr.has_axes:
@@ -976,39 +1005,46 @@ class Pyramid(Multimeta, Operations):
         return self
 
     #  main pyramid method
-    def from_zarr(self, # TODO: add limit to layers
-                  fpath,
-                  include_imglabels = False,
-                  resolution_paths = None,
+    def from_zarr(self,
+                  input_path: Union[str, Path, zarr.Group],
+                  paths = None,
                   keep_array_type: bool = True,
-                  syncdir = 'same'
+                  syncdir = 'same',
+                  # include_imglabels = False,
                   ):
-        self._pyramid_root = fpath
+
+        self._pyramid_root = input_path
         if syncdir == 'same':
-            grp = zarr.open_group(fpath, mode='r+')
+            grp = zarr.open_group(input_path, mode='r+')
         else:
             synchronizer = self._parse_synchronizer(syncdir)
-            grp = zarr.open_group(fpath, mode='r+', synchronizer = synchronizer)
+            grp = zarr.open_group(input_path, mode='r+', synchronizer = synchronizer)
         multimeta = validate_multimeta(grp)
         mm = Multimeta(multimeta)
         self._gr = grp
-        for pth, arr in self.gr.arrays():
+        if paths is None:
+            paths = list(self.gr.array_keys())
+        paths = _parse_resolution_paths(paths)
+        for pth in paths:
+            if pth in self.gr.keys():
+                arr = self.gr[pth]
+            elif int(pth) in self.gr.keys():
+                arr = self.gr[int(pth)]
+            else:
+                warnings.warn(f"The requested resolution path {pth} does not exist in the target input_path.")
             if not self.has_axes:
                 self.parse_axes(mm.axis_order, unit_list=mm.unit_list)
-            if resolution_paths is not None:
-                if pth not in resolution_paths:
-                    continue
             self.add_layer(arr, pth, mm.scales[pth], mm.translations[pth], keep_array_type = keep_array_type)
-        if include_imglabels:
-            if not 'labels' in self.gr.keys():
-                warnings.warn(f'No groups named "labels" exist.')
-            self._labels_root = os.path.join(fpath, 'labels')
-            label_paths = list(self.gr['labels'].group_keys())
-            for name in label_paths:
-                pyr = LabelPyramid()
-                pyrpath = os.path.join(self._labels_root, name)
-                pyr.from_zarr(pyrpath, keep_array_type = keep_array_type)
-                self.add_imglabel(pyr, name)
+        # if include_imglabels:
+        #     if not 'labels' in self.gr.keys():
+        #         warnings.warn(f'No groups named "labels" exist.')
+        #     self._labels_root = os.path.join(input_path, 'labels')
+        #     label_paths = list(self.gr['labels'].group_keys())
+        #     for name in label_paths:
+        #         pyr = LabelPyramid()
+        #         pyrpath = os.path.join(self._labels_root, name)
+        #         pyr.from_zarr(pyrpath, keep_array_type = keep_array_type)
+        #         self.add_imglabel(pyr, name)
         return self
 
     def add_imglabel(self,
@@ -1102,22 +1138,48 @@ class Pyramid(Multimeta, Operations):
     #         self._arrays[pth] = self.layers[pth].compute()
     #     return self
 
-    # def to_dask(self):
-    #     arrmeta = copy.deepcopy(self.array_meta)
-    #     for pth, array in self.layers.items():
-    #         if isinstance(array, np.ndarray):
-    #             self._arrays[pth] = da.from_array(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
-
+    def to_dask(self,
+                deepcopy = False
+                ):
+        if deepcopy:
+            store = self.pyramid_root
+            pyr = Pyramid().from_zarr(store)
+            arrmeta = copy.deepcopy(pyr.array_meta)
+            scales = copy.deepcopy(pyr.scales)
+            # translations = copy.deepcopy(pyr.translations)
+            array_meta = copy.deepcopy(pyr.array_meta)
+            for pth, array in pyr.layers.items():
+                zarr_meta = array_meta[pth]
+                # pyr.add_layer(res.astype(self.dtype), pth, scale, translation, zarr_meta = zarr_meta)
+                if isinstance(array, np.ndarray):
+                    array = da.from_array(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
+                elif isinstance(array, zarr.Array):
+                    array = da.from_zarr(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
+                pyr.add_layer(array,
+                              pth = pth,
+                              scale = scales[pth],
+                              zarr_meta = zarr_meta,
+                              overwrite = True
+                              )
+            return pyr
+        else:
+            arrmeta = copy.deepcopy(self.array_meta)
+            for pth, array in self.layers.items():
+                if isinstance(array, np.ndarray):
+                    self._arrays[pth] = da.from_array(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
+                elif isinstance(array, zarr.Array):
+                    self._arrays[pth] = da.from_zarr(array, chunks=arrmeta[pth]['chunks']).astype(arrmeta[pth]['dtype'])
+            return self
     # def checkpoint(self):
     #     self.compute()
     #     self.to_dask()
 
     def save_binary(self, fpath, region_sizes, overwrite, verbose = False):
         for pth, arr in self.layers.items():
-            if hasattr(arr, 'write_binary'): # means it is blockwise
+            if hasattr(arr, 'write_binary'): # means it is a blockwise instance
                 self._arrays[pth] = arr.output
             elif isinstance(arr, zarr.Array):
-                zarr.copy(arr, self.gr)
+                self.gr[pth] = arr
                 self._arrays[pth] = self.gr[pth]
             elif isinstance(arr, da.Array):
                 self.save_dask_layer(fpath,
@@ -1126,6 +1188,7 @@ class Pyramid(Multimeta, Operations):
                                      overwrite = overwrite,
                                      verbose = verbose
                                      )
+                self._arrays[pth] = self.gr[pth]
             else:
                 warnings.warn(f"The data type for path {pth} could not be recognized!")
         return self
@@ -1143,31 +1206,33 @@ class Pyramid(Multimeta, Operations):
         return synchronizer
 
     def to_zarr(self, # Pyramid class
-                fpath,
+                output_path: Union[str, Path],
+                paths: Union[Iterable[int],Iterable[str]] = None,
                 overwrite: bool = False,
-                include_imglabels = False,
+                # include_imglabels = False,
                 region_sizes = None,
                 verbose = False,
                 only_meta = False,
                 syncdir = 'same'
                 ):
+        if paths is not None:
+            paths = _parse_resolution_paths(paths)
+            self.shrink(paths, hard = False)
         synchronizer = self._parse_synchronizer(syncdir)
-        if isinstance(fpath, str):
-            store = zarr.DirectoryStore(fpath, dimension_separator = self.dimension_separator)
+        if isinstance(output_path, (str, Path)):
+            store = zarr.DirectoryStore(output_path, dimension_separator = self.dimension_separator)
         else:
-            store = fpath
+            store = output_path
         grp = zarr.open_group(store, mode='a', synchronizer = synchronizer)
         self._gr = grp
-        if only_meta:
-            pass
-        else:
-            self.save_binary(fpath, region_sizes, overwrite)
+        if not only_meta:
+            self.save_binary(output_path, region_sizes, overwrite)
         self.gr.attrs['multiscales'] = self.multimeta
         # if include_imglabels:
         #     labelgrp = grp.create_group('labels', overwrite=overwrite)
         #     for label_name in self.label_paths:
         #         lpyr = self.labels[label_name]
-        #         lfpath = os.path.join(fpath, 'labels', label_name)
+        #         loutput_path = os.path.join(fpath, 'labels', label_name)
         #         lpyr.to_zarr(lfpath)
         #     labelgrp.attrs['labels'] = self.label_paths
         return self
@@ -1422,6 +1487,19 @@ class Pyramid(Multimeta, Operations):
         return self
 
     @property
+    def array_type(self):
+        typ = None
+        if isinstance(self.refarray, zarr.Array):
+            typ = 'zarr'
+        elif isinstance(self.refarray, da.Array):
+            typ = 'dask'
+        elif isinstance(self.refarray, np.ndarray):
+            typ = 'numpy'
+        elif isinstance(self.refarray, BlockwiseRunner):
+            typ = 'blockwise'
+        return typ
+
+    @property
     def layers(self):
         return dict(sorted(self._arrays.items()))
 
@@ -1466,34 +1544,34 @@ class Pyramid(Multimeta, Operations):
                 axis_order = self.axis_order
             self.parse_axes(axis_order, newmeta['unit_list'], overwrite = True)
 
-    # def astype(self,
-    #            new_dtype: Union[np.dtype, type, str],
-    #            paths: Union[list, str] = None, # if None, update all paths
-    #            label_paths: List[str] = None
-    #            ):
-    #     assert isinstance(np.dtype(new_dtype), (np.dtype, str)) or any(new_dtype == item for item in [int, float])
-    #     try:
-    #         npdtype = np.dtype(new_dtype)
-    #         _ = npdtype
-    #     except:
-    #         raise TypeError(f'The given data type is not parsable.')
-    #     if paths is None:
-    #         paths = self.resolution_paths
-    #     else:
-    #         paths = cnv.parse_as_list(paths)
-    #         assert cnv.includes(self.resolution_paths, paths)
-    #     for pth in paths:
-    #         layer = self.layers[pth].astype(new_dtype)
-    #         zarr_meta = self.array_meta[pth]
-    #         zarr_meta['dtype'] = new_dtype
-    #         # translation = self.translations[pth] if self.has_translation else None
-    #         self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
-    #     if label_paths is not None:
-    #         if label_paths == 'all': label_paths = self.label_paths
-    #         for lpth in label_paths:
-    #             if lpth in self.label_paths:
-    #                 self.labels[lpth].astype(new_dtype, paths)
-    #     return self
+    def astype(self,
+               new_dtype: Union[np.dtype, type, str],
+               paths: Union[list, str] = None, # if None, update all paths
+               # label_paths: List[str] = None
+               ):
+        assert isinstance(np.dtype(new_dtype), (np.dtype, str)) or any(new_dtype == item for item in [int, float])
+        try:
+            npdtype = np.dtype(new_dtype)
+            _ = npdtype
+        except:
+            raise TypeError(f'The given data type is not parsable.')
+        if paths is None:
+            paths = self.resolution_paths
+        else:
+            paths = _parse_resolution_paths(paths)
+            assert cnv.includes(self.resolution_paths, paths)
+        for pth in paths:
+            layer = self.layers[pth].astype(new_dtype)
+            zarr_meta = self.array_meta[pth]
+            zarr_meta['dtype'] = new_dtype
+            # translation = self.translations[pth] if self.has_translation else None
+            self.add_layer(layer, pth, self.scales[pth],  self.translations[pth], zarr_meta = zarr_meta, overwrite = True)
+        # if label_paths is not None:
+        #     if label_paths == 'all': label_paths = self.label_paths
+        #     for lpth in label_paths:
+        #         if lpth in self.label_paths:
+        #             self.labels[lpth].astype(new_dtype, paths)
+        return self
 
     # def asflat(self,
     #            paths: Union[list, str] = None,
