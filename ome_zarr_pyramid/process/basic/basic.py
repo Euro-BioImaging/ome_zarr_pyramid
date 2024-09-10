@@ -30,7 +30,9 @@ class _WrapperBase:
                  overwrite=False,
                  ###
                  n_jobs = None,
-                 select_layers = 'all'
+                 rescale_output=False,
+                 select_layers = 'all',
+                 n_scales = None
                  ):
         self.zarr_params = {
             # 'scale_factor': scale_factor,
@@ -46,7 +48,9 @@ class _WrapperBase:
             'overwrite': overwrite,
             ###
             'n_jobs': n_jobs,
-            'select_layers': select_layers
+            'rescale_output': rescale_output,
+            'select_layers': select_layers,
+            'n_scales': n_scales
         }
         self.scale_factor = scale_factor
 
@@ -63,25 +67,30 @@ class _WrapperBase:
         return self
 
 
-class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid):
+class BasicOperations(_WrapperBase, ApplyToPyramid):
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
                  block_overlap_sizes=None,
-                 subset_indices: dict = None,
+                 input_subset_indices: dict = None,
                  ### zarr parameters
-                 store: str = None,
-                 compressor='auto',
-                 chunks=None,
-                 dimension_separator=None,
+                 output_store: str = None,
+                 output_compressor='auto',
+                 output_chunks: Union[tuple, list] = None,
+                 output_dimension_separator=None,
                  output_dtype=None,
                  overwrite=False,
                  ###
                  n_jobs=None,
-                 select_layers = 'all'
+                 rescale_output = False,
+                 select_layers='all',
+                 n_scales=None
                  ):
-        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, subset_indices,
-                              store, compressor, chunks, dimension_separator, output_dtype, overwrite, n_jobs, select_layers)
+        _WrapperBase.__init__(
+                              self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+                              output_store, output_compressor, output_chunks, output_dimension_separator,
+                              output_dtype, overwrite, n_jobs, rescale_output, select_layers, n_scales
+                              )
 
     def __run(self,
             input: Union[str, Pyramid],
@@ -92,25 +101,26 @@ class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid):
             ):
         if out != '':
             self.set(store = out)
-        if isinstance(input, str):
+        if out is None:
+            self.zarr_params['n_jobs'] = 1
+        if isinstance(input, (str, Path)):
             input = Pyramid().from_zarr(input)
-        if self.scale_factor is None:
-            ApplyToPyramid.__init__(self,
-                                     input,
-                                     *args,
-                                     func=func,
-                                     **self.zarr_params,
-                                     **kwargs
-                                     )
-        else:
-            ApplyAndRescale.__init__(self,
-                                     input,
-                                     *args,
-                                     func = func,
-                                     **self.zarr_params,
-                                     **kwargs
-                                     )
+
+        ApplyToPyramid.__init__(self,
+                                 input,
+                                 *args,
+                                 func=func,
+                                 **self.zarr_params,
+                                 **kwargs,
+                                 scale_factor = self.scale_factor
+                                 )
         return self.add_layers()
+
+    def __run_with_dask(self):
+        """TODO: Some functions benefits from dask. Connect this to a dedicated module.
+        """
+        raise NotImplementedError(f"This method is not yet implemented.")
+
 
     def absolute(self, x, out = None):
         return self.__run(input = x, func = np.absolute, out = out)
@@ -381,55 +391,7 @@ class UFunc(_WrapperBase, ApplyAndRescale, ApplyToPyramid):
     def clip(self, a, a_min, a_max, out=None):
         return self.__run(input=a, func=np.clip, a_min=a_min, a_max=a_max, out=out)
 
-
-class BasicOperations(UFunc):
-    def __init__(self,
-                 scale_factor=None,
-                 min_block_size=None,
-                 block_overlap_sizes=None,
-                 input_subset_indices: dict = None,
-                 ### zarr parameters
-                 output_store: str = None,
-                 output_compressor='auto',
-                 output_chunks: Union[tuple, list] = None,
-                 output_dimension_separator=None,
-                 output_dtype=None,
-                 overwrite=False,
-                 ###
-                 n_jobs=None,
-                 select_layers='all',
-                 ):
-        UFunc.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
-                        output_store, output_compressor, output_chunks, output_dimension_separator,
-                        output_dtype, overwrite, n_jobs, select_layers)
-
-    def __run(self,
-            input: Union[str, Pyramid],
-            *args,
-            func,
-            out: str = '',
-            **kwargs
-            ):
-        if out != '':
-            self.set(store = out)
-        if out is None:
-            self.zarr_params['n_jobs'] = 1
-        if isinstance(input, (str, Path)):
-            input = Pyramid().from_zarr(input)
-        ApplyAndRescale.__init__(self,
-                                 input,
-                                 *args,
-                                 func = func,
-                                 **self.zarr_params,
-                                 **kwargs
-                                 )
-        return self.add_layers()
-
-
-    def __run_with_dask(self):
-        """TODO: Some functions benefits from dask. Connect this to a dedicated module.
-        """
-        raise NotImplementedError(f"This method is not yet implemented.")
+    ############################
 
     def max(self, input, axis, out=None):
         return self.__run(input, func=np.max, axis=axis, out=out)

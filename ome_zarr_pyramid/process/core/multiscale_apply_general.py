@@ -1,4 +1,5 @@
 import tempfile, warnings, multiprocessing, itertools, shutil, glob, zarr, os, copy, inspect
+from skimage import transform
 import numpy as np
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional, final )
 
@@ -68,6 +69,7 @@ def _parse_subset_indices(input, subset_indices):
                    for i in input.resolution_paths}
     return sub_ids
 
+def _parse_scale_factor(): pass
 
 
 class ApplyToPyramid:
@@ -88,7 +90,11 @@ class ApplyToPyramid:
                  func=None,
                  runner = None,
                  n_jobs = None,
-                 select_layers = 'all',
+                 ### parameters to manage multiscaling
+                 rescale_output = False, # overrides select_layers
+                 select_layers: (int, str, list, tuple) = 'all',
+                 scale_factor = None,
+                 n_scales = None,
                  **kwargs
                 ):
         assert isinstance(input, (Pyramid, PyramidCollection))
@@ -100,8 +106,12 @@ class ApplyToPyramid:
         self.min_block_size = min_block_size
         self.subset_indices = _parse_subset_indices(self.input, subset_indices)
         ### zarr parameters
+        self.rescale_output = rescale_output
         self.select_layers = select_layers
+        self.n_scales = n_scales
         self.store = store
+        self.scale_factor = scale_factor
+        self.downscale_func = None
         if compressor is None:
             self.compressor = self.input.compressor
         else:
@@ -126,6 +136,9 @@ class ApplyToPyramid:
             self.n_jobs = n_jobs
         self.blockwises = {}
 
+    def set_downscaler(self, downscale_func):
+        self.downscale_func = downscale_func
+
     def set_function(self, func):
         self.profiler = FunctionProfiler(func)
         self.lazyfunc = LazyFunction(func, profiler = FunctionProfiler)
@@ -142,7 +155,16 @@ class ApplyToPyramid:
             self.args = _parse_args(*args)
             self.kwargs = kwargs
 
-    def parse_resolution_paths(self):
+    def _parse_default_scale_factor(self):
+        scale_factor = [1] * self.input.nlayers
+        indices_yx = self.input.index('yx')
+        if isinstance(indices_yx[0], (list, tuple)):
+            indices_yx = indices_yx[0]
+        for idx in indices_yx:
+            scale_factor[idx] = 2
+        return scale_factor
+
+    def parse_select_layers(self):
         if self.select_layers == 'all':
             paths = self.input.resolution_paths
         elif isinstance(self.select_layers, int):
@@ -183,9 +205,26 @@ class ApplyToPyramid:
                                    )
         return self.output
 
-
     def add_layers(self):
-        paths = self.parse_resolution_paths()
+        select_paths = self.parse_select_layers()
+
+        if self.rescale_output and self.select_layers != 'all':
+            warnings.warn(f"Note that if rescale_output is True, the 'select_layers' parameter is ignored.")
+            warnings.warn(f"To control the number of layers to be created, use n_layers parameter instead.")
+
+        if self.rescale_output:
+            paths = [self.input.refpath] ### parse only the refpath if the scale_factor is specified so that the output can be rescaled.
+            if self.n_scales is None:
+                self.n_scales = self.input.nlayers
+            if self.downscale_func is None:
+                self.set_downscaler(transform.downscale_local_mean)
+            if self.scale_factor is None:
+                self.scale_factor = self._parse_default_scale_factor()
+        else:
+            paths = select_paths
+            assert self.n_scales is None, f"If rescale_output is False, the parameter n_scales must be None (default)."
+            assert self.downscale_func is None, f"If rescale_output is False, the parameter downscale_func must be None (default)."
+            assert self.scale_factor is None, f"If rescale_output is False, the parameter scale_factor must be None (default)."
 
         self.output = Pyramid()
 
@@ -218,7 +257,8 @@ class ApplyToPyramid:
                                     n_jobs = self.n_jobs,
                                     use_synchronizer = 'multiprocessing',
                                     pyramidal_syncdir = syncdir,
-                                    *parsed_args, **self.kwargs)
+                                    *parsed_args, **self.kwargs
+                                    )
 
             meta = copy.deepcopy(self.input.array_meta[pth])
             meta['chunks'] = blockwise.chunks
@@ -235,10 +275,25 @@ class ApplyToPyramid:
 
             self.blockwises[pth] = blockwise
         self.output.to_zarr(self.store, overwrite = self.overwrite, syncdir = 'default')
+
+        ### do rescaling if needed
+
+        if self.rescale_output and self.n_scales > 1:
+            self.output.rescale( # TODO: test this method.
+                                n_layers = self.n_scales,
+                                scale_factor = self.scale_factor,
+                                min_input_block_size = self.min_block_size,
+                                overwrite_layers = self.overwrite,
+                                n_jobs = self.n_jobs,
+                                downscale_func = self.downscale_func
+                                )
+        ###
+
         if self.output.refarray.synchronizer is not None:
             synchpath = os.path.dirname(self.output.refarray.synchronizer.path)
             shutil.rmtree(synchpath)
         return self.output
+
 
 
 class ApplyAndRescale(ApplyToPyramid):
@@ -354,7 +409,7 @@ class ApplyAndRescale(ApplyToPyramid):
         downscaling[self.input.refpath] = False
 
         ###
-        paths = self.parse_resolution_paths()
+        paths = self.parse_select_layers()
         ###
 
         syncdir = tempfile.mkdtemp()

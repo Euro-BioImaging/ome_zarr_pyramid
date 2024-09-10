@@ -3,6 +3,7 @@ import numpy as np
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.utils import multiscale_utils as mutils
 from ome_zarr_pyramid.process.core._blockwise_general import LazyFunction
 from ome_zarr_pyramid.process.morphology._blockwise_label import BlockwiseLabelRunner, LabelProfiler
 from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyToPyramid, ApplyAndRescale, \
@@ -24,30 +25,42 @@ class ApplyLabelToPyramid(ApplyToPyramid):
                  ### zarr parameters
                  store: str = None,
                  compressor='auto',
-                 dimension_separator=None,
+                 chunks = None,
+                 dimension_separator = None,
                  dtype=None,
                  overwrite=False,
                  ###
                  func=None,
-                 n_jobs=None,
-                 monoresolution=False,
+                 runner = None,
+                 n_jobs = None,
+                 ### parameters to manage multiscaling
+                 rescale_output = False, # overrides select_layers
+                 select_layers: (int, str, list, tuple) = 'all',
+                 scale_factor = None,
+                 n_scales = None,
                  **kwargs
                  ):
-        ApplyToPyramid.__init__(self,
-                                input = input,
-                                min_block_size = min_block_size,
-                                block_overlap_sizes = block_overlap_sizes,
-                                subset_indices = subset_indices,
-                                store = store,
-                                compressor = compressor,
-                                dimension_separator = dimension_separator,
-                                dtype = dtype,
-                                overwrite = overwrite,
-                                func = func,
-                                n_jobs = n_jobs,
-                                monoresolution = monoresolution,
-                                *args, **kwargs
-                                )
+        super().__init__(
+                        input = input,
+                        *args,
+                        min_block_size = min_block_size,
+                        block_overlap_sizes = block_overlap_sizes,
+                        subset_indices = subset_indices,
+                        store = store,
+                        compressor = compressor,
+                        chunks = chunks,
+                        dimension_separator = dimension_separator,
+                        dtype = dtype,
+                        overwrite = overwrite,
+                        func = func,
+                        runner = runner,
+                        n_jobs = n_jobs,
+                        rescale_output = rescale_output,
+                        select_layers = select_layers,
+                        scale_factor = scale_factor,
+                        n_scales = n_scales,
+                        **kwargs
+                        )
 
     def set_function(self, func):
         self.profiler = LabelProfiler(func)
@@ -70,34 +83,72 @@ class ApplyLabelToPyramid(ApplyToPyramid):
             raise Exception(f"This is not a label function.")
 
     def _write_single_layer(self,
-                            out,
+                            # out,
                             blockwise,
                             pth,
                             meta,
+                            scales = None,
+                            sequential = False,
+                            downscaling_per_layer=False,
                             **kwargs
                             ):
-        out.add_layer(blockwise,
-                      pth,
-                      scale=self.input.get_scale(pth),
-                      translation=self.input.get_translation(pth),
-                      zarr_meta={'dtype': meta['dtype'],
-                                 'chunks': meta['chunks'],
-                                 'shape': blockwise.shape,
-                                 'compressor': meta['compressor'],
-                                 'dimension_separator': meta['dimension_separator']
-                                 },
-                      axis_order=self.input.axis_order,
-                      unitlist=self.input.unit_list
-                      )
+        self.output.add_layer(blockwise,
+                              pth,
+                              scale = self.input.get_scale(pth),
+                              # scale=scales[pth],
+                              # translation=self.input.get_translation(pth),
+                              zarr_meta={'dtype': meta['dtype'],
+                                         'chunks': meta['chunks'],
+                                         'shape': blockwise.shape,
+                                         'compressor': meta['compressor'],
+                                         'dimension_separator': meta['dimension_separator']
+                                         },
+                              axis_order=self.input.axis_order,
+                              unitlist=self.input.unit_list
+                              )
 
         blockwise.write_meta()
         blockwise.clean_sync_folder()
-        relocated = blockwise.write_binary(sequential=True, relocate=True)
+        relocated = blockwise.write_binary(sequential=True, relocate=True, only_downscale=downscaling_per_layer)
         blockwise._set_input_array(relocated)
-        _ = blockwise.write_binary(sequential=True, relocate=False, repetitions=100, # TODO: parse these parameters
-                                   switch_slicing_direction = True
-                                   )
-        return out
+        if downscaling_per_layer:
+            _ = relocated
+        else:
+            _ = blockwise.write_binary(sequential = True,
+                                           relocate = False, repetitions = 100, # TODO: parse these parameters
+                                           switch_slicing_direction = True, only_downscale = False
+                                           )
+        return self.output#layer
+
+    # def _write_single_layer(self,
+    #                         out,
+    #                         blockwise,
+    #                         pth,
+    #                         meta,
+    #                         **kwargs
+    #                         ):
+    #     out.add_layer(blockwise,
+    #                   pth,
+    #                   scale=self.input.get_scale(pth),
+    #                   translation=self.input.get_translation(pth),
+    #                   zarr_meta={'dtype': meta['dtype'],
+    #                              'chunks': meta['chunks'],
+    #                              'shape': blockwise.shape,
+    #                              'compressor': meta['compressor'],
+    #                              'dimension_separator': meta['dimension_separator']
+    #                              },
+    #                   axis_order=self.input.axis_order,
+    #                   unitlist=self.input.unit_list
+    #                   )
+    #
+    #     blockwise.write_meta()
+    #     blockwise.clean_sync_folder()
+    #     relocated = blockwise.write_binary(sequential=True, relocate=True)
+    #     blockwise._set_input_array(relocated)
+    #     _ = blockwise.write_binary(sequential=True, relocate=False, repetitions=100, # TODO: parse these parameters
+    #                                switch_slicing_direction = True
+    #                                )
+    #     return out
 
 
 class ApplyLabelAndRescale(ApplyAndRescale):

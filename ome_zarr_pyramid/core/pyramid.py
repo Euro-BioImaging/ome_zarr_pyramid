@@ -6,6 +6,7 @@ import pandas as pd
 from dask import array as da
 # import s3fs
 from skimage.transform import resize as skresize
+from skimage import transform
 # from rechunker import rechunk
 from ome_zarr_pyramid.core import config, convenience as cnv
 from numcodecs import Blosc
@@ -638,7 +639,7 @@ class Operations:
         elif isinstance(other, (int, float)):
             pass
         else:
-            raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+            raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
         pyr = Pyramid()
         for pth in self.resolution_paths:
             if isinstance(other, Pyramid):
@@ -646,7 +647,7 @@ class Operations:
             elif isinstance(other, (int, float)):
                 res = self.layers[pth] + other
             else:
-                raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+                raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
             if not pyr.has_axes:
                 pyr.parse_axes(self.axis_order, self.unit_list)
             scale = self.get_scale(pth)
@@ -654,6 +655,9 @@ class Operations:
             zarr_meta = self.array_meta[pth]
             pyr.add_layer(res.astype(self.dtype), pth, scale, translation, zarr_meta)
         return pyr
+
+    def __radd__(self, other):
+        return self.__radd__(other)
 
     def __sub__(self,
                 other
@@ -665,7 +669,7 @@ class Operations:
         elif isinstance(other, (int, float)):
             pass
         else:
-            raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+            raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
         pyr = Pyramid()
         for pth in self.resolution_paths:
             if isinstance(other, Pyramid):
@@ -673,7 +677,7 @@ class Operations:
             elif isinstance(other, (int, float)):
                 res = self.layers[pth] - other
             else:
-                raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+                raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
             if not pyr.has_axes:
                 pyr.parse_axes(self.axis_order, self.unit_list)
             scale = self.get_scale(pth)
@@ -681,6 +685,9 @@ class Operations:
             zarr_meta = self.array_meta[pth]
             pyr.add_layer(res.astype(self.dtype), pth, scale, translation, zarr_meta)
         return pyr
+
+    def __rsub__(self, other):
+        return self.__sub__(other)
 
     def __mul__(self,
                 other
@@ -692,7 +699,7 @@ class Operations:
         elif isinstance(other, (int, float)):
             pass
         else:
-            raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+            raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
         pyr = Pyramid()
         for pth in self.resolution_paths:
             if isinstance(other, Pyramid):
@@ -700,7 +707,7 @@ class Operations:
             elif isinstance(other, (int, float)):
                 res = self.layers[pth] * other
             else:
-                raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+                raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
             if not pyr.has_axes:
                 pyr.parse_axes(self.axis_order, self.unit_list)
             scale = self.get_scale(pth)
@@ -708,6 +715,9 @@ class Operations:
             zarr_meta = self.array_meta[pth]
             pyr.add_layer(res.astype(self.dtype), pth, scale, translation, zarr_meta)
         return pyr
+
+    def __rmul__(self, other):
+        return self.__mul__(other)
 
     def __truediv__(self,
                 other
@@ -719,7 +729,7 @@ class Operations:
         elif isinstance(other, (int, float)):
             pass
         else:
-            raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+            raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
         pyr = Pyramid()
         for pth in self.resolution_paths:
             if isinstance(other, Pyramid):
@@ -727,7 +737,7 @@ class Operations:
             elif isinstance(other, (int, float)):
                 res = self.layers[pth] / other
             else:
-                raise ValueError(f"Other must either be an instance of Pyramid or be a scalar value.")
+                raise TypeError(f"Other must either be an instance of Pyramid or be a scalar value.")
             if not pyr.has_axes:
                 pyr.parse_axes(self.axis_order, self.unit_list)
             scale = self.get_scale(pth)
@@ -735,6 +745,9 @@ class Operations:
             zarr_meta = self.array_meta[pth]
             pyr.add_layer(res.astype(self.dtype), pth, scale, translation, zarr_meta)
         return pyr
+
+    def __rtruediv__(self, other):
+        return self.__rtruediv__(other)
 
     ##### Arythmetic operations
     def sum(self,
@@ -822,7 +835,11 @@ class Pyramid(Multimeta, Operations):
         return f"Pyramidal OME-Zarr with {self.nlayers} resolution layers."
 
     def __repr__(self):
-        return f"Pyramidal OME-Zarr with {self.nlayers} resolution layers."
+        # return f"Pyramidal OME-Zarr with {self.nlayers} resolution layers."
+        if self.pyramid_root is not None:
+            return self.pyramid_root
+        else:
+            return f"Pyramidal OME-Zarr with {self.nlayers} resolution layers."
 
     def __len__(self):
         return len(self.resolution_paths)
@@ -1678,7 +1695,8 @@ class Pyramid(Multimeta, Operations):
                 scale_factor: Union[Tuple, List] = None,
                 min_input_block_size: tuple = None,
                 overwrite_layers: bool = False,
-                n_jobs = 8
+                n_jobs = 8,
+                downscale_func = transform.downscale_local_mean
                 ):
         """
         This function rescales the entire Pyramid based on the top resolution layer. Note that if there are already existing
@@ -1706,7 +1724,8 @@ class Pyramid(Multimeta, Operations):
                                                        scale_factor = scale_factor,
                                                        min_input_block_size = min_input_block_size,
                                                        overwrite_layers = overwrite_layers,
-                                                       n_jobs = n_jobs
+                                                       n_jobs = n_jobs,
+                                                       downscale_func = downscale_func
                                                        )
         scales = mutils.get_scales_from_rescaled(rescaled = rescaled_layers,
                                                  refscale = refscale,
@@ -2203,6 +2222,10 @@ class PyramidCollection: # Change to PyramidIO
         return [pyr.nlayers for pyr in self.pyramids]
 
     @property
+    def nlayers(self):
+        return self._nlayers[0]
+
+    @property
     def _resolution_paths(self):
         return [pyr.resolution_paths for pyr in self.pyramids]
 
@@ -2406,6 +2429,12 @@ class PyramidCollection: # Change to PyramidIO
         for pyr in self.pyramids:
             index.append(pyr.index(axis, scalar_sensitive))
         return index
+
+    # def index(self,
+    #           axis = 'z',
+    #           scalar_sensitive = True
+    #           ):
+    #     return self._index(axis, scalar_sensitive)[0]
 
     def axlens_for(self,
                    axes

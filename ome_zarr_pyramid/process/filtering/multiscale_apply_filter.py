@@ -86,13 +86,19 @@ class ApplyFilterToPyramid(ApplyToPyramid):
                  ### zarr parameters
                  store: str = None,
                  compressor='auto',
-                 dimension_separator=None,
+                 chunks = None,
+                 dimension_separator = None,
                  dtype=None,
                  overwrite=False,
                  ###
                  func=None,
-                 n_jobs=None,
-                 monoresolution=False,
+                 runner = None,
+                 n_jobs = None,
+                 ### parameters to manage multiscaling
+                 rescale_output = False, # overrides select_layers
+                 select_layers: (int, str, list, tuple) = 'all',
+                 scale_factor = None,
+                 n_scales = None,
                  **kwargs
                  ):
         super().__init__(
@@ -103,12 +109,17 @@ class ApplyFilterToPyramid(ApplyToPyramid):
                         subset_indices = subset_indices,
                         store = store,
                         compressor = compressor,
+                        chunks = chunks,
                         dimension_separator = dimension_separator,
                         dtype = dtype,
                         overwrite = overwrite,
                         func = func,
+                        runner = runner,
                         n_jobs = n_jobs,
-                        monoresolution = monoresolution,
+                        rescale_output = rescale_output,
+                        select_layers = select_layers,
+                        scale_factor = scale_factor,
+                        n_scales = n_scales,
                         **kwargs
                         )
 

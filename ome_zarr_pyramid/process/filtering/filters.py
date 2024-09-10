@@ -7,11 +7,11 @@ from skimage import transform
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.process.basic.basic import _WrapperBase
-from ome_zarr_pyramid.process.filtering.multiscale_apply_filter import ApplyFilterAndRescale
+from ome_zarr_pyramid.process.filtering.multiscale_apply_filter import ApplyFilterToPyramid
 from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
 
 
-class Filters(_WrapperBase, ApplyFilterAndRescale):
+class Filters(_WrapperBase, ApplyFilterToPyramid):
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
@@ -25,33 +25,39 @@ class Filters(_WrapperBase, ApplyFilterAndRescale):
                  output_dtype=None,
                  overwrite=False,
                  ###
-                 n_jobs = None,
-                 select_layers='all'
+                 n_jobs=None,
+                 rescale_output=False,
+                 select_layers='all',
+                 n_scales=None
                  ):
-        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+        _WrapperBase.__init__(
+                              self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
                               output_store, output_compressor, output_chunks, output_dimension_separator,
-                              output_dtype, overwrite, n_jobs, select_layers)
+                              output_dtype, overwrite, n_jobs, rescale_output, select_layers, n_scales
+                              )
 
     def __run(self,
             input: Union[str, Pyramid],
             *args,
             func,
-            out: str = None,
+            out: str = '',
             **kwargs
             ):
-        if out is not None:
+        if out != '':
             self.set(store = out)
         if out is None:
             self.zarr_params['n_jobs'] = 1
         if isinstance(input, (str, Path)):
             input = Pyramid().from_zarr(input)
-        ApplyFilterAndRescale.__init__(self,
-                                         input,
-                                         *args,
-                                         func = func,
-                                         **self.zarr_params,
-                                         **kwargs
-                                         )
+
+        ApplyFilterToPyramid.__init__(self,
+                                 input,
+                                 *args,
+                                 func=func,
+                                 **self.zarr_params,
+                                 **kwargs,
+                                 scale_factor = self.scale_factor
+                                 )
         return self.add_layers()
 
     def convolve(self, input, weights, mode='reflect', cval=0.0, out=None):

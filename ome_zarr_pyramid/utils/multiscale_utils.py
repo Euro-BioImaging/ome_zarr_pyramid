@@ -10,6 +10,54 @@ import numcodecs; numcodecs.blosc.use_threads = False
 # from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.utils.general_utils import *
 from ome_zarr_pyramid.utils.assignment_utils import assign_array
+from skimage.util import view_as_blocks
+
+
+
+### Downscaling methods
+def blockwise_median(a, factors):
+    """https://stackoverflow.com/questions/50485458/median-downsampling-in-python"""
+    assert a.ndim == len(factors), \
+        "blocks must have same dimensionality as the input image"
+    # assert not (np.array(a.shape) % factors).any(), \
+    #     "factors must divide cleanly into the input image shape"
+    block_view = view_as_blocks(a, factors)
+    assert block_view.shape[a.ndim:] == factors
+    block_axes = [*range(a.ndim, 2*a.ndim)]
+    return np.median(block_view, axis=block_axes)
+
+def blockwise_min(a, factors):
+    """https://stackoverflow.com/questions/50485458/median-downsampling-in-python"""
+    assert a.ndim == len(factors), \
+        "blocks must have same dimensionality as the input image"
+    assert not (np.array(a.shape) % factors).any(), \
+        "factors must divide cleanly into the input image shape"
+    block_view = view_as_blocks(a, factors)
+    assert block_view.shape[a.ndim:] == factors
+    block_axes = [*range(a.ndim, 2*a.ndim)]
+    return np.min(block_view, axis=tuple(block_axes))
+
+def blockwise_max(a, factors):
+    """https://stackoverflow.com/questions/50485458/median-downsampling-in-python"""
+    assert a.ndim == len(factors), \
+        "blocks must have same dimensionality as the input image"
+    assert not (np.array(a.shape) % factors).any(), \
+        "factors must divide cleanly into the input image shape"
+    block_view = view_as_blocks(a, factors)
+    assert block_view.shape[a.ndim:] == factors
+    block_axes = [*range(a.ndim, 2*a.ndim)]
+    return np.max(block_view, axis=tuple(block_axes))
+
+def downscale_local_softmax(block, factors):
+    padder = np.sum((factors, block.shape), axis = 0) % factors
+    padder = tuple([(0, item) for item in padder])
+    padded = np.pad(block, padder)
+    min = blockwise_min(padded, factors)
+    max = blockwise_max(padded, factors)
+    resized = np.where(min > 0, min, max)
+    return resized
+
+##################################
 
 
 def _calculate_input_slice_bases(input_array, input_block_size):
@@ -50,7 +98,8 @@ def _downscale_step(input_array,
                     scale_factor,
                     min_input_block_size = None,
                     overwrite = False,
-                    n_jobs = 8
+                    n_jobs = 8,
+                    downscale_func = transform.downscale_local_mean
                     #**kwargs
                     ):
 
@@ -74,7 +123,7 @@ def _downscale_step(input_array,
                                 source = input_array,
                                 dest_slices = output_slices,
                                 source_slices = input_slices,
-                                func = transform.downscale_local_mean,
+                                func = downscale_func,
                                 factors = scale_factor,
                                 n_jobs = n_jobs
                                 )
@@ -84,9 +133,10 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
                           rootpath: str, # group path of all arrays
                           n_layers: Union[Tuple, List],
                           scale_factor: Union[Tuple, List],
+                          downscale_func = transform.downscale_local_mean,
                           min_input_block_size: tuple = None,
                           overwrite_layers: tuple = False,
-                          n_jobs = 8
+                          n_jobs = 8,
                           # **kwargs
                           ) -> dict:
     """
@@ -114,7 +164,8 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
                                     scale_factor = factor,
                                     min_input_block_size = min_input_block_size,
                                     overwrite = overwrite_layers,
-                                    n_jobs = n_jobs
+                                    n_jobs = n_jobs,
+                                    downscale_func = downscale_func,
                                     # **kwargs
                                     )
         nextpath = str(i + 1)

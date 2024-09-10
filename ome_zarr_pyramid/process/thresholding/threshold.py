@@ -11,7 +11,7 @@ from ome_zarr_pyramid.process.thresholding import _global_threshold as gt, _loca
 
 
 
-class Threshold(_WrapperBase, ApplyThresholdAndRescale):
+class Threshold(_WrapperBase, ApplyThresholdToPyramid):
     def __init__(self,
                  scale_factor=None,
                  min_block_size=None,
@@ -25,12 +25,16 @@ class Threshold(_WrapperBase, ApplyThresholdAndRescale):
                  output_dtype=None,
                  overwrite=False,
                  ###
-                 n_jobs = None,
-                 select_layers='all'
+                 n_jobs=None,
+                 rescale_output=False,
+                 select_layers='all',
+                 n_scales=None
                  ):
-        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+        _WrapperBase.__init__(
+                              self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
                               output_store, output_compressor, output_chunks, output_dimension_separator,
-                              output_dtype, overwrite, n_jobs, select_layers)
+                              output_dtype, overwrite, n_jobs, rescale_output, select_layers, n_scales
+                              )
 
         self._global_threshold_params_ = {'global_thresholder': filters.threshold_multiotsu,
                                           'classes': 3,

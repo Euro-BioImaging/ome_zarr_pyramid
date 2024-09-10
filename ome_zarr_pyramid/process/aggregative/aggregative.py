@@ -63,12 +63,16 @@ class Aggregative(_WrapperBase, ApplyAggregativeToPyramid):
                  output_dtype=None,
                  overwrite=False,
                  ###
-                 n_jobs = 1,
-                 select_layers='all'
+                 n_jobs=None,
+                 rescale_output=False,
+                 select_layers='all',
+                 n_scales=None
                  ):
-        _WrapperBase.__init__(self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
+        _WrapperBase.__init__(
+                              self, scale_factor, min_block_size, block_overlap_sizes, input_subset_indices,
                               output_store, output_compressor, output_chunks, output_dimension_separator,
-                              output_dtype, overwrite, n_jobs, select_layers)
+                              output_dtype, overwrite, n_jobs, rescale_output, select_layers, n_scales
+                              )
 
     def _read_multiple_paths(self): #TODO
         pass
