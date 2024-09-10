@@ -1,7 +1,6 @@
 import copy
 import inspect, itertools, os
 # from dataclasses import dataclass
-import napari
 from pathlib import Path
 from attrs import define, field, setters
 
