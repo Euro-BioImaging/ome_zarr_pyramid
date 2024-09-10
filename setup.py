@@ -34,6 +34,7 @@ setuptools.setup(
     include_package_data=True,
     install_requires = requirements,
     entry_points={'console_scripts': [
+                                      "converter = ome_zarr_pyramid.bin.runners:converters",
                                       "operations = ome_zarr_pyramid.bin.runners:operations",
                                       "filters = ome_zarr_pyramid.bin.runners:filters",
                                       "threshold = ome_zarr_pyramid.bin.runners:threshold",

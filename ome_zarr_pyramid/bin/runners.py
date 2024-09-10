@@ -1,5 +1,5 @@
 import fire
-from ome_zarr_pyramid import BasicOperations, Filters, Threshold, Label, Aggregative
+from ome_zarr_pyramid import BasicOperations, Filters, Threshold, Label, Aggregative, Converter
 
 # def _SeparateFlagArgs(args):
 #     try:
@@ -13,6 +13,9 @@ from ome_zarr_pyramid import BasicOperations, Filters, Threshold, Label, Aggrega
 #
 # fire.core.parser.SeparateFlagArgs = _SeparateFlagArgs
 
+def converters():
+    _ = fire.Fire(Converter)
+    return
 
 def operations():
     _ = fire.Fire(BasicOperations)
