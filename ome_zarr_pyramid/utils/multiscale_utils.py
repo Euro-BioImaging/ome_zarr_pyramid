@@ -1,4 +1,4 @@
-import warnings, time, shutil, zarr, itertools, multiprocessing, re, numcodecs, dask, os, copy, inspect, napari
+import warnings, time, shutil, zarr, itertools, multiprocessing, re, numcodecs, dask, os, copy, inspect
 import numpy as np
 import dask.array as da
 
