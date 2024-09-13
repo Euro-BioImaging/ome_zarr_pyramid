@@ -52,7 +52,14 @@ class _WrapperBase:
             'select_layers': select_layers,
             'n_scales': n_scales
         }
+
         self.scale_factor = scale_factor
+
+        self.slurm_params = {
+            'cores': 8,  # per job
+            'memory': "100GB",  # per job
+            'nanny': True
+        }
 
     def set(self, **kwargs):
         for key, value in kwargs.items():
@@ -64,7 +71,14 @@ class _WrapperBase:
                 self.zarr_params[key_] = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
+        ###
+        for key, value in kwargs.items():
+            if key in self.slurm_params.keys():
+                self.slurm_params[key] = value
         return self
+
+
+
 
 
 class BasicOperations(_WrapperBase, ApplyToPyramid):

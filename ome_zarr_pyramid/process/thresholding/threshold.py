@@ -54,7 +54,7 @@ class Threshold(_WrapperBase, ApplyThresholdToPyramid):
             self.zarr_params['n_jobs'] = 1
         if isinstance(input, (str, Path)):
             input = Pyramid().from_zarr(input)
-        ApplyThresholdAndRescale.__init__(self,
+        ApplyThresholdToPyramid.__init__(self,
                                          input,
                                          *args,
                                          func = func,
