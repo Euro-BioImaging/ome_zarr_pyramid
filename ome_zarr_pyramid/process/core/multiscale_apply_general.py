@@ -185,6 +185,8 @@ class ApplyToPyramid:
                             downscaling_per_layer=False,
                             **kwargs
                             ):
+        if hasattr(self, 'slurm_params'):
+            blockwise.set_slurm_params(self.slurm_params)
         self.output.add_layer(blockwise,
                       pth,
                       scale=self.input.get_scale(pth),

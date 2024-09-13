@@ -13,7 +13,7 @@ def run_command(cmd, use_shell = False):
     result = subprocess.run(cmd, shell=use_shell, capture_output=True, text=True)
     return result
 
-class Converter:
+class Converter: # TODO: parallelize with dask
     def __init__(self,
                  execute: bool = True,
                  use_shell: bool = False,

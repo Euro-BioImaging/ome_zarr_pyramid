@@ -716,6 +716,9 @@ class BlockwiseRunner(Aliases):
         self.func.parse_params(self.input_array, *args, **kwargs)
         self._handle_axes()
 
+    def set_slurm_params(self, slurm_params: dict): # TODO
+        self.slurm_params = slurm_params
+
     def write_meta(self):
         self.output = create_like(self.input_array, shape=self.output_shape, chunks=self.output_chunks,
                                   store=self.store, compressor=self.compressor, dtype = self.dtype,
@@ -821,13 +824,13 @@ class BlockwiseRunner(Aliases):
             print('###')
         return self.output
 
-    def set_workers(self, n_jobs):
+    def set_workers(self, n_jobs = None):
         cpus = multiprocessing.cpu_count()
         if n_jobs is None:
             n_jobs = cpus // 2
-        if n_jobs > cpus:
-            warnings.warn(f"The given job number ({n_jobs}) exceeds the number of available cpus. The maximum cpu number ({cpus}) will be used.")
-            n_jobs = cpus
+        # if n_jobs > cpus:
+        #     warnings.warn(f"The given job number ({n_jobs}) exceeds the number of available cpus. The maximum cpu number ({cpus}) will be used.")
+        #     n_jobs = cpus
         self.n_jobs = n_jobs
         return self
 
@@ -900,15 +903,15 @@ class BlockwiseRunner(Aliases):
                                                )
             elif self.is_slurm_available:
                 futures = []
-                with SLURMCluster(cores = self.n_jobs,
-                                  memory="100GB"
-                                   ) as cluster:
+                assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
+                with SLURMCluster(**self.slurm_params) as cluster:
                     cluster.scale(jobs=self.n_jobs)
                     with Client(cluster) as client:
                         for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
                                                                                      self.output_slices,
                                                                                      self.reducer_slices
-                                                                                     )):
+                                                                                     )
+                                                                                 ):
                             future = client.submit(self._transform_block,
                                                    i,
                                                    input_slc,
@@ -919,7 +922,7 @@ class BlockwiseRunner(Aliases):
                                                    )
                             futures.append(future)
                         results = client.gather(futures)
-                        print(f"Results for block count:: {len(results)}")
+                        print(f"Results for block count: {len(results)}")
                 client.close()
             else:
                 futures = []
