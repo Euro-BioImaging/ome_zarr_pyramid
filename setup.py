@@ -40,6 +40,7 @@ setuptools.setup(
                                       "threshold = ome_zarr_pyramid.bin.runners:threshold",
                                       "label = ome_zarr_pyramid.bin.runners:label",
                                       "aggregative = ome_zarr_pyramid.bin.runners:aggregative",
+                                      "metautils = ome_zarr_pyramid.bin.runners:metautils"
                                     ]
                   }
     )

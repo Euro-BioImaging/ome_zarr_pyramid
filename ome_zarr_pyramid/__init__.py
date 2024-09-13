@@ -10,9 +10,11 @@ from ome_zarr_pyramid.process.morphology import labeling
 from ome_zarr_pyramid.process.morphology.labeling import Label
 from ome_zarr_pyramid.process.converters import Converter
 from ome_zarr_pyramid.core.pyramid import Pyramid, LabelPyramid, PyramidCollection
+from ome_zarr_pyramid.utils.metadata_utils import MetadataUpdater
 
 __all__ = ['aggregative', 'basic', 'filters', 'threshold', 'labeling',
            'Aggregative', 'BasicOperations', 'Filters', 'Threshold', 'Label',
            'Converter',
+           'MetadataUpdater',
            'Pyramid', 'LabelPyramid', 'PyramidCollection'
            ]

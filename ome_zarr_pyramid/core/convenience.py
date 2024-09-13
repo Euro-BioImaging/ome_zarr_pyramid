@@ -15,6 +15,8 @@ import numcodecs
 # from rechunker import rechunk
 import shutil, tempfile
 
+from pathlib import Path
+
 from typing import (
     Union,
     Tuple,
@@ -40,6 +42,15 @@ def asdask(data, chunks = 'auto'):
     elif isinstance(data, np.ndarray):
         return da.from_array(data, chunks = chunks)
     return data
+
+def path_has_pyramid(path):
+    try:
+        store = zarr.DirectoryStore(path)
+        _ = zarr.open_group(store, mode = 'r')
+        return True
+    except:
+        return False
+
 
 def parse_as_list(path_or_paths: Union[Iterable, str, int, float]
                    ):

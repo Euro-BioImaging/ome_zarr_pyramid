@@ -1,5 +1,5 @@
 import fire
-from ome_zarr_pyramid import BasicOperations, Filters, Threshold, Label, Aggregative, Converter
+from ome_zarr_pyramid import BasicOperations, Filters, Threshold, Label, Aggregative, Converter, MetadataUpdater
 
 # def _SeparateFlagArgs(args):
 #     try:
@@ -37,3 +37,6 @@ def aggregative():
     _ = fire.Fire(Aggregative)
     return
 
+def metautils():
+    _ = fire.Fire(MetadataUpdater)
+    return

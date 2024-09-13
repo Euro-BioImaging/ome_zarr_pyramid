@@ -245,7 +245,7 @@ class Multimeta:
 
     def set_scale(self,
                   pth: Union[str, int] = 'auto',
-                  scale = 'auto',
+                  scale: Union[tuple, list] = 'auto', #TODO: add dict option
                   hard = False
                   ):
         if isinstance(scale, tuple):
@@ -270,6 +270,18 @@ class Multimeta:
             new_scale = np.multiply(factor, reference_scale)
             self.set_scale(pth, new_scale, hard)
         return self
+
+    def update_unitlist(self, ###TODO: test this
+                 unitlist=None,
+                 hard=False
+                 ):
+        if isinstance(unitlist, tuple):
+            unitlist = list(unitlist)
+        assert isinstance(unitlist, list)
+        self.parse_axes(self.axis_order, unitlist, overwrite = True)
+        if hard:
+            self.gr.attrs['multiscales'] = self.multimeta
+        return
 
     @property
     def scales(self):
@@ -1232,6 +1244,11 @@ class Pyramid(Multimeta, Operations):
                 only_meta = False,
                 syncdir = 'same'
                 ):
+        if cnv.path_has_pyramid(output_path):
+            if overwrite:
+                _ = zarr.group(output_path, overwrite = True)
+            else:
+                raise IOError(f"The output path already contains a zarr group.")
         if paths is not None:
             paths = _parse_resolution_paths(paths)
             self.shrink(paths, hard = False)
