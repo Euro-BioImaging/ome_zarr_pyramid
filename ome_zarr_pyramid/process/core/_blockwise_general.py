@@ -1,6 +1,9 @@
 import warnings, time, shutil, zarr, itertools, multiprocessing, re, numcodecs, dask, os, copy, inspect
 import numpy as np
 import dask.array as da
+import dask
+from dask.distributed import Client, LocalCluster
+from dask_jobqueue import SLURMCluster
 
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from skimage import transform
@@ -839,6 +842,11 @@ class BlockwiseRunner(Aliases):
                 if isinstance(self.output.synchronizer.path, str):
                     shutil.rmtree(self.output.synchronizer.path)
 
+    @property
+    def is_slurm_cluster(self):
+        slurm_vars = ['SLURM_JOB_ID', 'SLURM_NODELIST', 'SLURM_CPUS_ON_NODE']
+        return any(var in os.environ for var in slurm_vars)
+
     def write_binary(self,
                      sequential = False,
                      only_downscale = False,
@@ -891,21 +899,68 @@ class BlockwiseRunner(Aliases):
                                                x2,
                                                reducer_slc = reducer_slc
                                                )
+            elif self.is_slurm_cluster:
+                futures = []
+                with SLURMCluster(cores = self.n_jobs,
+                                  memory="500 GB"
+                                   ) as cluster:
+                    with Client(cluster) as client:
+                        for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                     self.output_slices,
+                                                                                     self.reducer_slices
+                                                                                     )):
+                            future = client.submit(self._transform_block,
+                                                   i,
+                                                   input_slc,
+                                                   output_slc,
+                                                   x1,
+                                                   x2,
+                                                   reducer_slc = reducer_slc
+                                                   )
+                            futures.append(future)
+                        results = client.gather(futures)
+                        print(f"Results for block count:: {len(results)}")
+                client.close()
             else:
-                with parallel_backend('multiprocessing'):
-                    with Parallel(n_jobs=n_jobs, require=self.require_sharedmem) as parallel:
-                        _ = parallel(
-                            delayed(self._transform_block)(i,
-                                                           input_slc,
-                                                           output_slc,
-                                                           x1,
-                                                           x2,
-                                                           reducer_slc = reducer_slc
-                                                           )
-                            for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                                                                                         self.output_slices,
-                                                                                         self.reducer_slices
-                                                                                         )))
+                futures = []
+                with LocalCluster(n_workers = self.n_jobs,
+                                       processes=True,
+                                       dashboard_address='127.0.0.1:8787',
+                                       worker_dashboard_address='127.0.0.1:0',
+                                       host = '127.0.0.1'
+                                       ) as cluster:
+                    with Client(cluster) as client:
+                        for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                     self.output_slices,
+                                                                                     self.reducer_slices
+                                                                                     )):
+                            future = client.submit(self._transform_block,
+                                                   i,
+                                                   input_slc,
+                                                   output_slc,
+                                                   x1,
+                                                   x2,
+                                                   reducer_slc = reducer_slc
+                                                   )
+                            futures.append(future)
+                        results = client.gather(futures)
+                        print(f"Results for block count:: {len(results)}")
+                client.close()
+            # else:
+            #     with parallel_backend('multiprocessing'):
+            #         with Parallel(n_jobs=n_jobs, require=self.require_sharedmem) as parallel:
+            #             _ = parallel(
+            #                 delayed(self._transform_block)(i,
+            #                                                input_slc,
+            #                                                output_slc,
+            #                                                x1,
+            #                                                x2,
+            #                                                reducer_slc = reducer_slc
+            #                                                )
+            #                 for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+            #                                                                              self.output_slices,
+            #                                                                              self.reducer_slices
+            #                                                                              )))
         # self.clean_sync_folder()
         return self.output
 
