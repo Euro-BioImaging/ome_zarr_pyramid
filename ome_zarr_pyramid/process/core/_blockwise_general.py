@@ -843,9 +843,8 @@ class BlockwiseRunner(Aliases):
                     shutil.rmtree(self.output.synchronizer.path)
 
     @property
-    def is_slurm_cluster(self):
-        slurm_vars = ['SLURM_JOB_ID', 'SLURM_NODELIST', 'SLURM_CPUS_ON_NODE']
-        return any(var in os.environ for var in slurm_vars)
+    def is_slurm_available(self):
+        return shutil.which("sbatch") is not None
 
     def write_binary(self,
                      sequential = False,
@@ -899,7 +898,7 @@ class BlockwiseRunner(Aliases):
                                                x2,
                                                reducer_slc = reducer_slc
                                                )
-            elif self.is_slurm_cluster:
+            elif self.is_slurm_available:
                 futures = []
                 with SLURMCluster(cores = self.n_jobs,
                                   memory="500 GB"
