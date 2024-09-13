@@ -901,8 +901,9 @@ class BlockwiseRunner(Aliases):
             elif self.is_slurm_available:
                 futures = []
                 with SLURMCluster(cores = self.n_jobs,
-                                  memory="500 GB"
+                                  memory="100GB"
                                    ) as cluster:
+                    cluster.scale(jobs=self.n_jobs)
                     with Client(cluster) as client:
                         for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
                                                                                      self.output_slices,
