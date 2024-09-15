@@ -932,6 +932,7 @@ class BlockwiseRunner(Aliases):
                                        worker_dashboard_address='127.0.0.1:0',
                                        host = '127.0.0.1'
                                        ) as cluster:
+                    cluster.scale(jobs=self.n_jobs)
                     with Client(cluster) as client:
                         for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
                                                                                      self.output_slices,

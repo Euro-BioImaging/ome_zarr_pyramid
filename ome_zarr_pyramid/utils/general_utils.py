@@ -54,7 +54,7 @@ def calculate_slice_bases(
 
 def create_like(zarray,
                 store = None,
-                use_synchronizer  = False,
+                use_synchronizer = None,
                 syncdir = None,
                 **kwargs
                 ):
@@ -85,11 +85,9 @@ def create_like(zarray,
                 synchronizer = None
             elif use_synchronizer == 'multiprocessing':
                 if syncdir is None:
-                    raise TypeError()
+                    raise Exception()
                 synchronizer = zarr.ProcessSynchronizer(syncdir)
             elif use_synchronizer == 'multithreading':
-                if syncdir is None:
-                    raise TypeError()
                 synchronizer = zarr.ThreadSynchronizer()
             else:
                 synchronizer = None

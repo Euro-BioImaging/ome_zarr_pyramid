@@ -92,6 +92,22 @@ def _calculate_output_slices(input_array, input_block_size, scale_factor):
     slcs = get_slices_from_slice_bases(bases)
     return slcs
 
+# def _parse_syncdir(input, syncdir = None):
+#     if syncdir is not None and syncdir != 'same' and syncdir != 'default':
+#         pass
+#     elif syncdir == 'default':
+#         syncdir = os.path.expanduser('~') + '/.syncdir'
+#     elif syncdir == 'same':
+#         if input.synchronizer is not None:
+#             syncdir = input.synchronizer.path
+#         else:
+#             warnings.warn(f"The input array has no synchronizer. Default synchronizer path is being used.")
+#             syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', self.basename)
+#             syncdir = os.path.expanduser('~') + '/.syncdir'
+#     else:
+#         syncdir = None
+#     return syncdir
+
 def _downscale_step(input_array,
                     rootpath,
                     basename,
@@ -99,7 +115,9 @@ def _downscale_step(input_array,
                     min_input_block_size = None,
                     overwrite = False,
                     n_jobs = 8,
-                    downscale_func = transform.downscale_local_mean
+                    downscale_func = transform.downscale_local_mean,
+                    use_synchronizer = 'multiprocessing',
+                    syncdir = 'default'
                     #**kwargs
                     ):
 
@@ -117,8 +135,24 @@ def _downscale_step(input_array,
     input_slices = _calculate_input_slices(input_array, input_block_size)
     output_shape = calculate_output_shape(input_array.shape, scale_factor)
     output_slices = _calculate_output_slices(input_array, input_block_size, scale_factor)
+
+    # pyrname = os.path.basename(rootpath)
+    # if syncdir is not None and syncdir != 'same' and syncdir != 'default':
+    #     pass
+    # elif syncdir == 'default':
+    #     syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname + '.sync')
+    # elif syncdir == 'same':
+    #     if input_array.synchronizer is not None:
+    #         syncdir = input_array.synchronizer.path
+    #     else:
+    #         warnings.warn(f"The input array has no synchronizer. Default synchronizer path is being used.")
+    #         syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname + '.sync')
+    # else:
+    #     syncdir = None
+
+    # syncdir = _parse_syncdir(input_array, syncdir)
     output_array = create_like(input_array, shape = output_shape, store = output_store, overwrite = overwrite, #**kwargs
-                                )
+                                use_synchronizer = use_synchronizer, syncdir = syncdir)
     output_array = assign_array(dest = output_array,
                                 source = input_array,
                                 dest_slices = output_slices,
@@ -127,6 +161,7 @@ def _downscale_step(input_array,
                                 factors = scale_factor,
                                 n_jobs = n_jobs
                                 )
+    print(f'output: {output_array.synchronizer}')
     return output_array
 
 def downscale_multiscales(input_array: zarr.Array, # top level array
@@ -137,6 +172,8 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
                           min_input_block_size: tuple = None,
                           overwrite_layers: tuple = False,
                           n_jobs = 8,
+                          use_synchronizer: str = 'multiprocessing',
+                          syncdir: str = 'default'
                           # **kwargs
                           ) -> dict:
     """
@@ -155,6 +192,25 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
     processed = input_array
     scale_factor = np.floor(np.array(scale_factor) + 0.5).astype(int)
 
+    pyrname = os.path.basename(rootpath)
+    if syncdir is not None and syncdir != 'same' and syncdir != 'default':
+        pass
+    elif syncdir == 'default':
+        syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname)
+    elif syncdir == 'same':
+        if input_array.synchronizer is not None:
+            syncdir = input_array.synchronizer.path
+        else:
+            warnings.warn(f"The input array has no synchronizer. Default synchronizer path is being used.")
+            syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname)
+    else:
+        syncdir = None
+
+    try:
+        shutil.rmtree(syncdir)
+    except:
+        pass
+
     for i in paths:
         factor = tuple(scale_factor)
         basename = str(i)
@@ -166,6 +222,8 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
                                     overwrite = overwrite_layers,
                                     n_jobs = n_jobs,
                                     downscale_func = downscale_func,
+                                    use_synchronizer = use_synchronizer,
+                                    syncdir = syncdir
                                     # **kwargs
                                     )
         nextpath = str(i + 1)
