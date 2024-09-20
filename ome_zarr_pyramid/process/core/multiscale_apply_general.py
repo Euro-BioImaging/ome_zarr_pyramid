@@ -229,8 +229,14 @@ class ApplyToPyramid:
             assert self.scale_factor is None, f"If rescale_output is False, the parameter scale_factor must be None (default)."
 
         self.output = Pyramid()
+        if self.overwrite:
+            _ = zarr.group(self.store, overwrite = True)
 
-        syncdir = tempfile.mkdtemp()
+        # syncdir = tempfile.mkdtemp()
+
+        if not hasattr(self, 'syncdir'):
+            self.syncdir = None
+
         for i, pth in enumerate(paths):
             layer = self.input.layers[pth]
             if self.store is not None:
@@ -258,7 +264,7 @@ class ApplyToPyramid:
                                     func = self.lazyfunc,
                                     n_jobs = self.n_jobs,
                                     use_synchronizer = 'multiprocessing',
-                                    pyramidal_syncdir = syncdir,
+                                    pyramidal_syncdir = self.syncdir,
                                     *parsed_args, **self.kwargs
                                     )
 
@@ -276,24 +282,29 @@ class ApplyToPyramid:
                                              None, sequential, None)
 
             self.blockwises[pth] = blockwise
-        self.output.to_zarr(self.store, overwrite = self.overwrite, syncdir = 'default')
+        self.output.to_zarr(self.store,
+                            overwrite = False,
+                            syncdir = self.syncdir, # TODO: handle synchronizers
+                            only_meta = False
+                            )
 
         ### do rescaling if needed
 
         if self.rescale_output and self.n_scales > 1:
-            self.output.rescale( # TODO: test this method.
+            self.output.rescale( # TODO: test this method further.
                                 n_layers = self.n_scales,
                                 scale_factor = self.scale_factor,
                                 min_input_block_size = self.min_block_size,
                                 overwrite_layers = self.overwrite,
                                 n_jobs = self.n_jobs,
-                                downscale_func = self.downscale_func
+                                downscale_func = self.downscale_func,
+                                use_synchronizer='multiprocessing',
+                                syncdir=self.syncdir
                                 )
         ###
-
-        if self.output.refarray.synchronizer is not None:
-            synchpath = os.path.dirname(self.output.refarray.synchronizer.path)
-            shutil.rmtree(synchpath)
+        # if self.output.refarray.synchronizer is not None:
+        #     synchpath = os.path.dirname(self.output.refarray.synchronizer.path)
+        #     shutil.rmtree(synchpath)
         return self.output
 
 

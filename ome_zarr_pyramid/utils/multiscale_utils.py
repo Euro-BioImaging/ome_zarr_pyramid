@@ -109,7 +109,7 @@ def _calculate_output_slices(input_array, input_block_size, scale_factor):
 #     return syncdir
 
 def _downscale_step(input_array,
-                    rootpath,
+                    root: zarr.Group,
                     basename,
                     scale_factor,
                     min_input_block_size = None,
@@ -117,16 +117,11 @@ def _downscale_step(input_array,
                     n_jobs = 8,
                     downscale_func = transform.downscale_local_mean,
                     use_synchronizer = 'multiprocessing',
-                    syncdir = 'default'
+                    syncdir = None
                     #**kwargs
                     ):
 
     assert isinstance(input_array, zarr.Array)
-    if isinstance(input_array.store, zarr.DirectoryStore):
-        nextpath = str(int(basename) + 1)
-        output_store = os.path.join(rootpath, nextpath)
-    else:
-        output_store = zarr.MemoryStore()
     if min_input_block_size is None:
         input_block_size = input_array.chunks
     else:
@@ -136,23 +131,18 @@ def _downscale_step(input_array,
     output_shape = calculate_output_shape(input_array.shape, scale_factor)
     output_slices = _calculate_output_slices(input_array, input_block_size, scale_factor)
 
-    # pyrname = os.path.basename(rootpath)
-    # if syncdir is not None and syncdir != 'same' and syncdir != 'default':
-    #     pass
-    # elif syncdir == 'default':
-    #     syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname + '.sync')
-    # elif syncdir == 'same':
-    #     if input_array.synchronizer is not None:
-    #         syncdir = input_array.synchronizer.path
-    #     else:
-    #         warnings.warn(f"The input array has no synchronizer. Default synchronizer path is being used.")
-    #         syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname + '.sync')
-    # else:
-    #     syncdir = None
+    # print(f"syncdir: {syncdir}")
+    output_array = create_in_group_like(input_array,
+                                     gr = root,
+                                     shape = output_shape,
+                                     # store = output_store,
+                                     overwrite = overwrite, #**kwargs
+                                     use_synchronizer = use_synchronizer,
+                                     syncdir = syncdir,
+                                     path_in_group = basename
+                                     )
 
-    # syncdir = _parse_syncdir(input_array, syncdir)
-    output_array = create_like(input_array, shape = output_shape, store = output_store, overwrite = overwrite, #**kwargs
-                                use_synchronizer = use_synchronizer, syncdir = syncdir)
+    # print(f'output_sync: {output_array.synchronizer.path}')
     output_array = assign_array(dest = output_array,
                                 source = input_array,
                                 dest_slices = output_slices,
@@ -161,21 +151,23 @@ def _downscale_step(input_array,
                                 factors = scale_factor,
                                 n_jobs = n_jobs
                                 )
-    print(f'output: {output_array.synchronizer}')
+    # print(f'output: {output_array.synchronizer}')
     return output_array
 
-def downscale_multiscales(input_array: zarr.Array, # top level array
-                          rootpath: str, # group path of all arrays
+def downscale_multiscales(
+                          #input_array: zarr.Array, # top level array
+                          root: (str, zarr.Group), # group path of all arrays
                           n_layers: Union[Tuple, List],
                           scale_factor: Union[Tuple, List],
                           downscale_func = transform.downscale_local_mean,
                           min_input_block_size: tuple = None,
                           overwrite_layers: tuple = False,
                           n_jobs = 8,
-                          use_synchronizer: str = 'multiprocessing',
-                          syncdir: str = 'default'
+                          use_synchronizer: str = None,
+                          syncdir: str = None,
+                          refpath = None
                           # **kwargs
-                          ) -> dict:
+                          ) -> zarr.Group:
     """
     :param input_array:
     :param n_layers:
@@ -187,19 +179,18 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
     This function is used to rescale the arrays of a Pyramid object.
     """
 
-    paths = np.arange(n_layers - 1)
-    multiscales = {str(paths[0]): input_array}
-    processed = input_array
-    scale_factor = np.floor(np.array(scale_factor) + 0.5).astype(int)
-
+    # handle the synchronizer
+    if not isinstance(root, zarr.Group):
+        root = zarr.group(root)
+    rootpath = root.store.path
     pyrname = os.path.basename(rootpath)
     if syncdir is not None and syncdir != 'same' and syncdir != 'default':
         pass
     elif syncdir == 'default':
         syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname)
     elif syncdir == 'same':
-        if input_array.synchronizer is not None:
-            syncdir = input_array.synchronizer.path
+        if root.synchronizer is not None:
+            syncdir = root.synchronizer.path
         else:
             warnings.warn(f"The input array has no synchronizer. Default synchronizer path is being used.")
             syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', pyrname)
@@ -210,32 +201,52 @@ def downscale_multiscales(input_array: zarr.Array, # top level array
         shutil.rmtree(syncdir)
     except:
         pass
+    ###
+
+    paths = np.arange(n_layers - 1)
+    synchronizer = zarr.ProcessSynchronizer(syncdir)
+    multiscales = root
+
+    keys = sorted([int(i) for i in multiscales.array_keys()])
+    if refpath is None:
+        refpath = keys[0]
+
+    processed = multiscales[refpath]
+    scale_factor = np.floor(np.array(scale_factor) + 0.5).astype(int)
+
+    # Delete non-reference arrays
+    for key in keys:
+        if key != refpath:
+            multiscales.pop(key)
 
     for i in paths:
         factor = tuple(scale_factor)
-        basename = str(i)
+        basename = str(i + 1)
+        try:
+            syncpath = synchronizer[basename].path
+        except:
+            syncpath = synchronizer.path
         processed = _downscale_step(processed,
-                                    rootpath,
-                                    basename,
+                                    root = multiscales,
+                                    basename = basename,
                                     scale_factor = factor,
                                     min_input_block_size = min_input_block_size,
                                     overwrite = overwrite_layers,
+                                    # overwrite=True,
                                     n_jobs = n_jobs,
                                     downscale_func = downscale_func,
                                     use_synchronizer = use_synchronizer,
-                                    syncdir = syncdir
+                                    syncdir = syncpath
                                     # **kwargs
                                     )
-        nextpath = str(i + 1)
-        multiscales[nextpath] = processed
     return multiscales
 
-def get_scale_factors_from_rescaled(rescaled: dict, refpath = '0'):
+def get_scale_factors_from_rescaled(rescaled: zarr.Group, refpath = '0'):
     assert refpath in rescaled.keys()
     mainshape = rescaled['0'].shape
     return {pth: np.divide(mainshape, item.shape) for pth, item in rescaled.items()}
 
-def get_scales_from_rescaled(rescaled: dict,
+def get_scales_from_rescaled(rescaled: zarr.Group,
                              refscale: (tuple, list),
                              refpath = '0'
                              ):

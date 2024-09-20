@@ -1,5 +1,6 @@
 import os, zarr, json, shutil, copy, tempfile, numcodecs, warnings, itertools
 from pathlib import Path
+
 import numpy as np  # pandas as pd
 import dask
 import pandas as pd
@@ -925,7 +926,7 @@ class Pyramid(Multimeta, Operations):
         try:
             syncdir = os.path.dirname(self.syncdir)
         except:
-            syncdir = 'same'
+            syncdir = None
         pyr.to_zarr(new_dir, syncdir = syncdir, **kwargs)
         return pyr
 
@@ -1216,6 +1217,27 @@ class Pyramid(Multimeta, Operations):
     #     self.compute()
     #     self.to_dask()
 
+    def _parse_synchronizer(self, syncdir, basename):
+        if syncdir is not None and syncdir != 'same' and syncdir != 'default':
+            syncdir = os.path.join(syncdir, basename)
+            if os.path.exists(syncdir):
+                shutil.rmtree(syncdir)
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+        elif syncdir == 'default':
+            syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', basename)
+            if os.path.exists(syncdir):
+                shutil.rmtree(syncdir)
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+        elif syncdir == 'same':
+            syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', basename)
+            if os.path.exists(syncdir):
+                shutil.rmtree(syncdir)
+            synchronizer = zarr.ProcessSynchronizer(syncdir)
+            # synchronizer = self.synchronizer
+        else:
+            synchronizer = None
+        return synchronizer
+
     def save_binary(self, fpath, region_sizes, overwrite, verbose = False):
         for pth, arr in self.layers.items():
             if hasattr(arr, 'write_binary'): # means it is a blockwise instance
@@ -1235,21 +1257,6 @@ class Pyramid(Multimeta, Operations):
                 warnings.warn(f"The data type for path {pth} could not be recognized!")
         return self
 
-    def _parse_synchronizer(self, syncdir, basename):
-        if syncdir is not None and syncdir != 'same' and syncdir != 'default':
-            syncdir = os.path.join(syncdir, basename)
-            synchronizer = zarr.ProcessSynchronizer(syncdir)
-        elif syncdir == 'default':
-            syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', basename)
-            synchronizer = zarr.ProcessSynchronizer(syncdir)
-        elif syncdir == 'same':
-            syncdir = os.path.join(os.path.expanduser('~'), '.syncdir', basename)
-            synchronizer = zarr.ProcessSynchronizer(syncdir)
-            # synchronizer = self.synchronizer
-        else:
-            synchronizer = None
-        return synchronizer
-
     def to_zarr(self, # Pyramid class
                 output_path: Union[str, Path],
                 paths: Union[Iterable[int],Iterable[str]] = None,
@@ -1258,18 +1265,28 @@ class Pyramid(Multimeta, Operations):
                 region_sizes = None,
                 verbose = False,
                 only_meta = False,
-                syncdir = 'same'
+                syncdir = None
                 ):
         if cnv.path_has_pyramid(output_path):
             if overwrite:
                 _ = zarr.group(output_path, overwrite = True)
-            else:
-                raise IOError(f"The output path already contains a zarr group.")
+            # else:
+            #     if not only_meta:
+            #         raise IOError(f"The output path is not empty.")
         if paths is not None:
             paths = _parse_resolution_paths(paths)
             self.shrink(paths, hard = False)
-        synchronizer = self._parse_synchronizer(syncdir, os.path.basename(output_path))
+        if isinstance(syncdir, (Path, str)):
+            if isinstance(syncdir, Path):
+                syncdir = syncdir.as_posix()
+            basename = os.path.basename(output_path)
+            if syncdir.endswith(basename):
+                synchronizer = self._parse_synchronizer(syncdir, '')
+            else:
+                synchronizer = self._parse_synchronizer(syncdir, basename)
 
+        else:
+            synchronizer = None
         if isinstance(output_path, (str, Path)):
             store = zarr.DirectoryStore(output_path, dimension_separator = self.dimension_separator)
         else:
@@ -1278,6 +1295,9 @@ class Pyramid(Multimeta, Operations):
         self._gr = grp
         if not only_meta:
             self.save_binary(output_path, region_sizes, overwrite)
+        else:
+            # print(f"Only meta")
+            pass
         self.gr.attrs['multiscales'] = self.multimeta
         # if include_imglabels:
         #     labelgrp = grp.create_group('labels', overwrite=overwrite)
@@ -1731,8 +1751,8 @@ class Pyramid(Multimeta, Operations):
                 overwrite_layers: bool = False,
                 n_jobs = 8,
                 downscale_func = transform.downscale_local_mean,
-                use_synchronizer = 'multiprocessing',
-                syncdir = 'default'
+                use_synchronizer = None,
+                syncdir = None
                 ):
         """
         This function rescales the entire Pyramid based on the top resolution layer. Note that if there are already existing
@@ -1744,18 +1764,18 @@ class Pyramid(Multimeta, Operations):
         :param overwrite_layers:
         :return:
         """
-
+        print(f"Rescaling.")
         if scale_factor is None:
             assert '1' in self.resolution_paths
             scale_factor = self.scale_factors['1']
         refpath = str(np.arange(n_layers)[0])
-        refarray = self.layers[refpath]
         refscale = self.scales[refpath]
-        rootpath = self.pyramid_root
+        # rootpath = self.pyramid_root
+        root = self.gr
         nlayers = self.nlayers
 
-        rescaled_layers = mutils.downscale_multiscales(input_array = refarray,
-                                                       rootpath = rootpath,
+        rescaled_layers = mutils.downscale_multiscales(#input_array = refarray,
+                                                       root = root,
                                                        n_layers = n_layers,
                                                        scale_factor = scale_factor,
                                                        min_input_block_size = min_input_block_size,
@@ -1763,42 +1783,36 @@ class Pyramid(Multimeta, Operations):
                                                        n_jobs = n_jobs,
                                                        downscale_func = downscale_func,
                                                        use_synchronizer = use_synchronizer,
-                                                       syncdir = syncdir
+                                                       syncdir = syncdir,
+                                                       refpath = int(refpath)
                                                        )
+        meta = copy.deepcopy(self.array_meta[refpath])
         scales = mutils.get_scales_from_rescaled(rescaled = rescaled_layers,
                                                  refscale = refscale,
-                                                 refpath = '0'
+                                                 refpath = refpath
                                                  )
-
-        meta = self.array_meta[refpath]
-        for pth in scales.keys():
-            if pth in self.array_meta.keys():
-                meta = self.array_meta[pth]
-            arr = rescaled_layers[pth]
-            if arr.synchronizer is not None: # When rescaling, there has to be a synchronizer.
-                syncdir = arr.synchronizer.path
+        self._gr = rescaled_layers
+        for pth, arr in rescaled_layers.items():
             scale = scales[pth]
             self.add_layer(arr,
                           pth,
                           scale = scale,
-                          translation = self.get_translation(pth),
-                          zarr_meta={'dtype': meta['dtype'],
-                                     'chunks': meta['chunks'],
+                          # translation = self.get_translation(pth),
+                          zarr_meta={'dtype': arr.dtype,
+                                     'chunks': arr.chunks,
                                      'shape': arr.shape,
-                                     'compressor': meta['compressor'],
+                                     'compressor': arr.compressor,
                                      'dimension_separator': meta['dimension_separator']
                                      },
                           axis_order = self.axis_order,
                           unitlist = self.unit_list,
                           overwrite = True
                           )
+
         paths = set([self.refpath] + list(scales.keys()))
         if len(paths) < nlayers:
-            self.shrink(paths, hard = True)
+            self.shrink(paths, hard = False)
         self.gr.attrs['multiscales'] = self.multimeta
-        root = os.path.dirname(syncdir)
-        basename = os.path.basename(syncdir)
-        self.activate_synchronizer(root, basename)
         return self
 
     # def rescale_to_shapes(self, # new_shapes must contain the refpath
@@ -2512,3 +2526,6 @@ class PyramidCollection: # Change to PyramidIO
 
     def match_ref_pyramid(self):
         raise NotImplementedError(f"This method is not yet implemented.")
+
+
+

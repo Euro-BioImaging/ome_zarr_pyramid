@@ -1,12 +1,42 @@
-import copy, inspect, itertools, os, zarr, shutil
+import copy, inspect, itertools, os, zarr, shutil, logging
 from attrs import define, field, setters
 import numcodecs; numcodecs.blosc.use_threads = False
 from joblib import Parallel, delayed, parallel_backend
 from dask.distributed import Client, LocalCluster
+import dask.distributed as distributed
 from dask_jobqueue import SLURMCluster
-import numpy as np
+import numpy as np, dask
+from dask.distributed import Lock
+
+import parsl
+from parsl import python_app
+from parsl.config import Config
+from parsl.providers import LocalProvider, SlurmProvider
+from parsl.launchers import SrunLauncher
+from parsl.executors import HighThroughputExecutor
+from multiprocessing import Lock as mlock
+
 
 from ome_zarr_pyramid.utils.general_utils import *
+
+warnings.simplefilter("ignore", distributed.comm.core.CommClosedError)
+
+# dask.config.set({"distributed.comm.retry.count": 10})
+# dask.config.set({"distributed.comm.timeouts.connect": 30})
+# dask.config.set({"distributed.worker.memory.terminate": False})
+# dask.config.set({"distributed.worker.memory.terminate": False})
+# dask.config.set({"distributed.comm.retries.connect": 10})
+# dask.config.set({"distributed.comm.timeouts.connect": "30s"})
+
+dask.config.set({
+    "distributed.comm.retries.connect": 10,  # Retry connection 10 times
+    "distributed.comm.timeouts.connect": "30s",  # Set connection timeout to 30 seconds
+    "distributed.worker.memory.terminate": False,  # Prevent workers from terminating on memory errors
+    "distributed.worker.reconnect": True,  # Workers will try to reconnect if they lose connection
+    "distributed.worker.lifetime.duration": "2h",  # Optionally set a maximum worker lifetime
+    "distributed.worker.lifetime.stagger": "10m",  # Workers restart staggered over 10 minutes to prevent all restarting at once
+    'distributed.scheduler.worker-ttl': None
+})
 
 
 def is_slurm_available():
@@ -25,7 +55,12 @@ def _assign_block(dest: zarr.Array,
         dest[slc_dest] = function(source[slc_source], **func_args)
     return dest
 
-def assign_array(dest: zarr.Array, # TODO: think about adding synchronizer to this.
+def _assign_block_with_lock(dest, source, slc_dest, slc_source, function, lock, **func_args):
+    with lock:
+        dest = _assign_block(dest, source, slc_dest, slc_source, function, **func_args)
+    return dest
+
+def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible with dask.distributed?
                  source: zarr.Array,
                  crop_indices: tuple = None,
                  insert_at: (list, tuple, np.ndarray) = None,
@@ -38,12 +73,22 @@ def assign_array(dest: zarr.Array, # TODO: think about adding synchronizer to th
                  slurm_params: dict = None,
                  **func_args,
                  ):
-    if slurm_params is None:
-        slurm_params = {
-                        'cores': 8,  # per job
-                        'memory': "100GB",  # per job
-                        'nanny': True
-                        }
+    sparams = {
+        "cores": 2,  # Number of cores per job
+        "memory": "16GB",  # Memory per job
+        "nanny": True,
+        "walltime": "02:00:00",  # Maximum job runtime
+        "processes": 1,  # Number of processes (workers) per job
+        "threads_per_worker": 1,  # One thread per worker to enforce single-threading
+        # "job_extra": ["--exclusive"],  # Additional Slurm-specific options
+        # "queue": "my_partition",  # The Slurm partition to use
+        "interface": "ib0",  # Specify the network interface (if necessary)
+        # "log_directory": "logs",  # Directory to save worker logs (optional)
+    }
+    if slurm_params is not None:
+        for key, value in slurm_params:
+            sparams[key] = value
+
     if crop_indices is None:
         crop_indices = tuple([(0, item) for item in source.shape])
     if insert_at is None:
@@ -76,68 +121,78 @@ def assign_array(dest: zarr.Array, # TODO: think about adding synchronizer to th
     if hasattr(dest, 'synchronizer'):
         has_synchronizer = dest.synchronizer is not None
 
-    if not isinstance(dest.store, zarr.DirectoryStore) or not has_synchronizer:
+    if n_jobs <= 1:
         for slc_source, slc_dest in zip(source_slices, dest_slices):
             dest = _assign_block(dest = dest, source = source, slc_dest = slc_dest, slc_source = slc_source, function = func, **func_args)
-    # else:
-    #     with parallel_backend('multiprocessing'):
-    #         with Parallel(n_jobs = n_jobs,
-    #                       require = require_sharedmem
-    #                       ) as parallel:
-    #             _ = parallel(
-    #                 delayed(_assign_block)(dest = dest, source = source, slc_dest = slc_dest, slc_source = slc_source, func = func, **func_args)
-    #                 for slc_source, slc_dest in zip(source_slices, dest_slices)
-    #             )
-    #####
+
     elif is_slurm_available():
-        futures = []
-        with SLURMCluster(**slurm_params) as cluster:
+        print(f"Running with SLURM.")
+        with SLURMCluster(**sparams) as cluster:
             cluster.scale(jobs = n_jobs)
-            with Client(cluster) as client:
-                for slc_source, slc_dest in zip(source_slices, dest_slices):
-                    future = client.submit(_assign_block,
-                                           dest = dest,
-                                           source = source,
-                                           slc_dest = slc_dest,
-                                           slc_source = slc_source,
-                                           function = func,
-                                           **func_args
-                                           )
-                    futures.append(future)
-                results = client.gather(futures)
-                print(f"Results for block count: {len(results)}")
-            # client.close()
+            with Client(cluster,
+                        heartbeat_interval="10s",
+                        timeout="120s",
+                        ) as client:
+                with parallel_backend('dask'):
+                    lock = Lock('zarr-write-lock')
+                    with Parallel(n_jobs = n_jobs,
+                                  require = require_sharedmem
+                                  ) as parallel:
+                        _ = parallel(
+                            delayed(_assign_block_with_lock)(
+                                dest = dest,
+                                source = source,
+                                slc_dest = slc_dest,
+                                slc_source = slc_source,
+                                function = func,
+                                lock = lock,
+                                **func_args
+                            )
+                            for slc_source, slc_dest in zip(source_slices, dest_slices)
+                        )
+
     else:
-        futures = []
+        print(f"Running with local cluster.")
         with LocalCluster(n_workers = n_jobs,
                           processes=True,
-                          dashboard_address='127.0.0.1:8787',
-                          worker_dashboard_address='127.0.0.1:0',
-                          host='127.0.0.1'
+                          threads_per_worker=1,
+                          nanny=True,
+                          memory_limit='8GB',
+                          # dashboard_address='127.0.0.1:8787',
+                          # worker_dashboard_address='127.0.0.1:0',
+                          # host='127.0.0.1'
                           ) as cluster:
             cluster.scale(n_jobs)
-            with Client(cluster) as client:
-                for slc_source, slc_dest in zip(source_slices, dest_slices):
-                    future = client.submit(_assign_block,
-                                           dest = dest,
-                                           source = source,
-                                           slc_dest = slc_dest,
-                                           slc_source = slc_source,
-                                           function = func,
-                                           **func_args
-                                           )
-
-                    futures.append(future)
-                results = client.gather(futures)
-                print(f"Results for block count: {len(results)}")
-            # client.close()
-    #####
+            with Client(
+                    cluster,
+                    heartbeat_interval="10s",
+                    timeout="120s",
+                    ) as client:
+                with parallel_backend('dask'):
+                    lock = Lock('zarr-write-lock')
+                    with Parallel(
+                                  # n_jobs = n_jobs,
+                                  verbose = True,
+                                  require = require_sharedmem
+                                  ) as parallel:
+                        _ = parallel(
+                            delayed(_assign_block_with_lock)(
+                                dest = dest,
+                                source = source,
+                                slc_dest = slc_dest,
+                                slc_source = slc_source,
+                                function = func,
+                                lock = lock,
+                                **func_args
+                            )
+                            for slc_source, slc_dest in zip(source_slices, dest_slices)
+                        )
     return dest
 
-def basic_assign(dest: zarr.Array, # TODO: think about adding synchronizer to this.
+def basic_assign(dest: zarr.Array, # TODO: add support for dask.distributed and dask_queue
                  source: zarr.Array,
-                 dest_slice: tuple = None, # TODO: support dict
-                 source_slice: (list, tuple, np.ndarray) = None, # TODO: support dict
+                 dest_slice: tuple = None, # TODO: support dict?
+                 source_slice: (list, tuple, np.ndarray) = None, # TODO: support dict?
                  block_size = None,
                  n_jobs = 8,
                  require_sharedmem = None,
@@ -212,3 +267,50 @@ def basic_assign(dest: zarr.Array, # TODO: think about adding synchronizer to th
                     for slc_source, slc_dest in zip(source_slices, dest_slices)
                 )
     return dest
+
+
+
+#
+#
+#
+# import zarr, os
+# from pathlib import Path
+# # from ome_zarr_pyramid.core.pyramid import Pyramid
+# # # from ome_zarr_pyramid.utils import assignment_utils as asutils
+# #
+# root = Path("data")
+# # pyr = Pyramid().from_zarr(root/'filament.zarr')
+# #
+# # pyr1 = pyr.copy(root/'filament1.zarr', overwrite = True, paths = ['0'])
+# # pyr1.scales
+# # np.max(pyr1[0])
+# #
+# # pyr2 = pyr1.copy(root/'filament2.zarr', overwrite = True)
+# # pyr2[0][:] = 0
+# # np.max(pyr2[0])
+# # syncdir = f"/home/oezdemir/.syncdir/filament1.zarr.sync"
+# # zarr.group(pyr2.pyramid_root, synchronizer = zarr.ProcessSynchronizer(syncdir))
+#
+# arr0 = zarr.open_array(root/'filament1.zarr/0')
+# arr1 = zarr.open_array(root/'filament2.zarr/0')
+# arr1[:] = 0
+# arr1.synchronizer
+# np.max(arr0)
+# np.max(arr1)
+#
+# assign_array(dest = arr1,
+#              source = arr0,
+#              block_size = (10, 100, 100),
+#              )
+# np.max(arr1)
+#
+#
+
+
+
+
+
+
+
+
+

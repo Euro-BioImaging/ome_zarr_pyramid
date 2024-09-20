@@ -61,12 +61,16 @@ class _WrapperBase:
             'nanny': True
         }
 
+        self.syncdir = None
+
     def set(self, **kwargs):
         for key, value in kwargs.items():
             key_ = key.replace('input_', '')
             key_ = key_.replace('output_', '')
             if key_ == 'scale_factor':
                 self.scale_factor = kwargs.get('scale_factor')
+            elif key_ == 'syncdir':
+                self.syncdir = kwargs.get('syncdir')
             elif key_ in self.zarr_params.keys():
                 self.zarr_params[key_] = value
             else:

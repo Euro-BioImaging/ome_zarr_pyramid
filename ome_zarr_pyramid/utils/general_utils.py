@@ -1,6 +1,7 @@
 import warnings, time, shutil, zarr, itertools, multiprocessing, re, numcodecs, dask, os, copy, inspect
 import numpy as np
 import dask.array as da
+from pathlib import Path
 
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from skimage import transform
@@ -58,7 +59,6 @@ def create_like(zarray,
                 syncdir = None,
                 **kwargs
                 ):
-    synchronizer = None
     if store is None:
         store = zarr.MemoryStore()
     elif isinstance(store, str) and not store.startswith('http'):
@@ -79,18 +79,18 @@ def create_like(zarray,
                 dimension_separator = '/'
         store = zarr.DirectoryStore(store, dimension_separator = dimension_separator)
 
+    synchronizer = None
     if hasattr(store, 'path'):
         if isinstance(store.path, str):
-            if use_synchronizer is None:
-                synchronizer = None
-            elif use_synchronizer == 'multiprocessing':
-                if syncdir is None:
-                    raise Exception()
-                synchronizer = zarr.ProcessSynchronizer(syncdir)
+            synchronizer = None
+            if use_synchronizer == 'multiprocessing':
+                if syncdir is not None:
+                    # raise TypeError()
+                    synchronizer = zarr.ProcessSynchronizer(syncdir)
             elif use_synchronizer == 'multithreading':
                 synchronizer = zarr.ThreadSynchronizer()
-            else:
-                synchronizer = None
+            # else:
+            #     synchronizer = None
 
     if 'overwrite' in kwargs.keys():
         overwrite = kwargs.get("overwrite")
@@ -115,5 +115,55 @@ def create_like(zarray,
 
 
 
+def create_in_group_like(zarray,
+                         gr: zarr.Group, # if not None, set the array inside this group
+                         use_synchronizer = None,
+                         syncdir = None,
+                         path_in_group = None,
+                         **kwargs
+                         ):
 
+    assert hasattr(zarray, 'shape')
+    assert isinstance(gr, zarr.Group)
+
+    try:
+        syncdir = str(syncdir)
+    except:
+        pass
+
+    synchronizer = None
+
+    store = gr.store
+    if hasattr(store, 'path'):
+        if isinstance(store.path, (str, Path)):
+            if use_synchronizer is None:
+                synchronizer = None
+            elif use_synchronizer == 'multiprocessing':
+                if syncdir is None:
+                    raise Exception()
+                synchronizer = zarr.ProcessSynchronizer(syncdir)
+            elif use_synchronizer == 'multithreading':
+                synchronizer = zarr.ThreadSynchronizer()
+            else:
+                synchronizer = None
+
+    if 'overwrite' in kwargs.keys():
+        overwrite = kwargs.get("overwrite")
+    else:
+        overwrite = False
+
+    params = {
+        'shape': zarray.shape if 'shape' not in kwargs.keys() else kwargs['shape'],
+        'chunks': zarray.chunks if 'chunks' not in kwargs.keys() else kwargs['chunks'],
+        'dtype': zarray.dtype if 'dtype' not in kwargs.keys() else kwargs['dtype'],
+        'compressor': zarray.compressor if 'compressor' not in kwargs.keys() else kwargs['compressor'],
+        'overwrite': overwrite
+    }
+    if hasattr(zarray, 'dimension_separator'):
+        params['dimension_separator'] = gr.dimension_separator
+
+    assert path_in_group is not None, f"If create_group is True, path_in_group cannot be None."
+
+    res = gr.create(name = path_in_group, **params, synchronizer = synchronizer)
+    return res
 
