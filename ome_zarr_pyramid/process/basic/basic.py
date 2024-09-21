@@ -74,12 +74,10 @@ class _WrapperBase:
                 self.syncdir = kwargs.get('syncdir')
             elif key_ in self.zarr_params.keys():
                 self.zarr_params[key_] = value
+            elif key in self.slurm_params.keys():
+                self.slurm_params[key] = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
-        ###
-        for key, value in kwargs.items():
-            if key in self.slurm_params.keys():
-                self.slurm_params[key] = value
         return self
 
 
