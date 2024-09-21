@@ -939,30 +939,53 @@ class BlockwiseRunner(Aliases):
                                            reducer_slc = reducer_slc
                                            )
         elif self.is_slurm_available:
-            futures = []
+            # futures = []
             assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
             with SLURMCluster(**self.slurm_params) as cluster:
+                print(self.slurm_params)
                 cluster.scale(jobs=self.n_jobs)
-                with Client(cluster, heartbeat_interval="5s", timeout="30s") as client:
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s"
+                            ) as client:
                     with parallel_backend('dask'):
                         lock = Lock('zarr-write-lock')
-                        for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                                                                                     self.output_slices,
-                                                                                     self.reducer_slices
-                                                                                     )
-                                                                                 ):
-                            future = client.submit(self._transform_block_with_lock,
-                                                   i,
-                                                   input_slc,
-                                                   output_slc,
-                                                   x1,
-                                                   x2,
-                                                   reducer_slc = reducer_slc,
-                                                   lock = lock
-                                                   )
-                            futures.append(future)
-                        results = client.gather(futures)
-                        print(f"Results for block count: {len(results)}")
+                        with Parallel(
+                                      verbose = True,
+                                      require = self.require_sharedmem
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(self._transform_block_with_lock)(
+                                    i,
+                                    input_slc,
+                                    output_slc,
+                                    x1,
+                                    x2,
+                                    reducer_slc=reducer_slc,
+                                    lock=lock
+                                )
+                                for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                             self.output_slices,
+                                                                                             self.reducer_slices
+                                                                                             ))
+                            )
+                        # for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                        #                                                              self.output_slices,
+                        #                                                              self.reducer_slices
+                        #                                                              )
+                        #                                                          ):
+                        #     future = client.submit(self._transform_block_with_lock,
+                        #                            i,
+                        #                            input_slc,
+                        #                            output_slc,
+                        #                            x1,
+                        #                            x2,
+                        #                            reducer_slc = reducer_slc,
+                        #                            lock = lock
+                        #                            )
+                        #     futures.append(future)
+                        # results = client.gather(futures)
+                        # print(f"Results for block count: {len(results)}")
         else:
             with LocalCluster(n_workers = self.n_jobs,
                               processes=True,
