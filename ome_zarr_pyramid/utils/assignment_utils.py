@@ -7,16 +7,6 @@ import dask.distributed as distributed
 from dask_jobqueue import SLURMCluster
 import numpy as np, dask
 from dask.distributed import Lock
-
-import parsl
-from parsl import python_app
-from parsl.config import Config
-from parsl.providers import LocalProvider, SlurmProvider
-from parsl.launchers import SrunLauncher
-from parsl.executors import HighThroughputExecutor
-from multiprocessing import Lock as mlock
-
-
 from ome_zarr_pyramid.utils.general_utils import *
 
 warnings.simplefilter("ignore", distributed.comm.core.CommClosedError)
