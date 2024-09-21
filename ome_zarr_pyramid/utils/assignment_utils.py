@@ -123,9 +123,13 @@ def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible 
                         heartbeat_interval="10s",
                         timeout="120s",
                         ) as client:
-                with parallel_backend('dask'):
+                with parallel_backend('dask',
+                                      wait_for_workers_timeout=600
+                                      ):
                     lock = Lock('zarr-write-lock')
-                    with Parallel(n_jobs = n_jobs,
+                    with Parallel(
+                                  verbose = True,
+                                  n_jobs = n_jobs,
                                   require = require_sharedmem
                                   ) as parallel:
                         _ = parallel(
