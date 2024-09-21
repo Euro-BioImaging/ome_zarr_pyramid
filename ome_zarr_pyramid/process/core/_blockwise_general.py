@@ -948,7 +948,7 @@ class BlockwiseRunner(Aliases):
                             heartbeat_interval="10s",
                             timeout="120s"
                             ) as client:
-                    with parallel_backend('dask'):
+                    with parallel_backend('dask', wait_for_workers_timeout=30):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
                                       verbose = True,

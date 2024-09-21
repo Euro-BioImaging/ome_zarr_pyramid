@@ -57,8 +57,9 @@ class _WrapperBase:
 
         self.slurm_params = {
             'cores': 8,  # per job
-            'memory': "100GB",  # per job
-            'nanny': True
+            'memory': "8GB",  # per job
+            'nanny': True,
+            'walltime': '00:10:00'
         }
 
         self.syncdir = None
