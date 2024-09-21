@@ -948,11 +948,12 @@ class BlockwiseRunner(Aliases):
                             heartbeat_interval="10s",
                             timeout="120s"
                             ) as client:
-                    with parallel_backend('dask', wait_for_workers_timeout=30):
+                    with parallel_backend('dask', wait_for_workers_timeout=600):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
                                       verbose = True,
-                                      require = self.require_sharedmem
+                                      require = self.require_sharedmem,
+                                      n_jobs=self.n_jobs
                                       ) as parallel:
                             _ = parallel(
                                 delayed(self._transform_block_with_lock)(
