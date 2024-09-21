@@ -64,15 +64,15 @@ def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible 
                  **func_args,
                  ):
     sparams = {
-        "cores": 2,  # Number of cores per job
-        "memory": "16GB",  # Memory per job
+        "cores": 8,  # Number of cores per job
+        "memory": "8GB",  # Memory per job
         "nanny": True,
         "walltime": "02:00:00",  # Maximum job runtime
         "processes": 1,  # Number of processes (workers) per job
-        "threads_per_worker": 1,  # One thread per worker to enforce single-threading
+        # "threads_per_worker": 1,  # One thread per worker to enforce single-threading
         # "job_extra": ["--exclusive"],  # Additional Slurm-specific options
         # "queue": "my_partition",  # The Slurm partition to use
-        "interface": "ib0",  # Specify the network interface (if necessary)
+        # "interface": "ib0",  # Specify the network interface (if necessary)
         # "log_directory": "logs",  # Directory to save worker logs (optional)
     }
     if slurm_params is not None:

@@ -59,7 +59,8 @@ class _WrapperBase:
             'cores': 8,  # per job
             'memory': "8GB",  # per job
             'nanny': True,
-            'walltime': '00:10:00'
+            'walltime': "02:00:00",
+            "processes": 1,  # Number of processes (workers) per job
         }
 
         self.syncdir = None
@@ -79,8 +80,6 @@ class _WrapperBase:
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
         return self
-
-
 
 
 
