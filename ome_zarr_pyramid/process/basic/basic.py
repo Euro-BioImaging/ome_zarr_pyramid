@@ -57,9 +57,13 @@ class _WrapperBase:
 
         self.slurm_params = {
             'cores': 8,  # per job
-            'memory': "100GB",  # per job
-            'nanny': True
+            'memory': "8GB",  # per job
+            'nanny': True,
+            'walltime': "02:00:00",
+            "processes": 1,  # Number of processes (workers) per job
         }
+
+        self.syncdir = None
 
     def set(self, **kwargs):
         for key, value in kwargs.items():
@@ -67,17 +71,15 @@ class _WrapperBase:
             key_ = key_.replace('output_', '')
             if key_ == 'scale_factor':
                 self.scale_factor = kwargs.get('scale_factor')
+            elif key_ == 'syncdir':
+                self.syncdir = kwargs.get('syncdir')
             elif key_ in self.zarr_params.keys():
                 self.zarr_params[key_] = value
+            elif key in self.slurm_params.keys():
+                self.slurm_params[key] = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
-        ###
-        for key, value in kwargs.items():
-            if key in self.slurm_params.keys():
-                self.slurm_params[key] = value
         return self
-
-
 
 
 

@@ -1,18 +1,44 @@
 import warnings, time, shutil, zarr, itertools, multiprocessing, re, numcodecs, dask, os, copy, inspect
 import numpy as np
 import dask.array as da
-import dask
+import dask, logging
 from dask.distributed import Client, LocalCluster
 from dask_jobqueue import SLURMCluster
 
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from skimage import transform
 from joblib import Parallel, delayed, parallel_backend
+from dask.distributed import Lock
+import dask.distributed as distributed
+
 import numcodecs; numcodecs.blosc.use_threads = False
 
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.utils.general_utils import create_like
 
+# warnings.simplefilter("ignore", distributed.comm.core.CommClosedError)
+
+# dask.config.set({"distributed.comm.retry.count": 10})
+# dask.config.set({"distributed.comm.timeouts.connect": 30})
+# dask.config.set({"distributed.worker.memory.terminate": False})
+# dask.config.set({"distributed.worker.memory.terminate": False})
+# dask.config.set({"distributed.comm.retries.connect": 10})
+# dask.config.set({"distributed.comm.timeouts.connect": "30s"})
+
+dask.config.set({
+    "distributed.comm.retries.connect": 10,  # Retry connection 10 times
+    "distributed.comm.timeouts.connect": "30s",  # Set connection timeout to 30 seconds
+    "distributed.worker.memory.terminate": False,  # Prevent workers from terminating on memory errors
+    "distributed.worker.reconnect": True,  # Workers will try to reconnect if they lose connection
+    "distributed.worker.lifetime.duration": "2h",  # Optionally set a maximum worker lifetime
+    "distributed.worker.lifetime.stagger": "10m",  # Workers restart staggered over 10 minutes to prevent all restarting at once
+    'distributed.scheduler.worker-ttl': None
+})
+
+logging.getLogger('distributed.worker').setLevel(logging.ERROR)
+logging.getLogger('distributed.comm').setLevel(logging.CRITICAL)
+# Optional: Set global level for general Dask logs
+logging.getLogger('distributed').setLevel(logging.ERROR)
 
 def copy_zarray(zarray):
     copied = zarr.zeros_like(zarray)
@@ -359,7 +385,7 @@ class BlockwiseRunner(Aliases):
         self._handle_axes()
         self.set_workers(n_jobs)
         self.use_synchronizer = use_synchronizer
-        if store is not None and self.use_synchronizer is not None:
+        if store is not None and self.use_synchronizer is not None and pyramidal_syncdir is not None:
             self.syncdir = os.path.join(pyramidal_syncdir, os.path.basename(store) + '.sync')
         else:
             self.syncdir = None
@@ -663,7 +689,11 @@ class BlockwiseRunner(Aliases):
 
     @property
     def output_shape(self):
-        return self._output_shape
+        try:
+            ret = tuple(np.array(self._output_shape).flatten().tolist())
+        except:
+            raise TypeError(f"Output shape is in type: {type(self._output_shape)}.")
+        return ret
 
     @property
     def output_block_sizes(self):
@@ -800,8 +830,8 @@ class BlockwiseRunner(Aliases):
             block = extended_block
         else:
             block = extended_block[reducer_slc]
-        if np.greater(self.scale_factor, 1).any():
-            block = transform.downscale_local_mean(block, tuple(self.scale_factor))
+        # if np.greater(self.scale_factor, 1).any():
+        #     block = transform.downscale_local_mean(block, tuple(self.scale_factor))
 
         try:
             self.output[output_slc] = block.astype(self.dtype)
@@ -823,6 +853,13 @@ class BlockwiseRunner(Aliases):
             print(f"Error at block no {i}")
             print('###')
         return self.output
+
+    def _transform_block_with_lock(self, i, input_slc, output_slc, x1, x2 = None,
+                         reducer_slc = None, lock = None):
+        assert lock is not None
+        with lock:
+            out = self._transform_block(i, input_slc, output_slc, x1, x2, reducer_slc)
+        return out
 
     def set_workers(self, n_jobs = None):
         cpus = multiprocessing.cpu_count()
@@ -869,102 +906,126 @@ class BlockwiseRunner(Aliases):
             if self.n_jobs > 1:
                 warnings.warn(f"Currently, writing to MemoryStore is only supported in the sequential mode.\nThe 'n_jobs' value greater than 1 may not be exploited as expected.")
 
-        if only_downscale:
-            if self.block_overlap_sizes is not None:
-                if np.any(np.array(self.block_overlap_sizes) != 0):
-                    warnings.warn(f"The 'only_downscale' mode requires None for block overlap sizes.\nUpdating the 'block_overlap_sizes' property to None.")
-                    self.block_overlap_sizes = None
-                else:
-                    pass
-            if sequential:
-                _ = [self._downscale_block(i, input_slc, output_slc)
-                             for i, (input_slc, output_slc) in enumerate(zip(self.input_slices, self.output_slices))]
-            else:
-                with parallel_backend('multiprocessing'):
-                    with Parallel(n_jobs=n_jobs, require=self.require_sharedmem) as parallel:
-                                _ = parallel(
-                                    delayed(self._downscale_block)(i,
-                                                                   input_slc,
-                                                                   output_slc
-                                                                   )
-                                    for i, (input_slc, output_slc) in enumerate(zip(self.input_slices, self.output_slices)))
+        # if only_downscale:
+        #     if self.block_overlap_sizes is not None:
+        #         if np.any(np.array(self.block_overlap_sizes) != 0):
+        #             warnings.warn(f"The 'only_downscale' mode requires None for block overlap sizes.\nUpdating the 'block_overlap_sizes' property to None.")
+        #             self.block_overlap_sizes = None
+        #         else:
+        #             pass
+        #     if sequential:
+        #         _ = [self._downscale_block(i, input_slc, output_slc)
+        #                      for i, (input_slc, output_slc) in enumerate(zip(self.input_slices, self.output_slices))]
+        #     else:
+        #         with parallel_backend('multiprocessing'):
+        #             with Parallel(n_jobs=n_jobs, require=self.require_sharedmem) as parallel:
+        #                         _ = parallel(
+        #                             delayed(self._downscale_block)(i,
+        #                                                            input_slc,
+        #                                                            output_slc
+        #                                                            )
+        #                             for i, (input_slc, output_slc) in enumerate(zip(self.input_slices, self.output_slices)))
+        # else:
+        if sequential:
+            for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                         self.output_slices,
+                                                                         self.reducer_slices
+                                                                         )):
+                _ = self._transform_block(i,
+                                           input_slc,
+                                           output_slc,
+                                           x1,
+                                           x2,
+                                           reducer_slc = reducer_slc
+                                           )
+        elif self.is_slurm_available:
+            # futures = []
+            assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
+            with SLURMCluster(**self.slurm_params) as cluster:
+                print(self.slurm_params)
+                cluster.scale(jobs=self.n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s"
+                            ) as client:
+                    with parallel_backend('dask',
+                                          wait_for_workers_timeout=600
+                                          ):
+                        lock = Lock('zarr-write-lock')
+                        with Parallel(
+                                      verbose = True,
+                                      require = self.require_sharedmem,
+                                      n_jobs=self.n_jobs
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(self._transform_block_with_lock)(
+                                    i,
+                                    input_slc,
+                                    output_slc,
+                                    x1,
+                                    x2,
+                                    reducer_slc=reducer_slc,
+                                    lock=lock
+                                )
+                                for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                             self.output_slices,
+                                                                                             self.reducer_slices
+                                                                                             ))
+                            )
+                        # for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                        #                                                              self.output_slices,
+                        #                                                              self.reducer_slices
+                        #                                                              )
+                        #                                                          ):
+                        #     future = client.submit(self._transform_block_with_lock,
+                        #                            i,
+                        #                            input_slc,
+                        #                            output_slc,
+                        #                            x1,
+                        #                            x2,
+                        #                            reducer_slc = reducer_slc,
+                        #                            lock = lock
+                        #                            )
+                        #     futures.append(future)
+                        # results = client.gather(futures)
+                        # print(f"Results for block count: {len(results)}")
         else:
-            if sequential:
-                for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                                                                             self.output_slices,
-                                                                             self.reducer_slices
-                                                                             )):
-                    _ = self._transform_block(i,
-                                               input_slc,
-                                               output_slc,
-                                               x1,
-                                               x2,
-                                               reducer_slc = reducer_slc
-                                               )
-            elif self.is_slurm_available:
-                futures = []
-                assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
-                with SLURMCluster(**self.slurm_params) as cluster:
-                    cluster.scale(jobs=self.n_jobs)
-                    with Client(cluster) as client:
-                        for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                                                                                     self.output_slices,
-                                                                                     self.reducer_slices
-                                                                                     )
-                                                                                 ):
-                            future = client.submit(self._transform_block,
-                                                   i,
-                                                   input_slc,
-                                                   output_slc,
-                                                   x1,
-                                                   x2,
-                                                   reducer_slc = reducer_slc
-                                                   )
-                            futures.append(future)
-                        results = client.gather(futures)
-                        print(f"Results for block count: {len(results)}")
-                client.close()
-            else:
-                futures = []
-                with LocalCluster(n_workers = self.n_jobs,
-                                       processes=True,
-                                       dashboard_address='127.0.0.1:8787',
-                                       worker_dashboard_address='127.0.0.1:0',
-                                       host = '127.0.0.1'
-                                       ) as cluster:
-                    with Client(cluster) as client:
-                        for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                                                                                     self.output_slices,
-                                                                                     self.reducer_slices
-                                                                                     )):
-                            future = client.submit(self._transform_block,
-                                                   i,
-                                                   input_slc,
-                                                   output_slc,
-                                                   x1,
-                                                   x2,
-                                                   reducer_slc = reducer_slc
-                                                   )
-                            futures.append(future)
-                        results = client.gather(futures)
-                        print(f"Results for block count:: {len(results)}")
-                client.close()
-            # else:
-            #     with parallel_backend('multiprocessing'):
-            #         with Parallel(n_jobs=n_jobs, require=self.require_sharedmem) as parallel:
-            #             _ = parallel(
-            #                 delayed(self._transform_block)(i,
-            #                                                input_slc,
-            #                                                output_slc,
-            #                                                x1,
-            #                                                x2,
-            #                                                reducer_slc = reducer_slc
-            #                                                )
-            #                 for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-            #                                                                              self.output_slices,
-            #                                                                              self.reducer_slices
-            #                                                                              )))
-        # self.clean_sync_folder()
+            with LocalCluster(n_workers = self.n_jobs,
+                              processes=True,
+                              threads_per_worker=1,
+                              nanny = True,
+                              memory_limit='8GB'
+                              # memory_limit='auto'
+                               # dashboard_address='127.0.0.1:8787',
+                               # worker_dashboard_address='127.0.0.1:0',
+                               # host = '127.0.0.1'
+                               ) as cluster:
+                cluster.scale(self.n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s",
+                            ) as client:
+                    with parallel_backend('dask'):
+                        lock = Lock('zarr-write-lock')
+                        with Parallel(
+                                      verbose = True,
+                                      require = self.require_sharedmem
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(self._transform_block_with_lock)(
+                                    i,
+                                    input_slc,
+                                    output_slc,
+                                    x1,
+                                    x2,
+                                    reducer_slc=reducer_slc,
+                                    lock=lock
+                                )
+                                for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                             self.output_slices,
+                                                                                             self.reducer_slices
+                                                                                             ))
+                            )
         return self.output
 
     def write_with_dask(self): # TODO
