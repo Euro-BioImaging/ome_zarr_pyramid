@@ -6,6 +6,15 @@ import fire
 from joblib import Parallel, delayed, parallel_backend
 from multiprocessing import Pool
 
+import dask.array as da
+import dask, logging
+from dask.distributed import Client, LocalCluster
+from dask_jobqueue import SLURMCluster
+from joblib import Parallel, delayed, parallel_backend
+from dask.distributed import Lock
+import dask.distributed as distributed
+
+
 
 intlist = lambda s: [int(x) for x in re.findall(r'\b\d+\b', s)]
 
@@ -24,6 +33,24 @@ class Converter: # TODO: parallelize with dask
         self.use_shell = use_shell
         self.n_jobs = n_jobs
         self.require_sharedmem = require_sharedmem
+        self.slurm_params = {
+            'cores': 8,  # per job
+            'memory': "8GB",  # per job
+            'nanny': True,
+            'walltime': "02:00:00",
+            "processes": 1,  # Number of processes (workers) per job
+        }
+
+    @property
+    def is_slurm_available(self):
+        return shutil.which("sbatch") is not None
+
+    def set_slurm_params(self, slurm_params: dict):
+        for key, value in slurm_params:
+            if key in self.slurm_params.keys():
+                self.slurm_params[key] = value
+        return self
+
     def as_cmd(self,
                    ):
         self.execute = False
@@ -203,15 +230,44 @@ class Converter: # TODO: parallelize with dask
             if not self.use_shell:
                 cmd = shlex.split(self.cmd)
             cmds.append(cmd)
-        with Parallel(n_jobs=self.n_jobs, require=self.require_sharedmem) as parallel:
-            _ = parallel(
-                delayed(run_command)
-                    (
-                    cmd,
-                    use_shell = self.use_shell
+
+        if self.is_slurm_available:
+            assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
+            with SLURMCluster(**self.slurm_params) as cluster:
+                print(self.slurm_params)
+                cluster.scale(jobs=self.n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s"
+                            ) as client:
+                    with parallel_backend('dask',
+                                          wait_for_workers_timeout=600
+                                          ):
+                        lock = Lock('zarr-write-lock')
+                        with Parallel(
+                                      verbose = True,
+                                      require = self.require_sharedmem,
+                                      n_jobs=self.n_jobs
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(run_command)
+                                    (
+                                    cmd,
+                                    use_shell=self.use_shell
+                                )
+                                for i, cmd in enumerate(cmds)
+                            )
+
+        else:
+            with Parallel(n_jobs=self.n_jobs, require=self.require_sharedmem) as parallel:
+                _ = parallel(
+                    delayed(run_command)
+                        (
+                        cmd,
+                        use_shell = self.use_shell
+                    )
+                    for i, cmd in enumerate(cmds)
                 )
-                for i, cmd in enumerate(cmds)
-            )
 
     def to_omezarrs(self,
                     input_dir: str,
@@ -258,15 +314,44 @@ class Converter: # TODO: parallelize with dask
             if not self.use_shell:
                 cmd = shlex.split(self.cmd)
             cmds.append(cmd)
-        with Parallel(n_jobs=self.n_jobs, require=self.require_sharedmem) as parallel:
-            _ = parallel(
-                delayed(run_command)
-                    (
-                    cmd,
-                    use_shell = self.use_shell
+
+        if self.is_slurm_available:
+            assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
+            with SLURMCluster(**self.slurm_params) as cluster:
+                print(self.slurm_params)
+                cluster.scale(jobs=self.n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s"
+                            ) as client:
+                    with parallel_backend('dask',
+                                          wait_for_workers_timeout=600
+                                          ):
+                        lock = Lock('zarr-write-lock')
+                        with Parallel(
+                                      verbose = True,
+                                      require = self.require_sharedmem,
+                                      n_jobs=self.n_jobs
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(run_command)
+                                    (
+                                    cmd,
+                                    use_shell=self.use_shell
+                                )
+                                for i, cmd in enumerate(cmds)
+                            )
+
+        else:
+            with Parallel(n_jobs=self.n_jobs, require=self.require_sharedmem) as parallel:
+                _ = parallel(
+                    delayed(run_command)
+                        (
+                        cmd,
+                        use_shell = self.use_shell
+                    )
+                    for i, cmd in enumerate(cmds)
                 )
-                for i, cmd in enumerate(cmds)
-            )
 
 def run():
     fire.Fire(Converter)
