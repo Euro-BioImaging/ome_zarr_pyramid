@@ -135,51 +135,51 @@ class ApplyFilterToPyramid(ApplyToPyramid):
         else:
             raise Exception(f"Currently only scipy.ndimage filters are supported.")
 
-
-class ApplyFilterAndRescale(ApplyAndRescale):
-    def __init__(self,
-                 input: Pyramid,
-                 min_block_size=None,
-                 block_overlap_sizes=None,
-                 subset_indices: dict = None,
-                 ### zarr parameters
-                 store: str = None,
-                 compressor='auto',
-                 dimension_separator = None,
-                 dtype=None,
-                 overwrite=False,
-                 ###
-                 func=None,
-                 n_jobs = None,
-                 monoresolution = False,
-                 *args,
-                 **kwargs
-                ):
-        super().__init__(
-                        input = input,
-                        min_block_size = min_block_size,
-                        block_overlap_sizes = block_overlap_sizes,
-                        subset_indices = subset_indices,
-                        store = store,
-                        compressor = compressor,
-                        dimension_separator = dimension_separator,
-                        dtype = dtype,
-                        overwrite = overwrite,
-                        func = func,
-                        n_jobs = n_jobs,
-                        monoresolution = monoresolution,
-                         *args,
-                         **kwargs
-                        )
-    def set_function(self, func):
-        self.profiler = FilterProfiler(func)
-        self.lazyfunc = LazyFunction(func, profiler=FilterProfiler)
-
-    def parse_params(self, *args, **kwargs):
-        if self.profiler.is_scipy_ndimage_filter:
-            self.args, self.kwargs, overlap = _parse_params_for_scipy_ndimage(self.input, self.profiler, *args, **kwargs)
-            if self.block_overlap_sizes is None:
-                self.block_overlap_sizes = overlap
-        else:
-            raise Exception(f"Currently only scipy.ndimage filters are supported.")
+#
+# class ApplyFilterAndRescale(ApplyAndRescale):
+#     def __init__(self,
+#                  input: Pyramid,
+#                  min_block_size=None,
+#                  block_overlap_sizes=None,
+#                  subset_indices: dict = None,
+#                  ### zarr parameters
+#                  store: str = None,
+#                  compressor='auto',
+#                  dimension_separator = None,
+#                  dtype=None,
+#                  overwrite=False,
+#                  ###
+#                  func=None,
+#                  n_jobs = None,
+#                  monoresolution = False,
+#                  *args,
+#                  **kwargs
+#                 ):
+#         super().__init__(
+#                         input = input,
+#                         min_block_size = min_block_size,
+#                         block_overlap_sizes = block_overlap_sizes,
+#                         subset_indices = subset_indices,
+#                         store = store,
+#                         compressor = compressor,
+#                         dimension_separator = dimension_separator,
+#                         dtype = dtype,
+#                         overwrite = overwrite,
+#                         func = func,
+#                         n_jobs = n_jobs,
+#                         monoresolution = monoresolution,
+#                          *args,
+#                          **kwargs
+#                         )
+#     def set_function(self, func):
+#         self.profiler = FilterProfiler(func)
+#         self.lazyfunc = LazyFunction(func, profiler=FilterProfiler)
+#
+#     def parse_params(self, *args, **kwargs):
+#         if self.profiler.is_scipy_ndimage_filter:
+#             self.args, self.kwargs, overlap = _parse_params_for_scipy_ndimage(self.input, self.profiler, *args, **kwargs)
+#             if self.block_overlap_sizes is None:
+#                 self.block_overlap_sizes = overlap
+#         else:
+#             raise Exception(f"Currently only scipy.ndimage filters are supported.")
 

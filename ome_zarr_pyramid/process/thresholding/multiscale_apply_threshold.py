@@ -116,7 +116,7 @@ class ApplyThresholdToPyramid(ApplyToPyramid):
                             pth,
                             meta,
                             scales = None, # only for compatibility
-                            sequential = False,
+                            parallel_backend = 'dask',
                             downscaling_per_layer = False,
                             **kwargs
                             ):
@@ -148,8 +148,8 @@ class ApplyThresholdToPyramid(ApplyToPyramid):
             pass
 
         blockwise.write_meta()
-        _ = blockwise.write_binary(sequential=False,
-                                   only_downscale=False
+        _ = blockwise.write_binary(parallel_backend=parallel_backend,
+                                   # only_downscale=False
                                    )
         return self.output
 

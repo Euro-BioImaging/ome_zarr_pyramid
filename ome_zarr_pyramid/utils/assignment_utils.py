@@ -61,6 +61,8 @@ def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible 
                  n_jobs = 8,
                  require_sharedmem = None,
                  slurm_params: dict = None,
+                 backend = 'dask',
+                 verbose = True,
                  **func_args,
                  ):
     sparams = {
@@ -112,75 +114,97 @@ def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible 
         has_synchronizer = dest.synchronizer is not None
 
     if n_jobs <= 1:
+        backend = 'sequential'
+
+    if backend == 'sequential':
         for slc_source, slc_dest in zip(source_slices, dest_slices):
             dest = _assign_block(dest = dest, source = source, slc_dest = slc_dest, slc_source = slc_source, function = func, **func_args)
 
-    elif is_slurm_available():
-        print(f"Running with SLURM.")
-        with SLURMCluster(**sparams) as cluster:
-            cluster.scale(jobs = n_jobs)
-            with Client(cluster,
+    elif backend in ('loky', 'multiprocessing'):
+        with parallel_backend(backend):
+            with Parallel(
+                    verbose=verbose,
+                    n_jobs=n_jobs,
+                    require=require_sharedmem
+            ) as parallel:
+                _ = parallel(
+                    delayed(_assign_block)(
+                        dest=dest,
+                        source=source,
+                        slc_dest=slc_dest,
+                        slc_source=slc_source,
+                        function=func,
+                        **func_args
+                    )
+                    for slc_source, slc_dest in zip(source_slices, dest_slices)
+                )
+
+    else:
+        if is_slurm_available():
+            print(f"Running with SLURM.")
+            with SLURMCluster(**sparams) as cluster:
+                cluster.scale(jobs = n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s",
+                            ) as client:
+                    with parallel_backend('dask',
+                                          wait_for_workers_timeout=600
+                                          ):
+                        lock = Lock('zarr-write-lock')
+                        with Parallel(
+                                      verbose = verbose,
+                                      n_jobs = n_jobs,
+                                      require = require_sharedmem
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(_assign_block_with_lock)(
+                                    dest = dest,
+                                    source = source,
+                                    slc_dest = slc_dest,
+                                    slc_source = slc_source,
+                                    function = func,
+                                    lock = lock,
+                                    **func_args
+                                )
+                                for slc_source, slc_dest in zip(source_slices, dest_slices)
+                            )
+        else:
+            print(f"Running with local cluster.")
+            with LocalCluster(n_workers = n_jobs,
+                              processes=True,
+                              threads_per_worker=1,
+                              nanny=True,
+                              memory_limit='8GB',
+                              # dashboard_address='127.0.0.1:8787',
+                              # worker_dashboard_address='127.0.0.1:0',
+                              # host='127.0.0.1'
+                              ) as cluster:
+                cluster.scale(n_jobs)
+                with Client(
+                        cluster,
                         heartbeat_interval="10s",
                         timeout="120s",
                         ) as client:
-                with parallel_backend('dask',
-                                      wait_for_workers_timeout=600
-                                      ):
-                    lock = Lock('zarr-write-lock')
-                    with Parallel(
-                                  verbose = True,
-                                  n_jobs = n_jobs,
-                                  require = require_sharedmem
-                                  ) as parallel:
-                        _ = parallel(
-                            delayed(_assign_block_with_lock)(
-                                dest = dest,
-                                source = source,
-                                slc_dest = slc_dest,
-                                slc_source = slc_source,
-                                function = func,
-                                lock = lock,
-                                **func_args
+                    with parallel_backend('dask'):
+                        lock = Lock('zarr-write-lock')
+                        with Parallel(
+                                      # n_jobs = n_jobs,
+                                      verbose = verbose,
+                                      require = require_sharedmem
+                                      ) as parallel:
+                            _ = parallel(
+                                delayed(_assign_block_with_lock)(
+                                    dest = dest,
+                                    source = source,
+                                    slc_dest = slc_dest,
+                                    slc_source = slc_source,
+                                    function = func,
+                                    lock = lock,
+                                    **func_args
+                                )
+                                for slc_source, slc_dest in zip(source_slices, dest_slices)
                             )
-                            for slc_source, slc_dest in zip(source_slices, dest_slices)
-                        )
-
-    else:
-        print(f"Running with local cluster.")
-        with LocalCluster(n_workers = n_jobs,
-                          processes=True,
-                          threads_per_worker=1,
-                          nanny=True,
-                          memory_limit='8GB',
-                          # dashboard_address='127.0.0.1:8787',
-                          # worker_dashboard_address='127.0.0.1:0',
-                          # host='127.0.0.1'
-                          ) as cluster:
-            cluster.scale(n_jobs)
-            with Client(
-                    cluster,
-                    heartbeat_interval="10s",
-                    timeout="120s",
-                    ) as client:
-                with parallel_backend('dask'):
-                    lock = Lock('zarr-write-lock')
-                    with Parallel(
-                                  # n_jobs = n_jobs,
-                                  verbose = True,
-                                  require = require_sharedmem
-                                  ) as parallel:
-                        _ = parallel(
-                            delayed(_assign_block_with_lock)(
-                                dest = dest,
-                                source = source,
-                                slc_dest = slc_dest,
-                                slc_source = slc_source,
-                                function = func,
-                                lock = lock,
-                                **func_args
-                            )
-                            for slc_source, slc_dest in zip(source_slices, dest_slices)
-                        )
     return dest
 
 def basic_assign(dest: zarr.Array, # TODO: add support for dask.distributed and dask_queue

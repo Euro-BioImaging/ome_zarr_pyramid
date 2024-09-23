@@ -1752,7 +1752,9 @@ class Pyramid(Multimeta, Operations):
                 n_jobs = 8,
                 downscale_func = transform.downscale_local_mean,
                 use_synchronizer = None,
-                syncdir = None
+                syncdir = None,
+                backend = 'dask',
+                verbose = True
                 ):
         """
         This function rescales the entire Pyramid based on the top resolution layer. Note that if there are already existing
@@ -1784,7 +1786,9 @@ class Pyramid(Multimeta, Operations):
                                                        downscale_func = downscale_func,
                                                        use_synchronizer = use_synchronizer,
                                                        syncdir = syncdir,
-                                                       refpath = int(refpath)
+                                                       refpath = int(refpath),
+                                                       backend = backend,
+                                                       verbose = verbose
                                                        )
         meta = copy.deepcopy(self.array_meta[refpath])
         scales = mutils.get_scales_from_rescaled(rescaled = rescaled_layers,
