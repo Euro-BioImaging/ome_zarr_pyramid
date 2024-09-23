@@ -17,15 +17,6 @@ import numcodecs; numcodecs.blosc.use_threads = False
 from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.utils.general_utils import create_like
 
-# warnings.simplefilter("ignore", distributed.comm.core.CommClosedError)
-
-# dask.config.set({"distributed.comm.retry.count": 10})
-# dask.config.set({"distributed.comm.timeouts.connect": 30})
-# dask.config.set({"distributed.worker.memory.terminate": False})
-# dask.config.set({"distributed.worker.memory.terminate": False})
-# dask.config.set({"distributed.comm.retries.connect": 10})
-# dask.config.set({"distributed.comm.timeouts.connect": "30s"})
-
 dask.config.set({
     "distributed.comm.retries.connect": 10,  # Retry connection 10 times
     "distributed.comm.timeouts.connect": "30s",  # Set connection timeout to 30 seconds
@@ -59,7 +50,7 @@ def passive_func(array, *args, **kwargs):
 
 
 class FunctionProfiler: # Change name to UnaryProfiler?
-    """A class to explores functions.
+    """A class to explore functions.
         Ideally, the function must either be a ufunc or contain a signature.
     """
     def __init__(self, func):
@@ -747,7 +738,7 @@ class BlockwiseRunner(Aliases):
         self.func.parse_params(self.input_array, *args, **kwargs)
         self._handle_axes()
 
-    def set_slurm_params(self, slurm_params: dict): # TODO
+    def set_slurm_params(self, slurm_params: dict): # TODO: validate the slurm parameters
         self.slurm_params = slurm_params
 
     def write_meta(self):
@@ -816,6 +807,31 @@ class BlockwiseRunner(Aliases):
             self.reducer_slices.append(reducer_slc)
             self.output_slices.append(output_slc)
 
+    def set_workers(self, n_jobs = None):
+        cpus = multiprocessing.cpu_count()
+        if n_jobs is None:
+            n_jobs = cpus // 2
+        # if n_jobs > cpus:
+        #     warnings.warn(f"The given job number ({n_jobs}) exceeds the number of available cpus. The maximum cpu number ({cpus}) will be used.")
+        #     n_jobs = cpus
+        self.n_jobs = n_jobs
+        return self
+
+    def _downscale_block(self, i, input_slc, output_slc):
+        block = transform.downscale_local_mean(self.input_array[input_slc], tuple(self.scale_factor)).astype(self.dtype)
+        self.output[output_slc] = block
+        return self.output
+
+    def clean_sync_folder(self):
+        if hasattr(self.output, 'synchronizer'):
+            if self.output.synchronizer is not None:
+                if isinstance(self.output.synchronizer.path, str):
+                    shutil.rmtree(self.output.synchronizer.path)
+
+    @property
+    def is_slurm_available(self):
+        return shutil.which("sbatch") is not None
+
     def _transform_block(self, i, input_slc, output_slc, x1, x2 = None,
                          reducer_slc = None,
                          ):
@@ -862,86 +878,23 @@ class BlockwiseRunner(Aliases):
             out = self._transform_block(i, input_slc, output_slc, x1, x2, reducer_slc)
         return out
 
-    def set_workers(self, n_jobs = None):
-        cpus = multiprocessing.cpu_count()
-        if n_jobs is None:
-            n_jobs = cpus // 2
-        # if n_jobs > cpus:
-        #     warnings.warn(f"The given job number ({n_jobs}) exceeds the number of available cpus. The maximum cpu number ({cpus}) will be used.")
-        #     n_jobs = cpus
-        self.n_jobs = n_jobs
-        return self
+    def run_sequential(self, x1, x2 = None):
+        for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                     self.output_slices,
+                                                                     self.reducer_slices
+                                                                     )):
+            _ = self._transform_block(i,
+                                      input_slc,
+                                      output_slc,
+                                      x1,
+                                      x2,
+                                      reducer_slc=reducer_slc
+                                      )
 
-    def _downscale_block(self, i, input_slc, output_slc):
-        block = transform.downscale_local_mean(self.input_array[input_slc], tuple(self.scale_factor)).astype(self.dtype)
-        self.output[output_slc] = block
-        return self.output
-
-    def clean_sync_folder(self):
-        if hasattr(self.output, 'synchronizer'):
-            if self.output.synchronizer is not None:
-                if isinstance(self.output.synchronizer.path, str):
-                    shutil.rmtree(self.output.synchronizer.path)
-
-    @property
-    def is_slurm_available(self):
-        return shutil.which("sbatch") is not None
-
-    def write_binary(self,
-                     sequential = False,
-                     only_downscale = False,
-                     slicing_direction = 'forwards',
-                     ):
-        x1 = self.input_array
-        try:
-            x2 = self.func.parsed[1]
-        except:
-            x2 = None
-        self._create_slices(slicing_direction)
-        n_jobs = self.n_jobs
-
-        if isinstance(self.store, zarr.MemoryStore):
-            if not sequential:
-                # warnings.warn(f"Currently, writing to MemoryStore is only supported in the sequential mode.\nSpecifying 'sequential=False' is, therefore, ignored for MemoryStore.")
-                sequential = True
-            if self.n_jobs > 1:
-                warnings.warn(f"Currently, writing to MemoryStore is only supported in the sequential mode.\nThe 'n_jobs' value greater than 1 may not be exploited as expected.")
-
-        # if only_downscale:
-        #     if self.block_overlap_sizes is not None:
-        #         if np.any(np.array(self.block_overlap_sizes) != 0):
-        #             warnings.warn(f"The 'only_downscale' mode requires None for block overlap sizes.\nUpdating the 'block_overlap_sizes' property to None.")
-        #             self.block_overlap_sizes = None
-        #         else:
-        #             pass
-        #     if sequential:
-        #         _ = [self._downscale_block(i, input_slc, output_slc)
-        #                      for i, (input_slc, output_slc) in enumerate(zip(self.input_slices, self.output_slices))]
-        #     else:
-        #         with parallel_backend('multiprocessing'):
-        #             with Parallel(n_jobs=n_jobs, require=self.require_sharedmem) as parallel:
-        #                         _ = parallel(
-        #                             delayed(self._downscale_block)(i,
-        #                                                            input_slc,
-        #                                                            output_slc
-        #                                                            )
-        #                             for i, (input_slc, output_slc) in enumerate(zip(self.input_slices, self.output_slices)))
-        # else:
-        if sequential:
-            for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                                                                         self.output_slices,
-                                                                         self.reducer_slices
-                                                                         )):
-                _ = self._transform_block(i,
-                                           input_slc,
-                                           output_slc,
-                                           x1,
-                                           x2,
-                                           reducer_slc = reducer_slc
-                                           )
-        elif self.is_slurm_available:
-            # futures = []
-            assert hasattr(self, 'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
+    def run_on_dask(self, x1, x2 = None):
+        if self.is_slurm_available:
+            assert hasattr(self,
+                           'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
             with SLURMCluster(**self.slurm_params) as cluster:
                 print(self.slurm_params)
                 cluster.scale(jobs=self.n_jobs)
@@ -954,10 +907,10 @@ class BlockwiseRunner(Aliases):
                                           ):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
-                                      verbose = True,
-                                      require = self.require_sharedmem,
-                                      n_jobs=self.n_jobs
-                                      ) as parallel:
+                                verbose=True,
+                                require=self.require_sharedmem,
+                                n_jobs=self.n_jobs
+                        ) as parallel:
                             _ = parallel(
                                 delayed(self._transform_block_with_lock)(
                                     i,
@@ -991,16 +944,16 @@ class BlockwiseRunner(Aliases):
                         # results = client.gather(futures)
                         # print(f"Results for block count: {len(results)}")
         else:
-            with LocalCluster(n_workers = self.n_jobs,
+            with LocalCluster(n_workers=self.n_jobs,
                               processes=True,
                               threads_per_worker=1,
-                              nanny = True,
+                              nanny=True,
                               memory_limit='8GB'
                               # memory_limit='auto'
-                               # dashboard_address='127.0.0.1:8787',
-                               # worker_dashboard_address='127.0.0.1:0',
-                               # host = '127.0.0.1'
-                               ) as cluster:
+                              # dashboard_address='127.0.0.1:8787',
+                              # worker_dashboard_address='127.0.0.1:0',
+                              # host = '127.0.0.1'
+                              ) as cluster:
                 cluster.scale(self.n_jobs)
                 with Client(cluster,
                             heartbeat_interval="10s",
@@ -1009,9 +962,9 @@ class BlockwiseRunner(Aliases):
                     with parallel_backend('dask'):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
-                                      verbose = True,
-                                      require = self.require_sharedmem
-                                      ) as parallel:
+                                verbose=True,
+                                require=self.require_sharedmem
+                        ) as parallel:
                             _ = parallel(
                                 delayed(self._transform_block_with_lock)(
                                     i,
@@ -1027,6 +980,71 @@ class BlockwiseRunner(Aliases):
                                                                                              self.reducer_slices
                                                                                              ))
                             )
+
+    def run_on_loky(self, x1, x2 = None):
+        with parallel_backend('loky'):
+            with Parallel(n_jobs=self.n_jobs,
+                          verbose=True,
+                          require=self.require_sharedmem) as parallel:
+                _ = parallel(
+                    delayed(self._transform_block)(i,
+                                                   input_slc,
+                                                   output_slc,
+                                                   x1,
+                                                   x2,
+                                                   reducer_slc = reducer_slc
+                                                   )
+                    for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                 self.output_slices,
+                                                                                 self.reducer_slices
+                                                                                 )))
+
+    def run_on_multiprocessing(self, x1, x2 = None):
+        with parallel_backend('multiprocessing'):
+            with Parallel(n_jobs=self.n_jobs,
+                          verbose=True,
+                          require=self.require_sharedmem) as parallel:
+                _ = parallel(
+                    delayed(self._transform_block)(i,
+                                                   input_slc,
+                                                   output_slc,
+                                                   x1,
+                                                   x2,
+                                                   reducer_slc = reducer_slc
+                                                   )
+                    for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                 self.output_slices,
+                                                                                 self.reducer_slices
+                                                                                 )))
+
+    def write_binary(self,
+                     # sequential = False,
+                     parallel_backend = 'dask',
+                     # only_downscale = False,
+                     slicing_direction = 'forwards',
+                     ):
+        x1 = self.input_array
+        try:
+            x2 = self.func.parsed[1]
+        except:
+            x2 = None
+        self._create_slices(slicing_direction)
+
+        if isinstance(self.store, zarr.MemoryStore):
+            if parallel_backend != 'sequential':
+                # warnings.warn(f"Currently, writing to MemoryStore is only supported in the sequential mode.\nSpecifying 'sequential=False' is, therefore, ignored for MemoryStore.")
+                parallel_backend = 'sequential'
+            if self.n_jobs > 1:
+                warnings.warn(f"Currently, writing to MemoryStore is only supported in the sequential mode.\nThe 'n_jobs' value greater than 1 may not be exploited as expected.")
+
+        if parallel_backend == 'sequential':
+            self.run_sequential(x1, x2)
+        elif parallel_backend == 'dask':
+            self.run_on_dask(x1, x2)
+        elif parallel_backend == 'loky':
+            self.run_on_loky(x1, x2)
+        elif parallel_backend == 'multiprocessing':
+            self.run_on_multiprocessing(x1, x2)
         return self.output
 
     def write_with_dask(self): # TODO
@@ -1036,7 +1054,7 @@ class BlockwiseRunner(Aliases):
         self.overwrite = overwrite
         self.compressor = compressor
         self.store = url
-        try: # TODO: These two look ugly.
+        try: # TODO: These two blocks look ugly.
             self.dimension_separator = dimension_separator
         except:
             pass

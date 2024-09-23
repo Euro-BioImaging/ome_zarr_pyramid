@@ -181,7 +181,8 @@ class ApplyToPyramid:
                             pth,
                             meta,
                             scales = None,
-                            sequential = False,
+                            parallel_backend = 'dask',
+                            # sequential = False,
                             downscaling_per_layer=False,
                             **kwargs
                             ):
@@ -202,8 +203,8 @@ class ApplyToPyramid:
                       )
 
         blockwise.write_meta()
-        _ = blockwise.write_binary(sequential=sequential,
-                                   only_downscale=False
+        _ = blockwise.write_binary(parallel_backend = parallel_backend,
+                                   # only_downscale=False
                                    )
         return self.output
 
@@ -274,14 +275,30 @@ class ApplyToPyramid:
             meta['dimension_separator'] = blockwise.dimension_separator
             meta['dtype'] = blockwise.dtype
             if self.n_jobs == 1:
-                sequential = True
+                self.parallel_backend = 'sequential'
             else:
-                sequential = False
-            self.output = self._write_single_layer(
-                                             blockwise, pth, meta,
-                                             None, sequential, None)
+                if not hasattr(self, 'parallel_backend'):
+                    self.parallel_backend = 'dask'
+                elif self.parallel_backend is None:
+                    self.parallel_backend = 'dask'
 
+            if not hasattr(self, 'verbose'):
+                self.verbose = False
+            else:
+                if self.verbose is None:
+                    self.verbose = False
+                else:
+                    self.verbose = True
+
+            self.output = self._write_single_layer(
+                blockwise = blockwise,
+                pth = pth,
+                meta = meta,
+                scales = None,
+                parallel_backend = self.parallel_backend,
+            )
             self.blockwises[pth] = blockwise
+
         self.output.to_zarr(self.store,
                             overwrite = False,
                             syncdir = self.syncdir, # TODO: handle synchronizers
@@ -299,7 +316,9 @@ class ApplyToPyramid:
                                 n_jobs = self.n_jobs,
                                 downscale_func = self.downscale_func,
                                 use_synchronizer='multiprocessing',
-                                syncdir=self.syncdir
+                                syncdir=self.syncdir,
+                                backend = self.parallel_backend,
+                                verbose = self.verbose
                                 )
         ###
         # if self.output.refarray.synchronizer is not None:

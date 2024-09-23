@@ -1,5 +1,5 @@
 """Wrappers for bfconvert and bioformats2raw to be run from python environment. """
-import os.path, os, glob
+import os.path, os, glob, shutil
 import subprocess, re, shlex
 from typing import Optional, List
 import fire

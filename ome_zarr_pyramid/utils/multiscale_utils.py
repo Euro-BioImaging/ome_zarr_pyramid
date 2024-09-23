@@ -117,7 +117,9 @@ def _downscale_step(input_array,
                     n_jobs = 8,
                     downscale_func = transform.downscale_local_mean,
                     use_synchronizer = 'multiprocessing',
-                    syncdir = None
+                    syncdir = None,
+                    backend = 'dask',
+                    verbose = True
                     #**kwargs
                     ):
 
@@ -149,7 +151,9 @@ def _downscale_step(input_array,
                                 source_slices = input_slices,
                                 func = downscale_func,
                                 factors = scale_factor,
-                                n_jobs = n_jobs
+                                n_jobs = n_jobs,
+                                backend = backend,
+                                verbose = verbose
                                 )
     # print(f'output: {output_array.synchronizer}')
     return output_array
@@ -165,7 +169,9 @@ def downscale_multiscales(
                           n_jobs = 8,
                           use_synchronizer: str = None,
                           syncdir: str = None,
-                          refpath = None
+                          refpath = None,
+                          backend='dask',
+                          verbose=True
                           # **kwargs
                           ) -> zarr.Group:
     """
@@ -236,7 +242,9 @@ def downscale_multiscales(
                                     n_jobs = n_jobs,
                                     downscale_func = downscale_func,
                                     use_synchronizer = use_synchronizer,
-                                    syncdir = syncpath
+                                    syncdir = syncpath,
+                                    backend = backend,
+                                    verbose = verbose
                                     # **kwargs
                                     )
     return multiscales

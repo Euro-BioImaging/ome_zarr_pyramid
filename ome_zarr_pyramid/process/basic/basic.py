@@ -75,8 +75,14 @@ class _WrapperBase:
                 self.syncdir = kwargs.get('syncdir')
             elif key_ in self.zarr_params.keys():
                 self.zarr_params[key_] = value
-            elif key in self.slurm_params.keys():
-                self.slurm_params[key] = value
+            elif key_ in self.slurm_params.keys():
+                self.slurm_params[key_] = value
+            elif key_ == 'parallel_backend':
+                assert value in ('dask', 'multiprocessing', 'loky', 'sequential')
+                self.parallel_backend = value
+            elif key_ == 'verbose':
+                assert value in (False, True, 'False', 'True')
+                self.verbose = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
         return self
