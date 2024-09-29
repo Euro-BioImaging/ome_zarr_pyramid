@@ -2335,10 +2335,6 @@ class PyramidCollection: # Change to PyramidIO
         return [pyr.axis_order for pyr in self.pyramids]
 
     @property
-    def ndim(self):
-        return len(self.axes)
-
-    @property
     def has_uniform_axes(
             self):
         return all([self.axes[0] == item for item in self.axes])
@@ -2346,6 +2342,11 @@ class PyramidCollection: # Change to PyramidIO
     @property
     def axis_order(self):
         return self.axes[0]
+
+    @property
+    def ndim(self):
+        return len(self.axis_order)
+
 
     def get_uniform_dimensions(self): # TODO
         pass
