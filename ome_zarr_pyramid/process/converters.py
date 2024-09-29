@@ -45,8 +45,8 @@ class Converter: # TODO: parallelize with dask
     def is_slurm_available(self):
         return shutil.which("sbatch") is not None
 
-    def set_slurm_params(self, slurm_params: dict):
-        for key, value in slurm_params:
+    def set_slurm_params(self, **slurm_params):
+        for key, value in slurm_params.items():
             if key in self.slurm_params.keys():
                 self.slurm_params[key] = value
         return self
