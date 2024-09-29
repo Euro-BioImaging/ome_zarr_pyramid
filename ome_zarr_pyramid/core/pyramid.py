@@ -1768,8 +1768,13 @@ class Pyramid(Multimeta, Operations):
         """
         print(f"Rescaling.")
         if scale_factor is None:
-            assert '1' in self.resolution_paths
-            scale_factor = self.scale_factors['1']
+            if '1' in self.resolution_paths:
+                scale_factor = self.scale_factors['1']
+            else:
+                scale_factor = [1] * len(self.axis_order)
+                axyx = self.index('yx')
+                for idx in axyx:
+                    scale_factor[idx] = 2
         refpath = str(np.arange(n_layers)[0])
         refscale = self.scales[refpath]
         # rootpath = self.pyramid_root
