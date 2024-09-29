@@ -22,7 +22,7 @@ requirements = parse_requirements('requirements.txt')
 
 setuptools.setup(
     name = 'ome_zarr_pyramid',
-    version = '0.0.4',
+    version = '0.0.6',
     author = 'Bugra Özdemir',
     author_email = 'bugraa.ozdemir@gmail.com',
     description = 'A package for reading, writing and processing OME-Zarr datasets',
