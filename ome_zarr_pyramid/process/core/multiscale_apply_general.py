@@ -156,7 +156,7 @@ class ApplyToPyramid:
             self.kwargs = kwargs
 
     def _parse_default_scale_factor(self):
-        scale_factor = [1] * self.input.nlayers
+        scale_factor = [1] * self.input.ndim
         indices_yx = self.input.index('yx')
         if isinstance(indices_yx[0], (list, tuple)):
             indices_yx = indices_yx[0]
