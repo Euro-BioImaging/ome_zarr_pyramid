@@ -873,9 +873,11 @@ class BlockwiseRunner(Aliases):
 
     def _transform_block_with_lock(self, i, input_slc, output_slc, x1, x2 = None,
                          reducer_slc = None, lock = None):
-        assert lock is not None
-        with lock:
+        if lock is None:
             out = self._transform_block(i, input_slc, output_slc, x1, x2, reducer_slc)
+        else:
+            with lock:
+                out = self._transform_block(i, input_slc, output_slc, x1, x2, reducer_slc)
         return out
 
     def run_sequential(self, x1, x2 = None):
@@ -926,23 +928,6 @@ class BlockwiseRunner(Aliases):
                                                                                              self.reducer_slices
                                                                                              ))
                             )
-                        # for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
-                        #                                                              self.output_slices,
-                        #                                                              self.reducer_slices
-                        #                                                              )
-                        #                                                          ):
-                        #     future = client.submit(self._transform_block_with_lock,
-                        #                            i,
-                        #                            input_slc,
-                        #                            output_slc,
-                        #                            x1,
-                        #                            x2,
-                        #                            reducer_slc = reducer_slc,
-                        #                            lock = lock
-                        #                            )
-                        #     futures.append(future)
-                        # results = client.gather(futures)
-                        # print(f"Results for block count: {len(results)}")
         else:
             with LocalCluster(n_workers=self.n_jobs,
                               processes=True,
@@ -974,6 +959,75 @@ class BlockwiseRunner(Aliases):
                                     x2,
                                     reducer_slc=reducer_slc,
                                     lock=lock
+                                )
+                                for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                             self.output_slices,
+                                                                                             self.reducer_slices
+                                                                                             ))
+                            )
+
+    def run_on_dask_nolock(self, x1, x2 = None):
+        if self.is_slurm_available:
+            assert hasattr(self,
+                           'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
+            with SLURMCluster(**self.slurm_params) as cluster:
+                print(self.slurm_params)
+                cluster.scale(jobs=self.n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s"
+                            ) as client:
+                    with parallel_backend('dask',
+                                          wait_for_workers_timeout=600
+                                          ):
+                        with Parallel(
+                                verbose=True,
+                                require=self.require_sharedmem,
+                                n_jobs=self.n_jobs
+                        ) as parallel:
+                            _ = parallel(
+                                delayed(self._transform_block)(
+                                    i,
+                                    input_slc,
+                                    output_slc,
+                                    x1,
+                                    x2,
+                                    reducer_slc=reducer_slc,
+                                )
+                                for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
+                                                                                             self.output_slices,
+                                                                                             self.reducer_slices
+                                                                                             ))
+                            )
+        else:
+            with LocalCluster(n_workers=self.n_jobs,
+                              processes=True,
+                              threads_per_worker=1,
+                              nanny=True,
+                              memory_limit='8GB'
+                              # memory_limit='auto'
+                              # dashboard_address='127.0.0.1:8787',
+                              # worker_dashboard_address='127.0.0.1:0',
+                              # host = '127.0.0.1'
+                              ) as cluster:
+                cluster.scale(self.n_jobs)
+                with Client(cluster,
+                            heartbeat_interval="10s",
+                            timeout="120s",
+                            ) as client:
+                    with parallel_backend('dask'):
+                        with Parallel(
+                                verbose=True,
+                                require=self.require_sharedmem
+                        ) as parallel:
+                            _ = parallel(
+                                delayed(self._transform_block)(
+                                    i,
+                                    input_slc,
+                                    output_slc,
+                                    x1,
+                                    x2,
+                                    reducer_slc=reducer_slc,
                                 )
                                 for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
                                                                                              self.output_slices,
@@ -1041,6 +1095,8 @@ class BlockwiseRunner(Aliases):
             self.run_sequential(x1, x2)
         elif parallel_backend == 'dask':
             self.run_on_dask(x1, x2)
+        elif parallel_backend == 'dask_nolock':
+            self.run_on_dask_nolock(x1, x2)
         elif parallel_backend == 'loky':
             self.run_on_loky(x1, x2)
         elif parallel_backend == 'multiprocessing':
