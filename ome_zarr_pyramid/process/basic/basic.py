@@ -78,7 +78,7 @@ class _WrapperBase:
             elif key_ in self.slurm_params.keys():
                 self.slurm_params[key_] = value
             elif key_ == 'parallel_backend':
-                assert value in ('dask', 'multiprocessing', 'loky', 'sequential, dask_nolock')
+                assert value in ('dask', 'multiprocessing', 'loky', 'sequential', 'dask_nolock')
                 self.parallel_backend = value
             elif key_ == 'verbose':
                 assert value in (False, True, 'False', 'True')
