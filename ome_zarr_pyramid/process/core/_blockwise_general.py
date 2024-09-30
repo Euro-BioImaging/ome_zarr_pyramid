@@ -974,8 +974,8 @@ class BlockwiseRunner(Aliases):
                 print(self.slurm_params)
                 cluster.scale(jobs=self.n_jobs)
                 with Client(cluster,
-                            heartbeat_interval="30s",
-                            timeout="300s"
+                            heartbeat_interval="60s",
+                            timeout="600s"
                             ) as client:
                     with parallel_backend('dask',
                                           wait_for_workers_timeout=600
