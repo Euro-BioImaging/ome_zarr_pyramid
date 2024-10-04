@@ -290,6 +290,14 @@ class ApplyToPyramid:
                 else:
                     self.verbose = True
 
+            if not hasattr(self, '_threads_per_worker'):
+                self._threads_per_worker = 1
+            else:
+                if self._threads_per_worker is None:
+                    self._threads_per_worker = 1
+
+            blockwise.set_threads_per_worker(self._threads_per_worker)
+
             self.output = self._write_single_layer(
                 blockwise = blockwise,
                 pth = pth,

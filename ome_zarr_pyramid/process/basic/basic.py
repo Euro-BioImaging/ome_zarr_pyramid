@@ -1,11 +1,5 @@
 import inspect
 
-from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
-from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyAndRescale, ApplyToPyramid
-from ome_zarr_pyramid.creation.pyramid_creation import PyramidCreator
-from ome_zarr_pyramid.utils import metadata_utils as meta_utils
-# from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
-
 import zarr, warnings
 import numpy as np
 # import dask.array as da
@@ -13,6 +7,12 @@ from pathlib import Path
 from typing import ( Union, Tuple, Dict, Any, Iterable, List, Optional )
 from scipy import ndimage as ndi
 from skimage import transform
+
+from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
+from ome_zarr_pyramid.process.core.multiscale_apply_general import ApplyAndRescale, ApplyToPyramid
+from ome_zarr_pyramid.creation.pyramid_creation import PyramidCreator
+from ome_zarr_pyramid.utils import metadata_utils as meta_utils
+# from ome_zarr_pyramid.process.filtering import custom_filters as cfilt
 
 
 class _WrapperBase:
@@ -50,7 +50,7 @@ class _WrapperBase:
             'n_jobs': n_jobs,
             'rescale_output': rescale_output,
             'select_layers': select_layers,
-            'n_scales': n_scales
+            'n_scales': n_scales,
         }
 
         self.scale_factor = scale_factor
@@ -83,6 +83,8 @@ class _WrapperBase:
             elif key_ == 'verbose':
                 assert value in (False, True, 'False', 'True')
                 self.verbose = value
+            elif key_ == 'threads_per_worker':
+                self._threads_per_worker = value
             else:
                 raise TypeError(f"No such parameter as {key} exists.")
         return self

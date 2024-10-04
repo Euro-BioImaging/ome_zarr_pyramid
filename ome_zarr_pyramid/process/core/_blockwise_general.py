@@ -2,10 +2,10 @@ import warnings, time, shutil, zarr, itertools, multiprocessing, re, numcodecs, 
 import numpy as np
 
 import dask.array as da
-import dask, logging
+import dask, logging, sys
 from dask.distributed import Client, LocalCluster
 from dask_jobqueue import SLURMCluster
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed, parallel_backend, register_parallel_backend
 from dask.distributed import Lock
 import dask.distributed as distributed
 
@@ -385,6 +385,7 @@ class BlockwiseRunner(Aliases):
             self.require_sharedmem = 'sharedmem'
         else:
             self.require_sharedmem = None
+        self._threads_per_worker = 1
 
     ### zarr parameters
     @property
@@ -741,6 +742,19 @@ class BlockwiseRunner(Aliases):
     def set_slurm_params(self, slurm_params: dict): # TODO: validate the slurm parameters
         self.slurm_params = slurm_params
 
+    def set_threads_per_worker(self, value = 1):
+        self._threads_per_worker = value
+
+    def set_workers(self, n_jobs = None):
+        cpus = multiprocessing.cpu_count()
+        if n_jobs is None:
+            n_jobs = cpus // 2
+        # if n_jobs > cpus:
+        #     warnings.warn(f"The given job number ({n_jobs}) exceeds the number of available cpus. The maximum cpu number ({cpus}) will be used.")
+        #     n_jobs = cpus
+        self.n_jobs = n_jobs
+        return self
+
     def write_meta(self):
         self.output = create_like(self.input_array, shape=self.output_shape, chunks=self.output_chunks,
                                   store=self.store, compressor=self.compressor, dtype = self.dtype,
@@ -807,16 +821,6 @@ class BlockwiseRunner(Aliases):
             self.reducer_slices.append(reducer_slc)
             self.output_slices.append(output_slc)
 
-    def set_workers(self, n_jobs = None):
-        cpus = multiprocessing.cpu_count()
-        if n_jobs is None:
-            n_jobs = cpus // 2
-        # if n_jobs > cpus:
-        #     warnings.warn(f"The given job number ({n_jobs}) exceeds the number of available cpus. The maximum cpu number ({cpus}) will be used.")
-        #     n_jobs = cpus
-        self.n_jobs = n_jobs
-        return self
-
     def _downscale_block(self, i, input_slc, output_slc):
         block = transform.downscale_local_mean(self.input_array[input_slc], tuple(self.scale_factor)).astype(self.dtype)
         self.output[output_slc] = block
@@ -880,6 +884,16 @@ class BlockwiseRunner(Aliases):
                 out = self._transform_block(i, input_slc, output_slc, x1, x2, reducer_slc)
         return out
 
+    def _transform_block_insist(self, i, input_slc, output_slc, x1, x2 = None,
+                         reducer_slc = None, lock = None):
+        for _ in range(6):
+            try:
+                out = self._transform_block(i, input_slc, output_slc, x1, x2, reducer_slc)
+                break
+            except:
+                time.sleep(3)
+        return out
+
     def run_sequential(self, x1, x2 = None):
         for i, (input_slc, output_slc, reducer_slc) in enumerate(zip(self.input_slices,
                                                                      self.output_slices,
@@ -931,7 +945,7 @@ class BlockwiseRunner(Aliases):
         else:
             with LocalCluster(n_workers=self.n_jobs,
                               processes=True,
-                              threads_per_worker=1,
+                              threads_per_worker=self._threads_per_worker,
                               nanny=True,
                               memory_limit='8GB'
                               # memory_limit='auto'
@@ -1002,7 +1016,7 @@ class BlockwiseRunner(Aliases):
         else:
             with LocalCluster(n_workers=self.n_jobs,
                               processes=True,
-                              threads_per_worker=1,
+                              threads_per_worker=self._threads_per_worker,
                               nanny=True,
                               memory_limit='8GB'
                               # memory_limit='auto'
@@ -1018,7 +1032,9 @@ class BlockwiseRunner(Aliases):
                     with parallel_backend('dask'):
                         with Parallel(
                                 verbose=True,
-                                require=self.require_sharedmem
+                                require=self.require_sharedmem,
+                                n_jobs=self.n_jobs,
+                                prefer = 'threads'
                         ) as parallel:
                             _ = parallel(
                                 delayed(self._transform_block)(
@@ -1039,7 +1055,9 @@ class BlockwiseRunner(Aliases):
         with parallel_backend('loky'):
             with Parallel(n_jobs=self.n_jobs,
                           verbose=True,
-                          require=self.require_sharedmem) as parallel:
+                          require=self.require_sharedmem,
+                          prefer='threads'
+                          ) as parallel:
                 _ = parallel(
                     delayed(self._transform_block)(i,
                                                    input_slc,
