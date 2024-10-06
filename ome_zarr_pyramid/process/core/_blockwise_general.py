@@ -924,7 +924,7 @@ class BlockwiseRunner(Aliases):
                                           ):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
-                                verbose=False,
+                                verbose=True,
                                 require=self.require_sharedmem,
                                 n_jobs=self.n_jobs
                         ) as parallel:
@@ -962,7 +962,7 @@ class BlockwiseRunner(Aliases):
                     with parallel_backend('dask'):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
-                                verbose=False,
+                                verbose=True,
                                 require=self.require_sharedmem
                         ) as parallel:
                             _ = parallel(
@@ -998,7 +998,7 @@ class BlockwiseRunner(Aliases):
                                           wait_for_workers_timeout=600
                                           ):
                         with Parallel(
-                                verbose=self.verbose,
+                                verbose=True,
                                 require=self.require_sharedmem,
                                 # n_jobs=self.n_jobs
                         ) as parallel:
@@ -1036,7 +1036,7 @@ class BlockwiseRunner(Aliases):
                             ) as client:
                     with parallel_backend('dask'):
                         with Parallel(
-                                verbose=self.verbose,
+                                verbose=True,
                                 require=self.require_sharedmem,
                                 n_jobs=self.n_jobs,
                                 prefer = 'threads'
@@ -1059,7 +1059,7 @@ class BlockwiseRunner(Aliases):
     def run_on_loky(self, x1, x2 = None):
         with parallel_backend('loky'):
             with Parallel(n_jobs=self.n_jobs,
-                          verbose=False,
+                          verbose=True,
                           require=self.require_sharedmem,
                           # prefer='threads'
                           ) as parallel:
@@ -1079,7 +1079,7 @@ class BlockwiseRunner(Aliases):
     def run_on_multiprocessing(self, x1, x2 = None):
         with parallel_backend('multiprocessing'):
             with Parallel(n_jobs=self.n_jobs,
-                          verbose=False,
+                          verbose=True,
                           require=self.require_sharedmem) as parallel:
                 _ = parallel(
                     delayed(self._transform_block)(i,
