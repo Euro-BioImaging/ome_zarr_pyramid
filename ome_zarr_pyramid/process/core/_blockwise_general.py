@@ -988,8 +988,8 @@ class BlockwiseRunner(Aliases):
                            'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
             with SLURMCluster(**self.slurm_params) as cluster:
                 print(self.slurm_params)
-                # cluster.scale(jobs=self.n_jobs)
-                cluster.adapt(minimum = 4, maximum = self.n_jobs)
+                cluster.scale(jobs=self.n_jobs // 2)
+                cluster.adapt(minimum = 1, maximum = self.n_jobs)
                 with Client(cluster,
                             heartbeat_interval="60s",
                             timeout="600s"
@@ -998,7 +998,7 @@ class BlockwiseRunner(Aliases):
                                           wait_for_workers_timeout=600
                                           ):
                         with Parallel(
-                                verbose=False,
+                                verbose=self.verbose,
                                 require=self.require_sharedmem,
                                 # n_jobs=self.n_jobs
                         ) as parallel:
@@ -1036,7 +1036,7 @@ class BlockwiseRunner(Aliases):
                             ) as client:
                     with parallel_backend('dask'):
                         with Parallel(
-                                verbose=False,
+                                verbose=self.verbose,
                                 require=self.require_sharedmem,
                                 n_jobs=self.n_jobs,
                                 prefer = 'threads'
