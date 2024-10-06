@@ -125,7 +125,8 @@ def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible 
             with Parallel(
                     verbose=verbose,
                     n_jobs=n_jobs,
-                    require=require_sharedmem
+                    require=require_sharedmem,
+                    prefer='threads'
             ) as parallel:
                 _ = parallel(
                     delayed(_assign_block)(
@@ -209,8 +210,8 @@ def assign_array(dest: zarr.Array, # Is zarr.ProcessSynchronizer not compatible 
 
 def basic_assign(dest: zarr.Array, # TODO: add support for dask.distributed and dask_queue
                  source: zarr.Array,
-                 dest_slice: tuple = None, # TODO: support dict?
-                 source_slice: (list, tuple, np.ndarray) = None, # TODO: support dict?
+                 dest_slice: tuple = None, # This is destination subset slice TODO: support dict?
+                 source_slice: (list, tuple, np.ndarray) = None, # This is source subset slice TODO: support dict?
                  block_size = None,
                  n_jobs = 8,
                  require_sharedmem = None,
@@ -276,7 +277,7 @@ def basic_assign(dest: zarr.Array, # TODO: add support for dask.distributed and 
         for slc_source, slc_dest in zip(source_slices, dest_slices):
             dest = _assign_block(dest = dest, source = source, slc_dest = slc_dest, slc_source = slc_source)
     else:
-        with parallel_backend('multiprocessing'):
+        with parallel_backend('loky'): # maybe make selectable
             with Parallel(n_jobs = n_jobs,
                           require = require_sharedmem
                           ) as parallel:

@@ -6,6 +6,7 @@ from ome_zarr_pyramid.core.pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.process import process_utilities as putils
 from ome_zarr_pyramid.process.core._blockwise_general import BlockwiseRunner, LazyFunction, FunctionProfiler
 from ome_zarr_pyramid.process.aggregative import _aggregative_functions as agg
+from ome_zarr_pyramid.utils import assignment_utils as asutil
 
 class AggregativeProfiler(FunctionProfiler):
     def __init__(self, func):
@@ -96,19 +97,23 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
 
     def _transform_block(self, i, input_slc, output_slc, x1, x2 = None,
                          reducer_slc = None):
+        axis = self.func.parsed['axis'][0][0]
         block = self.input_collection[i]
-        try:
-            self.output[output_slc] = block
-        except:
-            print('#')
-            print(f"Block no {i}")
-            print(input_slc)
-            print(output_slc)
-            print(f"Input block shape: {self.input_array[input_slc].shape}")
-            print(f"Current output block shape: {block.shape}")
-            print(f"Expected output block shape: {self.output[output_slc].shape}")
-            print(f"Error at block no {i}")
-            print('###')
+        # try:
+        insert_at = [0] * self.ndim
+        insert_at[axis] = i
+        asutil.assign_array(self.output, block, insert_at = tuple(insert_at), backend = 'loky', n_jobs = 8, verbose = False)
+        # self.output[output_slc] = block
+        # except:
+        #     print('#')
+        #     print(f"Block no {i}")
+        #     print(input_slc)
+        #     print(output_slc)
+        #     print(f"Input block shape: {self.input_array[input_slc].shape}")
+        #     print(f"Current output block shape: {block.shape}")
+        #     print(f"Expected output block shape: {self.output[output_slc].shape}")
+        #     print(f"Error at block no {i}")
+        #     print('###')
         return self.output
 
 

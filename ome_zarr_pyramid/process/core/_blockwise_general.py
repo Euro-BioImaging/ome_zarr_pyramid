@@ -24,7 +24,8 @@ dask.config.set({
     "distributed.worker.reconnect": True,  # Workers will try to reconnect if they lose connection
     "distributed.worker.lifetime.duration": "2h",  # Optionally set a maximum worker lifetime
     "distributed.worker.lifetime.stagger": "10m",  # Workers restart staggered over 10 minutes to prevent all restarting at once
-    'distributed.scheduler.worker-ttl': None
+    'distributed.scheduler.worker-ttl': None,
+    'distributed.worker.daemon': False
 })
 
 logging.getLogger('distributed.worker').setLevel(logging.ERROR)
@@ -923,7 +924,7 @@ class BlockwiseRunner(Aliases):
                                           ):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
-                                verbose=True,
+                                verbose=False,
                                 require=self.require_sharedmem,
                                 n_jobs=self.n_jobs
                         ) as parallel:
@@ -961,7 +962,7 @@ class BlockwiseRunner(Aliases):
                     with parallel_backend('dask'):
                         lock = Lock('zarr-write-lock')
                         with Parallel(
-                                verbose=True,
+                                verbose=False,
                                 require=self.require_sharedmem
                         ) as parallel:
                             _ = parallel(
@@ -995,7 +996,7 @@ class BlockwiseRunner(Aliases):
                                           wait_for_workers_timeout=600
                                           ):
                         with Parallel(
-                                verbose=True,
+                                verbose=False,
                                 require=self.require_sharedmem,
                                 n_jobs=self.n_jobs
                         ) as parallel:
@@ -1031,7 +1032,7 @@ class BlockwiseRunner(Aliases):
                             ) as client:
                     with parallel_backend('dask'):
                         with Parallel(
-                                verbose=True,
+                                verbose=False,
                                 require=self.require_sharedmem,
                                 n_jobs=self.n_jobs,
                                 prefer = 'threads'
@@ -1054,9 +1055,9 @@ class BlockwiseRunner(Aliases):
     def run_on_loky(self, x1, x2 = None):
         with parallel_backend('loky'):
             with Parallel(n_jobs=self.n_jobs,
-                          verbose=True,
+                          verbose=False,
                           require=self.require_sharedmem,
-                          prefer='threads'
+                          # prefer='threads'
                           ) as parallel:
                 _ = parallel(
                     delayed(self._transform_block)(i,
@@ -1074,7 +1075,7 @@ class BlockwiseRunner(Aliases):
     def run_on_multiprocessing(self, x1, x2 = None):
         with parallel_backend('multiprocessing'):
             with Parallel(n_jobs=self.n_jobs,
-                          verbose=True,
+                          verbose=False,
                           require=self.require_sharedmem) as parallel:
                 _ = parallel(
                     delayed(self._transform_block)(i,
