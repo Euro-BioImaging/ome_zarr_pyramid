@@ -982,6 +982,7 @@ class BlockwiseRunner(Aliases):
                             )
 
     def run_on_dask_nolock(self, x1, x2 = None):
+        start_time = time.time()
         if self.is_slurm_available:
             assert hasattr(self,
                            'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
@@ -1015,6 +1016,8 @@ class BlockwiseRunner(Aliases):
                                                                                              self.reducer_slices
                                                                                              ))
                             )
+            end_time = time.time()
+            print(f"Time taken: {end_time - start_time} seconds for one set of jobs")
         else:
             with LocalCluster(n_workers=self.n_jobs,
                               processes=True,
