@@ -988,8 +988,8 @@ class BlockwiseRunner(Aliases):
                            'slurm_params'), f"SLURM parameters not configured. Please use the 'set_slurm_params' method."
             with SLURMCluster(**self.slurm_params) as cluster:
                 print(self.slurm_params)
-                cluster.scale(jobs=self.n_jobs // 2)
-                cluster.adapt(minimum = 1, maximum = self.n_jobs)
+                cluster.scale(jobs=self.n_jobs)
+                # cluster.adapt(minimum = 1, maximum = self.n_jobs)
                 with Client(cluster,
                             heartbeat_interval="60s",
                             timeout="600s"
