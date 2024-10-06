@@ -989,7 +989,7 @@ class BlockwiseRunner(Aliases):
             with SLURMCluster(**self.slurm_params) as cluster:
                 print(self.slurm_params)
                 # cluster.scale(jobs=self.n_jobs)
-                cluster.adapt(minimum = 10, maximum = self.n_jobs)
+                cluster.adapt(minimum = 4, maximum = self.n_jobs)
                 with Client(cluster,
                             heartbeat_interval="60s",
                             timeout="600s"

@@ -102,8 +102,8 @@ class BlockwiseAggregativeRunner(BlockwiseRunner):
         # try:
         insert_at = [0] * self.ndim
         insert_at[axis] = i
-        asutil.assign_array(self.output, block, insert_at = tuple(insert_at), backend = 'loky', n_jobs = 8, verbose = False)
-        # self.output[output_slc] = block
+        # asutil.assign_array(self.output, block, insert_at = tuple(insert_at), backend = 'loky', n_jobs = 8, verbose = False)
+        self.output[output_slc] = block
         # except:
         #     print('#')
         #     print(f"Block no {i}")
