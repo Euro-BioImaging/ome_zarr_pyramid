@@ -1061,7 +1061,7 @@ class BlockwiseRunner(Aliases):
             with Parallel(n_jobs=self.n_jobs,
                           verbose=True,
                           require=self.require_sharedmem,
-                          # prefer='threads'
+                          prefer='threads'
                           ) as parallel:
                 _ = parallel(
                     delayed(self._transform_block)(i,
