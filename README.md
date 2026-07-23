@@ -1,8 +1,8 @@
 # ome_zarr_pyramid
 
 Read, write and downscale **OME-Zarr (NGFF)** image pyramids through a single, lazy,
-dask-backed `Pyramid` object — memory-bound by design, so it scales from a small tile
-to a multi-terabyte volume with the same code.
+dask-backed `Pyramid` object, memory-bound by design, so it scales from a small tile
+to large-scale volumes with the same code.
 
 - **One object, all levels.** A `Pyramid` wraps every resolution level as a lazy
   `dask` array plus the full NGFF metadata (axes, scales, units, omero, translations).
@@ -12,7 +12,7 @@ to a multi-terabyte volume with the same code.
   backends, local or S3.
 - **Deferred, progressive downscaling.** `downscale()` records a plan and builds
   nothing; the writer streams the base to disk **once** and derives coarser levels
-  from the stored base — an expensive base (e.g. a segmentation) is computed a single
+  from the stored base. An expensive base (e.g. a segmentation) is computed a single
   time, not once per level.
 - **Elementwise algebra.** `Pyramid` objects support arithmetic, comparison and
   bitwise operators across every level at once (`img > 128`, `a * b`, `~mask`).
@@ -43,8 +43,8 @@ IO().write_pyramid(pyr, "copy.ome.zarr", overwrite=True)
 
 **Every operation returns a new `Pyramid`.** Selecting (`isel`, `sublevels`), the
 elementwise operators (`+ - * / > == & ~ …`), `downscale` and `rechunk` all produce a
-fresh, lazy `Pyramid` — **all resolution levels, metadata preserved** — so they compose
-and chain naturally. Nothing is materialised until you `.compute()` an array or write
+fresh, lazy `Pyramid`, with **all resolution levels and metadata preserved**, so they
+compose and chain naturally. Nothing is materialised until you `.compute()` an array or write
 the pyramid. Throughout this README, `pyr` and any variable ending in `_pyr` are
 `Pyramid` objects.
 
@@ -58,7 +58,7 @@ IO().write_pyramid(mask_pyr.downscale(n_layers=4), "mask.ome.zarr", overwrite=Tr
 ```python
 pyr = IO().read_pyramid("image.ome.zarr")
 
-pyr.axes                       # 'tczyx'  — axis order
+pyr.axes                       # 'tczyx' (axis order)
 pyr.meta.resolution_paths      # ['0', '1', '2', '3']
 pyr.meta.unit_list             # ['second', None, 'micrometer', 'micrometer', 'micrometer']
 
@@ -84,12 +84,12 @@ top3_pyr     = pyr.sublevels(0, 2)           # -> Pyramid: resolution levels 0..
 ```
 
 `isel` is xarray-style: an **int** selects one position and drops that axis, a
-**slice** keeps a strided sub-range — applied across every resolution level, with the
+**slice** keeps a strided sub-range, applied across every resolution level, with the
 coordinate metadata (scale, translation, dropped axes, omero channels) updated to match.
 
 ## Elementwise algebra (all levels, lazy)
 
-`Pyramid` behaves like an array under operators — but each operation returns **another
+`Pyramid` behaves like an array under operators, but each operation returns **another
 `Pyramid`** (every level transformed lazily, metadata preserved), so results chain:
 
 ```python
@@ -124,8 +124,8 @@ time (during its own write) instead of being recomputed for every pyramid level.
 ## Control storage chunking (independent of processing)
 
 Storage chunk shape is decoupled from whatever chunking an upstream operation imposed.
-Pass a chunk **shape** or a target chunk **size in MB** (isotropic — square in 2-D,
-cube in 3-D — dtype-aware):
+Pass a chunk **shape** or a target chunk **size in MB** (isotropic: square in 2-D,
+cube in 3-D, dtype-aware):
 
 ```python
 # target MB per chunk (scalar, or per-level sequence / dict)
@@ -175,4 +175,4 @@ IO().write_pyramid(pyr, "https://s3.example.com/bucket/out.ome.zarr")  # needs [
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
