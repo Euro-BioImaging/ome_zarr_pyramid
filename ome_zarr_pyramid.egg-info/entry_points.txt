@@ -1,0 +1,8 @@
+[console_scripts]
+aggregative = ome_zarr_pyramid.bin.runners:aggregative
+converter = ome_zarr_pyramid.bin.runners:converters
+filters = ome_zarr_pyramid.bin.runners:filters
+label = ome_zarr_pyramid.bin.runners:label
+metautils = ome_zarr_pyramid.bin.runners:metautils
+operations = ome_zarr_pyramid.bin.runners:operations
+threshold = ome_zarr_pyramid.bin.runners:threshold

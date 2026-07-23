@@ -1,0 +1,6 @@
+zarr
+dask
+tensorstore
+
+[s3]
+s3fs

@@ -1,0 +1,53 @@
+name: Publish to PyPI
+
+# Fires when you publish a GitHub Release (the "button" in the Releases UI).
+# Builds the sdist + wheel and uploads them to PyPI via Trusted Publishing (OIDC) -
+# no API token/secret required (configure the trusted publisher on PyPI once, see below).
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Check metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The GitHub environment must match the one set on the PyPI trusted publisher.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ome_zarr_pyramid/
+    permissions:
+      id-token: write        # OIDC token for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

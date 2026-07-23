@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: ome_zarr_pyramid
+Version: 0.0.5
+Summary: A package for reading, writing and processing OME-Zarr datasets
+Author-email: Bugra Özdemir <bugraa.ozdemir@gmail.com>
+Project-URL: Homepage, https://github.com/Euro-BioImaging/ome_zarr_pyramid
+Keywords: ome,zarr,pyramid
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/plain
+License-File: LICENSE
+Requires-Dist: zarr
+Requires-Dist: dask
+Requires-Dist: tensorstore
+Provides-Extra: s3
+Requires-Dist: s3fs; extra == "s3"
+Dynamic: license-file
+
+A command line tool to perform basic operations such as reading, writing and filtering OME-Zarr data.

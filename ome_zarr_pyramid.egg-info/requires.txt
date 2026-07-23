@@ -1,7 +1,5 @@
 s3fs
 zarr
-pandas
 dask
 distributed
 tensorstore
-natsort
