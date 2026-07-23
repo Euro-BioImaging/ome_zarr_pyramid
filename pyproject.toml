@@ -9,11 +9,20 @@ description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, m
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [ { name = "Bugra Özdemir", email = "bugraa.ozdemir@gmail.com" } ]
-keywords = ["ome", "zarr", "pyramid"]
+keywords = [
+    "ome-zarr", "ome", "ngff", "zarr", "pyramid", "multiscale", "image-pyramid",
+    "bioimage", "bioimaging", "microscopy", "image-processing",
+    "dask", "tensorstore", "out-of-core", "lazy",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Visualization",
 ]
 dependencies = [
     "zarr",

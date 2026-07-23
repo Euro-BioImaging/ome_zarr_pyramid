@@ -1,5 +1,0 @@
-s3fs
-zarr
-dask
-distributed
-tensorstore
