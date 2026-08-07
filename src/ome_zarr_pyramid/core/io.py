@@ -64,6 +64,76 @@ def _register_label_name(labels_group: zarr.Group, name: str, version: str) -> N
         labels_group.attrs["labels"] = names
 
 
+def _read_label_names(labels_group: zarr.Group) -> list:
+    """The registered label names in a ``labels/`` group (0.5 nests them under the
+    ``ome`` attr, 0.4 uses a top-level ``labels`` list)."""
+    if "ome" in labels_group.attrs:
+        return list(dict(labels_group.attrs["ome"]).get("labels", []))
+    return list(labels_group.attrs.get("labels", []))
+
+
+def _is_remote_store(path) -> bool:
+    """True for an object-store URL (https:// / s3://) that must NOT be treated as a
+    local filesystem `Path` (which would mangle the URL)."""
+    s = str(path)
+    return s.startswith("https://") or s.startswith("s3://")
+
+
+def _is_dyna_pyramid(pyramid) -> bool:
+    """True if the pyramid's in-memory layers are dyna_zarr DynamicArrays (the memory-bounded
+    pull backend), so writing should stream via dyna_zarr.io.write. False for zarr/dask/numpy
+    layers, or when dyna_zarr isn't installed."""
+    try:
+        from dyna_zarr import DynamicArray
+    except ImportError:
+        return False
+    if pyramid.meta is None:
+        return False
+    try:
+        first = pyramid.layers[pyramid.meta.resolution_paths[0]]
+    except Exception:
+        return False
+    return isinstance(first, DynamicArray)
+
+
+def _resolve_dyna_chunks(chunk_shape, level_path, arr):
+    """Storage chunks for a dyna level write: an explicit ``chunk_shape`` (tuple, or a
+    ``{level: tuple}`` dict), else the array's own chunks (preserving the read chunking)."""
+    if chunk_shape is None:
+        return arr.chunks
+    if isinstance(chunk_shape, dict):
+        return chunk_shape.get(int(level_path), chunk_shape.get(str(level_path), arr.chunks))
+    return tuple(chunk_shape)
+
+
+def _store_join(path, *parts):
+    """Join sub-paths onto a store: URL-safe (forward slashes) for remote stores, a
+    `pathlib.Path` for local ones."""
+    if _is_remote_store(path):
+        return str(path).rstrip("/") + "/" + "/".join(str(p).strip("/") for p in parts)
+    p = Path(path)
+    for part in parts:
+        p = p / str(part)
+    return p
+
+
+def _open_store_group(path, zarr_format: int, mode: str = "a") -> zarr.Group:
+    """Open/create a zarr group for attr read/write, S3-aware: an https:// path is
+    resolved to an s3fs mapping; a local path is used directly."""
+    if _is_remote_store(path):
+        store = tensorstore_writer.wrap_output_path(str(path))
+    else:
+        store = str(path)
+    return zarr.open_group(store, mode=mode, zarr_format=zarr_format)
+
+
+def _iter_region_slices(shape, region_shape):
+    """Yield the tuple-of-slices tiling `shape` into `region_shape` blocks."""
+    ranges = [range(0, int(s), int(r)) for s, r in zip(shape, region_shape)]
+    for start in itertools.product(*ranges):
+        yield tuple(slice(st, min(st + int(r), int(s))) for st, r, s in zip(start, region_shape, shape))
+
+
 def _compute_region_shape_for_layer(
     layer_shape: Tuple[int, ...],
     layer_chunks: Tuple[int, ...],
@@ -250,27 +320,32 @@ class PyramidIO:
         self.enable_gc = enable_gc
 
     def read_pyramid(self,
-                     path: Union[str, Path]) -> Pyramid:
+                     path: Union[str, Path],
+                     include_labels: bool = True) -> Pyramid:
         """Read a pyramid from an NGFF-compliant zarr store.
-        
+
         Parameters
         ----------
         path : str or Path
             Path to the zarr store containing the NGFF pyramid
-            
+        include_labels : bool
+            Also discover the image's NGFF ``labels/`` collection and populate the
+            returned pyramid's `Pyramid.labels` (lazy - only metadata + lazy arrays
+            are loaded). Default True; set False to skip the scan.
+
         Returns
         -------
         Pyramid
             Loaded pyramid with metadata and arrays
         """
         path = Path(path) if isinstance(path, str) else path
-        
+
         if not path.exists():
             raise FileNotFoundError(f"Path does not exist: {path}")
-        
+
         if self.verbose:
             logger.info(f"[PyramidIO] Reading pyramid from: {path}")
-        
+
         try:
             pyramid = Pyramid()
             pyramid.from_ngff(str(path))
@@ -283,17 +358,53 @@ class PyramidIO:
             except Exception:
                 pass
 
+            if include_labels:
+                self._discover_labels(pyramid, path)
+
             if self.verbose:
                 logger.info(f"[PyramidIO] Loaded {pyramid.nlayers} layers, axes: {pyramid.axes}")
 
             return pyramid
-            
+
         except Exception as e:
             logger.error(f"[PyramidIO] Failed to read pyramid: {str(e)}")
             raise
-        
+
         finally:
             gc.collect()
+
+    def read_labels(self,
+                    path: Union[str, Path],
+                    name: Optional[str] = None) -> Pyramid:
+        """Read a single OME-Zarr label image as a `Pyramid`, with its
+        ``image-label`` metadata parsed (surfaced via `pyr.meta.image_label`).
+
+        `path` may point directly at a label-image group, or at a source image with
+        `name` given - then ``<path>/labels/<name>`` is read. The label is a normal
+        multiscale pyramid, so every `Pyramid` operation works on it.
+        """
+        path = Path(path) if isinstance(path, str) else path
+        if name is not None:
+            path = path / "labels" / name
+        # a label image has no nested labels/; skip discovery
+        return self.read_pyramid(path, include_labels=False)
+
+    def _discover_labels(self, pyramid: Pyramid, path: Path) -> None:
+        """Populate ``pyramid._labels`` from the image's NGFF ``labels/`` group, if
+        present. Best-effort and lazy: failures leave the collection empty."""
+        labels_dir = Path(path) / "labels"
+        if not labels_dir.exists():
+            return
+        try:
+            grp = zarr.open_group(str(labels_dir), mode="r")
+            names = _read_label_names(grp)
+        except Exception:
+            return
+        for nm in names:
+            try:
+                pyramid._labels[nm] = self.read_labels(labels_dir / nm)
+            except Exception:
+                continue
 
     def write_pyramid(self,
                       pyramid: Pyramid,
@@ -312,8 +423,19 @@ class PyramidIO:
                       queue_size: Optional[int] = None,
                       max_concurrent_layers: int = 3,
                       chunk_shape=None,
-                      chunk_size_mb=None) -> None:
+                      chunk_size_mb=None,
+                      include_labels: bool = True,
+                      labels_group_path: Optional[Union[str, Path]] = None,
+                      label_name: Optional[str] = None,
+                      storage_options: Optional[dict] = None) -> None:
         """Write a pyramid using region-wise processing.
+
+        Handles BOTH image and label pyramids: a label image is detected via
+        ``pyramid.meta.is_label`` (it carries an ``image-label`` block) and its
+        metadata is attached automatically; pass ``labels_group_path`` + ``label_name``
+        to also register it under a parent ``labels/`` group (the NGFF convention).
+        An IMAGE pyramid's attached `labels` (from ``add_image_label``) are written
+        recursively into ``<path>/labels/<name>``.
 
         Storage chunking (decoupled from any PROCESSING tile size an op imposed):
         pass ``chunk_shape`` (per-axis tuple, or a ``{level: tuple}`` dict) or
@@ -374,7 +496,42 @@ class PyramidIO:
         if pyramid.meta is None:
             raise ValueError("Pyramid not initialized")
 
-        path = Path(path) if isinstance(path, str) else path
+        # REMOTE object store (https:// / s3://): keep the URL as a STRING (Path would
+        # mangle 'https://' -> 'https:\\') and use the SAME sync writer as local - its
+        # arrays are created on the group and its region writes go through zarr, so an
+        # s3fs/fsspec-backed group works identically. (The TensorStore backend uses a
+        # LOCAL 'file' kvstore and cannot write to S3; multiprocessing can't share the
+        # remote store.) One writer, one source of truth.
+        remote = _is_remote_store(path)
+        if remote:
+            if storage_options is not None:   # e.g. {'anon': True} for a public bucket
+                tensorstore_writer.set_s3_storage_options(**storage_options)
+            if getattr(pyramid, '_downscale_plan', None) is not None and layers is None:
+                raise NotImplementedError(
+                    "writing a DEFERRED downscale() pyramid to a remote store is not "
+                    "supported (it re-reads the base from the store; S3 read is not "
+                    "implemented). Use downscale(defer=False), or write a single level."
+                )
+            backend = 'sync'
+            use_multiprocessing = False
+        else:
+            path = Path(path) if isinstance(path, str) else path
+
+        # capture any attached labels NOW (top-level image write only): the storage
+        # rechunk below rebinds `pyramid` to a clone that does not carry `_labels`.
+        # They are written into `<path>/labels/<name>` after the image (see
+        # `_write_attached_labels`). `layers is not None` = an internal sub-write.
+        write_lbls = layers is None and include_labels and bool(getattr(pyramid, '_labels', None))
+        attached_labels = dict(getattr(pyramid, '_labels', {})) if write_lbls else {}
+
+        # LABEL image? detect via meta.is_label and capture its image-label block now
+        # (so it survives the rechunk rebind below); attached after the arrays. Register
+        # under a parent labels/ group FIRST, so the nested group is created inside it.
+        label_block = pyramid.meta.image_label if layers is None else None
+        label_version, label_zarr_format = pyramid.meta.version, pyramid.meta.zarr_format
+        if layers is None and labels_group_path is not None and label_name is not None:
+            lg = _open_store_group(labels_group_path, label_zarr_format, mode="a")
+            _register_label_name(lg, label_name, label_version)
 
         # A DEFERRED-downscale pyramid (from `Pyramid.downscale(defer=True)`) carries
         # only level 0 plus a plan; expand it PROGRESSIVELY FROM DISK so an expensive
@@ -382,7 +539,7 @@ class PyramidIO:
         # specific `layers` subset is requested - that path is used internally here.)
         plan = getattr(pyramid, '_downscale_plan', None)
         if plan is not None and layers is None:
-            return self._write_with_plan(
+            self._write_with_plan(
                 pyramid, path, plan, overwrite=overwrite,
                 chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb,
                 max_workers=max_workers, region_size_mb=region_size_mb,
@@ -392,6 +549,31 @@ class PyramidIO:
                 num_readers=num_readers, queue_size=queue_size,
                 max_concurrent_layers=max_concurrent_layers,
             )
+            self._write_side_metadata(
+                path, label_block=label_block, label_version=label_version,
+                label_zarr_format=label_zarr_format, attached_labels=attached_labels,
+                overwrite=overwrite, backend=backend, compressor=compressor,
+                compressor_params=compressor_params)
+            return
+
+        # dyna_zarr backend: the pyramid's layers are DynamicArrays (a memory-bounded,
+        # pull-based op chain). Write each level via dyna_zarr.io.write, which streams the
+        # whole read -> op-chain -> write pipeline region by region. Reuses the same group +
+        # NGFF-metadata machinery as the sync path (connect_to_group / save_changes).
+        if layers is None and _is_dyna_pyramid(pyramid):
+            if remote:
+                raise NotImplementedError(
+                    "writing a dyna_zarr-backed pyramid to a remote store is not supported "
+                    "yet; write locally (the dyna backend's remote write is still local-only)")
+            self._write_pyramid_dyna(
+                pyramid, path, overwrite=overwrite, chunk_shape=chunk_shape,
+                region_size_mb=region_size_mb, max_workers=max_workers)
+            self._write_side_metadata(
+                path, label_block=label_block, label_version=label_version,
+                label_zarr_format=label_zarr_format, attached_labels=attached_labels,
+                overwrite=overwrite, backend=backend, compressor=compressor,
+                compressor_params=compressor_params)
+            return
 
         # apply the storage chunking before writing (explicit spec, else restore the
         # recorded on-disk chunks). Skipped for internal layer-subset writes, which
@@ -417,6 +599,11 @@ class PyramidIO:
                 gc_interval=gc_interval,
                 max_concurrent_layers=max_concurrent_layers,
             )
+            self._write_side_metadata(
+                path, label_block=label_block, label_version=label_version,
+                label_zarr_format=label_zarr_format, attached_labels=attached_labels,
+                overwrite=overwrite, backend=backend, compressor=compressor,
+                compressor_params=compressor_params)
             return
 
         if self.verbose:
@@ -430,9 +617,12 @@ class PyramidIO:
             else:
                 layers_to_write = [str(layer) for layer in layers]
             
-            # Create output zarr group, honoring the pyramid's zarr format (v2/v3)
+            # Create output zarr group, honoring the pyramid's zarr format (v2/v3).
+            # Remote paths resolve to an s3fs/fsspec mapping so the group (and every
+            # array + region write on it) targets the object store.
+            group_store = tensorstore_writer.wrap_output_path(str(path)) if remote else str(path)
             zarr_group = tensorstore_writer._zarr_group(
-                str(path), overwrite=overwrite, zarr_format=pyramid.meta.zarr_format
+                group_store, overwrite=overwrite, zarr_format=pyramid.meta.zarr_format
             )
 
             if use_multiprocessing:
@@ -474,6 +664,75 @@ class PyramidIO:
 
         finally:
             gc.collect()
+
+        # attach the label image-label block + write any attached labels (normal exit)
+        self._write_side_metadata(
+            path, label_block=label_block, label_version=label_version,
+            label_zarr_format=label_zarr_format, attached_labels=attached_labels,
+            overwrite=overwrite, backend=backend, compressor=compressor,
+            compressor_params=compressor_params)
+
+    def _write_pyramid_dyna(self, pyramid, path, *, overwrite, chunk_shape,
+                            region_size_mb, max_workers):
+        """Write a dyna_zarr-backed pyramid: each level is streamed to disk via
+        dyna_zarr.io.write (memory-bounded), then the shared NGFF group metadata is written.
+        Local stores only for now."""
+        from dyna_zarr import io as dyna_io
+        path = Path(path) if isinstance(path, str) else path
+        zf = pyramid.meta.zarr_format
+        zarr_group = tensorstore_writer._zarr_group(str(path), overwrite=overwrite, zarr_format=zf)
+        das = pyramid.dynamic_arrays
+        for p in pyramid.meta.resolution_paths:
+            arr = das[str(p)]
+            chunks = _resolve_dyna_chunks(chunk_shape, p, arr)
+            dyna_io.write(arr, str(path / str(p)),
+                          chunks=tuple(chunks) if chunks is not None else None,
+                          zarr_format=int(zf), region_size_mb=region_size_mb,
+                          max_workers=max_workers)
+        # write the multiscales / omero metadata onto the group (same as the sync path)
+        pyramid.meta.connect_to_group(zarr_group)
+        pyramid.meta._pending_changes = True
+        pyramid.meta.save_changes()
+
+    def _write_side_metadata(self, path, *, label_block, label_version, label_zarr_format,
+                             attached_labels: dict, overwrite: bool, backend: str = 'sync',
+                             compressor=None, compressor_params=None) -> None:
+        """Post-array-write side metadata, shared by every write_pyramid exit:
+        (1) if this is a LABEL image, attach its ``image-label`` block to the written
+        group (belt-and-suspenders across backends; `save_changes` already writes it on
+        the sync path); (2) write any attached image `labels` into ``<path>/labels/<name>``."""
+        if label_block is not None:
+            group = _open_store_group(path, label_zarr_format, mode="a")
+            _attach_image_label(group, label_block, label_version)
+        if attached_labels:
+            self._write_attached_labels(attached_labels, path, overwrite=overwrite,
+                                        backend=backend, compressor=compressor,
+                                        compressor_params=compressor_params)
+
+    def _write_attached_labels(self, labels: dict, path, *, overwrite: bool,
+                               backend: str = 'sync', compressor=None,
+                               compressor_params=None) -> None:
+        """Write each entry of a pyramid's `labels` collection as an OME-Zarr label
+        image under ``<path>/labels/<name>`` (registering it in the ``labels/`` group),
+        carrying each label's own ``image-label`` metadata. The counterpart of
+        `read_pyramid`'s label discovery, so an add_image_label -> write -> read round
+        trips."""
+        if not labels:
+            return
+        labels_group = _store_join(path, "labels")   # S3-aware (URL join for remote)
+        for name, label_pyr in labels.items():
+            # unified: write_pyramid detects the label via meta.is_label, attaches its
+            # image-label block and registers it in the labels/ group. (label_pyr has no
+            # nested `labels`, so this does not recurse further.)
+            self.write_pyramid(
+                pyramid=label_pyr,
+                path=str(_store_join(labels_group, name)),
+                labels_group_path=str(labels_group),
+                label_name=name,
+                overwrite=overwrite,
+                backend=backend, compressor=compressor, compressor_params=compressor_params,
+            )
+
 
     def _write_with_plan(self, pyramid: Pyramid, path: Path, plan: dict, *,
                          overwrite: bool, chunk_shape=None, chunk_size_mb=None,
@@ -542,10 +801,29 @@ class PyramidIO:
             unit_list=unit_clean if unit_clean else None,
             scales=[full.meta.get_scale(p) for p in fpaths],
             version=full.meta.version,
-            name=full.meta.multiscales.get('name', 'Series_0') if full.meta.metadata else 'Series_0',
+            name=full.meta.multiscales.get('name', 'unnamed') if full.meta.metadata else 'unnamed',
         )
         full_dask._storage_chunks = getattr(pyramid, '_storage_chunks', None)
         full_dask = _rechunked(full_dask)
+        # `full_dask` was rebuilt via from_arrays (axes/scales/units/name only), so
+        # overlay the SOURCE pyramid's non-dataset metadata (omero channels/colours/
+        # windows and any custom top-level attrs). Without this, writing the extra
+        # levels re-saves the group attrs and clobbers omero set via set_channels /
+        # set_display_range. Keep full_dask's own `multiscales` (all levels, correct
+        # scales/translations).
+        import copy as _copy
+        src_md = pyramid.meta.metadata if pyramid.meta is not None else None
+        if src_md and full_dask.meta is not None and full_dask.meta.metadata is not None:
+            # mirror the source's non-`multiscales` metadata EXACTLY: add its
+            # omero/image-label/custom attrs, and DROP any keys full_dask auto-added
+            # that the source lacks (e.g. from_arrays' empty omero on a label image).
+            # Keep full_dask's own `multiscales` (all levels + correct scales).
+            ms = full_dask.meta.metadata.get('multiscales')
+            new_md = {k: _copy.deepcopy(v) for k, v in src_md.items() if k != 'multiscales'}
+            if ms is not None:
+                new_md['multiscales'] = ms
+            full_dask.meta.metadata = new_md
+            full_dask.meta._pending_changes = True
         self.write_pyramid(full_dask, path, layers=extra, overwrite=False, **write_kwargs)
 
     def write_labels(self,
@@ -558,11 +836,12 @@ class PyramidIO:
                      **write_kwargs) -> None:
         """Write `label_pyramid` as an OME-Zarr label image.
 
-        Writes the multiscale label arrays + `multiscales` metadata to `path`
-        (via `write_pyramid`), then attaches the OME `image-label` metadata
-        (`version`/`colors`/`properties`/`source`) to that group. When
-        `labels_group_path` and `label_name` are given, also registers the label
-        under that parent `labels` group's list (the NGFF `labels/` convention).
+        Thin wrapper over `write_pyramid`, which now handles label images directly
+        (detected via `meta.is_label`): it attaches the `image-label` block and, given
+        `labels_group_path` + `label_name`, registers the label under the parent
+        `labels` group. Prefer ``write_pyramid(label_pyr, path, labels_group_path=...,
+        label_name=...)``; this wrapper is kept for convenience and the explicit
+        `image_label` override.
 
         Parameters
         ----------
@@ -571,8 +850,11 @@ class PyramidIO:
         path : str or Path
             Destination for the label-image group (e.g. `<image>/labels/<name>`).
         image_label : dict, optional
-            The `image-label` metadata object to attach (already assembled by the
-            caller: `version`, `colors`, `properties`, `source`).
+            An explicit `image-label` metadata object (`version`/`colors`/
+            `properties`/`source`) to attach. Default None: use the block already on
+            the pyramid (`label_pyramid.meta.image_label`, set via
+            `Pyramid.set_image_label` / `from_label_arrays`), so
+            ``write_labels(label_pyr, path)`` just works. An explicit dict overrides it.
         labels_group_path : str or Path, optional
             Path to the parent `labels` group to register the label in. If given
             with `label_name`, that group is created/updated with the name.
@@ -585,25 +867,18 @@ class PyramidIO:
         """
         if label_pyramid.meta is None:
             raise ValueError("label_pyramid not initialized")
-        path = Path(path) if isinstance(path, str) else path
-        version = label_pyramid.meta.version
-        zarr_format = label_pyramid.meta.zarr_format
-
-        # ensure the parent labels/ group exists (and is registered) FIRST, so
-        # the nested label-image group is created inside a proper zarr group
-        if labels_group_path is not None and label_name is not None:
-            labels_group = zarr.open_group(str(labels_group_path), mode="a", zarr_format=zarr_format)
-            _register_label_name(labels_group, label_name, version)
-
-        # write the multiscale label arrays + standard multiscales metadata
-        self.write_pyramid(label_pyramid, path=path, overwrite=overwrite, **write_kwargs)
-
-        # attach image-label metadata to the written label-image group
+        # An explicit `image_label` dict overrides the block on the pyramid: stamp it
+        # onto a metadata-only clone (do not mutate the caller's pyramid).
         if image_label is not None:
-            group = zarr.open_group(str(path), mode="a", zarr_format=zarr_format)
-            _attach_image_label(group, image_label, version)
-            if self.verbose:
-                logger.info(f"[PyramidIO] Attached image-label metadata to: {path}")
+            label_pyramid = label_pyramid._clone_metadata_only()
+            if label_pyramid.meta is not None and label_pyramid.meta.metadata is not None:
+                label_pyramid.meta.metadata['image-label'] = image_label
+                label_pyramid.meta._pending_changes = True
+        # write_pyramid detects the label via meta.is_label, attaches its image-label
+        # block and (with labels_group_path + label_name) registers it in the labels/ group.
+        self.write_pyramid(label_pyramid, path=path, overwrite=overwrite,
+                           labels_group_path=labels_group_path, label_name=label_name,
+                           **write_kwargs)
 
     async def write_pyramid_async(self,
                                    pyramid: Pyramid,
@@ -632,7 +907,9 @@ class PyramidIO:
         if pyramid.meta is None:
             raise ValueError("Pyramid not initialized")
 
-        path = Path(path) if isinstance(path, str) else path
+        # keep object-store URLs as strings (Path would mangle 'https://' -> 'https:\\')
+        if not _is_remote_store(path):
+            path = Path(path) if isinstance(path, str) else path
 
         if compressor is None:
             if pyramid.compressor is not None:
@@ -655,7 +932,8 @@ class PyramidIO:
             logger.info(f"[PyramidIO] Writing pyramid to: {path} (backend=tensorstore)")
             logger.info(f"[PyramidIO] Writing layers: {layers_to_write}")
 
-        tensorstore_writer._zarr_group(str(path), overwrite=overwrite, zarr_format=zarr_format)
+        group_store = tensorstore_writer.wrap_output_path(str(path)) if _is_remote_store(path) else str(path)
+        tensorstore_writer._zarr_group(group_store, overwrite=overwrite, zarr_format=zarr_format)
 
         semaphore = asyncio.Semaphore(max(1, min(max_concurrent_layers, len(layers_to_write))))
 
@@ -664,7 +942,7 @@ class PyramidIO:
             async with semaphore:
                 await tensorstore_writer.write_with_queue_async(
                     arr=array,
-                    output_path=str(path / layer_path),
+                    output_path=str(_store_join(path, layer_path)),
                     output_chunks=get_chunk_shape(array),
                     zarr_format=zarr_format,
                     dtype=array.dtype,
@@ -688,7 +966,7 @@ class PyramidIO:
             if isinstance(result, Exception):
                 raise result
 
-        zarr_group = zarr.open_group(str(path), mode='r+')
+        zarr_group = _open_store_group(path, zarr_format, mode='r+')
         pyramid.meta.connect_to_group(zarr_group)
         pyramid.meta._pending_changes = True
         pyramid.meta.save_changes()
@@ -739,9 +1017,13 @@ class PyramidIO:
             else:
                 chunks = tuple([256] * len(shape))
             
-            # Create or get zarr array in group
+            # Create the layer array ON THE GROUP, so it lands in the group's store -
+            # LOCAL or an s3fs/fsspec mapping alike (single store-agnostic writer).
             if layer_path not in zarr_group:
-                _create_layer_array(Path(dest_path), layer_path, shape, chunks, dtype, pyramid)
+                zf = pyramid.meta.zarr_format if pyramid.meta else 2
+                tensorstore_writer.create_group_array(
+                    zarr_group, layer_path, shape, chunks, dtype, zf,
+                    pyramid.compressor, list(pyramid.axes) if zf == 3 else None)
 
             zarr_array = zarr_group[layer_path]
             
@@ -1032,9 +1314,16 @@ class PyramidIO:
 class IO:
     """Convenience wrapper for high-performance pyramid I/O operations."""
 
-    def read_pyramid(self, path: Union[str, Path]) -> Pyramid:
-        """Read a pyramid from a path."""
-        return PyramidIO().read_pyramid(path)
+    def read_pyramid(self, path: Union[str, Path], include_labels: bool = True) -> Pyramid:
+        """Read a pyramid from a path. `include_labels` also loads the image's NGFF
+        ``labels/`` collection into `Pyramid.labels` (lazy). See
+        :meth:`PyramidIO.read_pyramid`."""
+        return PyramidIO().read_pyramid(path, include_labels=include_labels)
+
+    def read_labels(self, path: Union[str, Path], name: Optional[str] = None) -> Pyramid:
+        """Read a single OME-Zarr label image as a `Pyramid` (with ``image-label``
+        metadata). See :meth:`PyramidIO.read_labels`."""
+        return PyramidIO().read_labels(path, name=name)
 
     def write_pyramid(self,
                       pyramid: Pyramid,

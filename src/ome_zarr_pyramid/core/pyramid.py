@@ -8,6 +8,7 @@ and full TensorStore integration for high-performance operations.
 import asyncio
 import copy
 import operator
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -94,6 +95,50 @@ def calculate_n_layers(shape: Tuple[int, ...],
     n_layers_per_largest_dim = n_layers_per_dim[argmax_largest_dim]
     n_layers = int(n_layers_per_largest_dim) + 1
     return max(1, n_layers)
+
+
+# Standard colour names -> OME hex ('RRGGBB', no '#'). CSS basic set plus the
+# channel colours common in microscopy. Used by `Pyramid.set_channels`.
+_COLOR_NAMES = {
+    "red": "FF0000", "green": "00FF00", "lime": "00FF00", "blue": "0000FF",
+    "cyan": "00FFFF", "aqua": "00FFFF", "magenta": "FF00FF", "fuchsia": "FF00FF",
+    "yellow": "FFFF00", "white": "FFFFFF", "black": "000000",
+    "gray": "808080", "grey": "808080", "silver": "C0C0C0",
+    "orange": "FFA500", "purple": "800080", "violet": "EE82EE", "indigo": "4B0082",
+    "pink": "FFC0CB", "brown": "A52A2A", "maroon": "800000", "navy": "000080",
+    "teal": "008080", "olive": "808000", "gold": "FFD700", "turquoise": "40E0D0",
+}
+
+
+def normalize_color(value: Union[str, Tuple, List]) -> str:
+    """Coerce a colour spec to an OME hex string 'RRGGBB' (uppercase, no '#').
+
+    Accepts a standard colour NAME ('red', 'green', 'magenta', ...), a hex string
+    with or without a leading '#' (6-digit 'FF0000' or 3-digit shorthand 'F00'),
+    or an (r, g, b) triple of 0-255 ints.
+    """
+    if isinstance(value, (tuple, list)):
+        if len(value) != 3:
+            raise ValueError(f"colour: RGB must have 3 components, got {value!r}")
+        rgb = [int(round(c)) for c in value]
+        if any(not (0 <= c <= 255) for c in rgb):
+            raise ValueError(f"colour: RGB components must be 0-255, got {value!r}")
+        return "{:02X}{:02X}{:02X}".format(*rgb)
+    if not isinstance(value, str):
+        raise TypeError(f"colour must be a name, hex string or (r,g,b) triple, got {value!r}")
+    s = value.strip()
+    key = s.lower()
+    if key in _COLOR_NAMES:
+        return _COLOR_NAMES[key]
+    h = s[1:] if s.startswith("#") else s
+    if len(h) == 3 and all(c in "0123456789abcdefABCDEF" for c in h):
+        h = "".join(c * 2 for c in h)   # 'F00' -> 'FF0000'
+    if len(h) == 6 and all(c in "0123456789abcdefABCDEF" for c in h):
+        return h.upper()
+    raise ValueError(
+        f"colour: unrecognised {value!r}; use a standard name (e.g. 'red'), a "
+        f"6-digit hex ('FF0000' or '#FF0000'), 3-digit shorthand ('F00') or an (r,g,b) triple"
+    )
 
 
 def generate_channel_metadata(
@@ -224,6 +269,31 @@ class NGFFMetadataHandler:
             raise RuntimeError("No omero metadata available")
         return self.metadata['omero']
 
+    @property
+    def image_label(self) -> Optional[Dict[str, Any]]:
+        """The OME ``image-label`` metadata block (``colors``/``properties``/
+        ``source``/``version``) if this is a label image, else ``None``.
+
+        The NGFF label-metadata sibling of `omero`/`multiscales`. Unlike `omero`
+        (which raises when absent), this returns ``None`` because image-label is
+        optional - most images are not labels. Set it via `Pyramid.set_image_label`.
+        """
+        if not self.metadata:
+            return None
+        return self.metadata.get('image-label')
+
+    @property
+    def is_multiscales(self) -> bool:
+        """True if this carries valid NGFF ``multiscales`` metadata (a resolution
+        pyramid) - the base validity of any image or label pyramid."""
+        return bool(self.metadata) and 'multiscales' in self.metadata
+
+    @property
+    def is_label(self) -> bool:
+        """True if this is a LABEL image (carries an OME ``image-label`` block);
+        False = a raw / intensity image pyramid."""
+        return self.image_label is not None
+
     def _validate_version_and_format(self, version: str, zarr_format: int) -> None:
         """Validate version and zarr format compatibility."""
         if version not in self.SUPPORTED_VERSIONS:
@@ -291,7 +361,7 @@ class NGFFMetadataHandler:
             'name': self.multiscales['name']
         }
 
-    def create_new(self, version: str = "0.5", name: str = "Series 0") -> 'NGFFMetadataHandler':
+    def create_new(self, version: str = "0.5", name: str = "unnamed") -> 'NGFFMetadataHandler':
         """Create a new metadata handler with empty metadata of specified version."""
         self._validate_version_and_format(version, 3 if version == "0.5" else 2)
 
@@ -382,6 +452,10 @@ class NGFFMetadataHandler:
 
         if 'omero' in self.zarr_group.attrs and self.metadata is not None:
             self.metadata['omero'] = self.zarr_group.attrs['omero']  # type: ignore
+        # capture the OME image-label block for label images (0.4 top-level; for 0.5
+        # it already lives inside the `ome` metadata read above)
+        if 'image-label' in self.zarr_group.attrs and self.metadata is not None:
+            self.metadata['image-label'] = self.zarr_group.attrs['image-label']  # type: ignore
         self.zarr_format = 3 if self.version == "0.5" else 2
         self._pending_changes = False
         return self
@@ -404,6 +478,8 @@ class NGFFMetadataHandler:
             self.zarr_group.attrs['multiscales'] = metadata_dict.get('multiscales')
             if 'omero' in metadata_dict:
                 self.zarr_group.attrs['omero'] = metadata_dict['omero']
+            if 'image-label' in metadata_dict:
+                self.zarr_group.attrs['image-label'] = metadata_dict['image-label']
             if '_creator' in metadata_dict:
                 self.zarr_group.attrs['_creator'] = metadata_dict['_creator']
 
@@ -620,6 +696,28 @@ class NGFFMetadataHandler:
         basepath = self.resolution_paths[0]
         return self.get_scale(basepath)
 
+    def get_translation(self, pth: Union[str, int]) -> Optional[List[float]]:
+        """Physical origin (translation) of a resolution level, or ``None`` if it
+        declares none. Looked up by transform TYPE - ``translation`` is optional and
+        follows ``scale``, so its index is not fixed (unlike ``scale`` at index 0).
+        The read counterpart of `update_translation` / `add_dataset(translation=...)`."""
+        idx = self.resolution_paths.index(str(pth))
+        for ct in self.multiscales['datasets'][idx].get('coordinateTransformations', []):
+            if ct.get('type') == 'translation':
+                return list(ct['translation'])
+        return None
+
+    def get_translationdict(self, pth: Union[str, int]) -> Optional[Dict[str, float]]:
+        """`get_translation` keyed by axis name, or ``None`` if no translation."""
+        translation = self.get_translation(pth)
+        if translation is None:
+            return None
+        return dict(zip(self.axis_order, translation))
+
+    def get_base_translation(self) -> Optional[List[float]]:
+        """Translation of the base (level 0) resolution, or ``None``."""
+        return self.get_translation(self.resolution_paths[0])
+
     def set_scale(self,
                   pth: Union[str, int] = 'auto',
                   scale: Union[tuple, list, dict, Literal['auto']] = 'auto') -> None:
@@ -707,6 +805,33 @@ class NGFFMetadataHandler:
         return scales
 
 
+class LabelCollection(Mapping):
+    """Read-only mapping of ``name -> label Pyramid`` for an image's NGFF ``labels/``
+    collection (see `Pyramid.labels`). Each value is a `Pyramid` whose metadata
+    carries an ``image-label`` block (surfaced via `pyr.meta.image_label`). Add labels
+    with `Pyramid.add_image_label`; this view itself is not mutable."""
+
+    def __init__(self, labels: Dict[str, 'Pyramid']):
+        self._labels = labels
+
+    def __getitem__(self, key: str) -> 'Pyramid':
+        return self._labels[key]
+
+    def __iter__(self):
+        return iter(self._labels)
+
+    def __len__(self) -> int:
+        return len(self._labels)
+
+    @property
+    def names(self) -> List[str]:
+        """The registered label names, in insertion order."""
+        return list(self._labels)
+
+    def __repr__(self) -> str:
+        return f"LabelCollection({self.names})"
+
+
 class Pyramid:
     """NGFF-compliant image pyramid supporting multiple array storage modes.
     
@@ -730,6 +855,7 @@ class Pyramid:
         self.gr = None
         self._array_layers = {}  # In-memory array storage
         self._compressor: Optional[CompressorConfig] = None
+        self._labels: Dict[str, 'Pyramid'] = {}  # NGFF labels/ collection (name -> label Pyramid)
         if gr is not None:
             self.from_ngff(gr)
 
@@ -776,7 +902,7 @@ class Pyramid:
                    unit_list: Optional[List[str]] = None,  # type: ignore
                    scale: Optional[List[float]] = None,  # type: ignore
                    version: str = "0.4",
-                   name: str = "Series 0") -> 'Pyramid':
+                   name: str = "unnamed") -> 'Pyramid':
         """Create a pyramid from any array type without writing to NGFF store."""
         ndim = array.ndim
         axes: str = axis_order if axis_order is not None else defaults.axis_order[:ndim]
@@ -800,7 +926,7 @@ class Pyramid:
                     scale_factor: Optional[List[float]] = None,  # type: ignore
                     scales: Optional[List[List[float]]] = None,  # type: ignore
                     version: str = "0.4",
-                    name: str = "Series 0",
+                    name: str = "unnamed",
                     compressor: Optional[CompressorConfig] = None) -> 'Pyramid':
         """Create a pyramid from a list of arrays at different resolutions.
 
@@ -884,6 +1010,53 @@ class Pyramid:
 
         return self
 
+    def from_label_arrays(self,
+                          arrays: List[Union[np.ndarray, da.Array, zarr.Array]],
+                          axis_order: Optional[str] = None,  # type: ignore
+                          unit_list: Optional[List[str]] = None,  # type: ignore
+                          scale_factor: Optional[List[float]] = None,  # type: ignore
+                          scales: Optional[List[List[float]]] = None,  # type: ignore
+                          version: str = "0.4",
+                          name: str = "unnamed",
+                          compressor: Optional[CompressorConfig] = None,
+                          colors: Optional[List[dict]] = None,
+                          properties: Optional[List[dict]] = None,
+                          source: Optional[Dict[str, Any]] = None) -> 'Pyramid':
+        """Create a LABEL pyramid from arrays, exactly like `from_arrays` but stamping
+        an OME ``image-label`` metadata block so the result is a valid NGFF label
+        image (and no ``omero`` block, which label images do not carry).
+
+        The label arrays are the integer label maps at each resolution. The
+        ``image-label`` block is minimal by default (just ``version``); pass
+        ``colors`` / ``properties`` / ``source`` to populate it (typically these are
+        assembled by the sibling ``pyrametric`` package). ``source`` usually
+        stays ``None`` here and is set when the label is attached to a source image
+        via `add_image_label`.
+
+        ::
+
+            lbl_pyr = Pyramid().from_label_arrays([labels0], axis_order="zyx",
+                                                  scales=[[1, 1, 1]], name="nuclei")
+            lbl_pyr.meta.image_label       # {'version': '0.4'}
+        """
+        self.from_arrays(
+            arrays, axis_order=axis_order, unit_list=unit_list, scale_factor=scale_factor,
+            scales=scales, version=version, name=name, compressor=compressor,
+        )
+        if self.meta is not None and self.meta.metadata is not None:
+            # label images carry image-label, not omero
+            self.meta.metadata.pop('omero', None)
+            image_label: Dict[str, Any] = {'version': version}
+            if colors is not None:
+                image_label['colors'] = colors
+            if properties is not None:
+                image_label['properties'] = properties
+            if source is not None:
+                image_label['source'] = source
+            self.meta.metadata['image-label'] = image_label
+            self.meta._pending_changes = True
+        return self.validate()   # a label image must be integer-typed (see validate)
+
     @property
     def axes(self) -> str:
         """Get axis order string."""
@@ -931,6 +1104,38 @@ class Pyramid:
         return result
 
     @property
+    def dynamic_arrays(self) -> Dict[str, 'DynamicArray']:
+        """Get all layers as dyna_zarr ``DynamicArray``s -- the pull-based, memory-bounded
+        backend counterpart to ``dask_arrays``. Zarr layers are wrapped lazily; a layer that
+        is already a ``DynamicArray`` passes through. A dask-backed in-memory layer cannot be
+        wrapped (no zarr to pull from) and raises.
+
+        Requires the optional ``dyna_zarr`` package. This is the read side of the dyna backend
+        used by ``pyrops`` ops; the write side is in ``IO.write_pyramid``.
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        try:
+            from dyna_zarr import DynamicArray
+        except ImportError as e:  # pragma: no cover - optional backend
+            raise ImportError(
+                "dynamic_arrays requires the optional 'dyna_zarr' package"
+            ) from e
+        result = {}
+        for path in self.meta.resolution_paths:
+            arr = self.layers[path]
+            if isinstance(arr, DynamicArray):
+                result[str(path)] = arr
+            elif isinstance(arr, zarr.Array):
+                result[str(path)] = DynamicArray(arr)
+            else:
+                raise TypeError(
+                    f"layer {path!r} is a {type(arr).__name__}; the dyna_zarr backend needs a "
+                    f"zarr-backed or DynamicArray layer (cannot wrap an in-memory dask/numpy array)"
+                )
+        return result
+
+    @property
     def scale_factor_dict(self) -> Dict[str, Dict[str, float]]:
         """Get scale factors as dictionaries for each resolution."""
         if self.meta is None:
@@ -946,7 +1151,7 @@ class Pyramid:
 
     async def update_downscaler(self,
                                 scale_factor=None,
-                                n_layers: Union[int, str, None] = 1,
+                                n_layers: Union[int, str, None] = None,
                                 downscale_method='simple',
                                 backend='numpy',
                                 smart_scale_factor=None,
@@ -983,9 +1188,12 @@ class Pyramid:
         return self
 
     def get_downscaled_pyramid(self) -> 'Pyramid':
-        """Get pyramid with downscaled layers."""
+        """Get pyramid with downscaled layers. When no downscaler has been configured
+        (e.g. via a prior `downscale(...)`), build one whose depth is chosen
+        automatically: keep adding levels until the largest downscaled spatial
+        dimension would drop below `min_dimension_size` (64), matching `downscale()`."""
         if not hasattr(self, 'downscaler'):
-            asyncio.run(self.update_downscaler())
+            asyncio.run(self.update_downscaler(n_layers=None))
         
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
@@ -994,7 +1202,7 @@ class Pyramid:
         scales = self.downscaler.dm.scales  # type: ignore
         unit_list = self.meta.unit_list
         axis_order = self.meta.axis_order
-        name = self.meta.multiscales.get('name', 'Series_0') if self.meta.metadata else 'Series_0'
+        name = self.meta.multiscales.get('name', 'unnamed') if self.meta.metadata else 'unnamed'
         
         # Convert scales to list format
         scales_list: List[Union[List[float], np.ndarray]] = scales.tolist() if hasattr(scales, 'tolist') else list(scales)  # type: ignore
@@ -1208,7 +1416,7 @@ class Pyramid:
             axis_order=axes,
             unit_list=unit_clean if unit_clean else None,  # type: ignore
             scales=[self.meta.get_scale(p) for p in paths],  # type: ignore
-            name=self.meta.multiscales.get('name', 'Series_0') if self.meta.metadata else 'Series_0',
+            name=self.meta.multiscales.get('name', 'unnamed') if self.meta.metadata else 'unnamed',
             compressor=compressor,
             version=self.meta.version,
         )
@@ -1239,20 +1447,46 @@ class Pyramid:
         ALL levels, returning a new sub-`Pyramid`.
 
         Each keyword is `axis_letter=index`, where `index` is an int (selects one
-        position and DROPS the axis) or a `slice` (`start:stop:step`; a `step`
-        strided-subsamples and rescales the axis). Indices are in FULL-RESOLUTION
-        (level-0) coordinates and mapped to each level by the TRUE per-axis
-        downsample factor `scale_level / scale_0` (from the pixel-size metadata,
-        not the array-shape ratio - the latter is inexact for odd sizes), rounded.
+        position and DROPS the axis), a `slice` (`start:stop:step`; a `step`
+        strided-subsamples and rescales the axis), or a LIST/array of ints (fancy
+        selection: the axis is KEPT and those positions are gathered in order, e.g.
+        `c=[3, 4]` keeps two channels; a single-element list keeps a size-1 axis,
+        unlike an int). Multiple list axes are selected orthogonally. Indices are in
+        FULL-RESOLUTION (level-0) coordinates and mapped to each level by the TRUE
+        per-axis downsample factor `scale_level / scale_0` (from the pixel-size
+        metadata, not the array-shape ratio - the latter is inexact for odd sizes),
+        rounded.
+
+        Axis keys also accept the long names `channels`/`channel` -> `c`, `time` ->
+        `t`.
 
         Coordinate metadata is updated: translation shifts by `start*scale`, scale
         multiplies by `step`, dropped axes are removed, and indexing the channel
-        axis `c` subsets the omero channels accordingly.
+        axis `c` subsets the omero channels accordingly. A uniformly-spaced list
+        updates scale/translation exactly; a non-uniform list gathers the data but
+        keeps the axis scale as-is (its spacing is no longer a single affine step).
         """
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
         axstr = self.meta.axis_order
         ndim = len(axstr)
+
+        _axis_aliases = {"channels": "c", "channel": "c", "time": "t"}
+        indexers = {_axis_aliases.get(a, a): idx for a, idx in indexers.items()}
+
+        def _uniform_step(vals):
+            """Positive common step of an arithmetic-progression list (1 for a
+            single element), else None -- signals whether a list selection is a
+            plain strided subsample the scale can represent exactly."""
+            if len(vals) == 1:
+                return 1
+            diffs = {vals[k + 1] - vals[k] for k in range(len(vals) - 1)}
+            if len(diffs) == 1:
+                d = next(iter(diffs))
+                if d > 0:
+                    return d
+            return None
+
         for a in indexers:
             if a not in axstr:
                 raise ValueError(f"isel: axis '{a}' not present in pyramid axes '{axstr}'")
@@ -1274,8 +1508,26 @@ class Pyramid:
                 if step <= 0:
                     raise ValueError("isel: only positive step is supported")
                 resolved[i] = ("slice", start, stop, step)
+            elif isinstance(idx, (list, tuple, np.ndarray)):
+                seq = np.asarray(idx)
+                if seq.ndim != 1 or seq.size == 0:
+                    raise ValueError(
+                        f"isel: list index for axis '{a}' must be a non-empty 1-D sequence")
+                if not np.issubdtype(seq.dtype, np.integer):
+                    raise TypeError(
+                        f"isel: list index for axis '{a}' must contain integers, got dtype {seq.dtype}")
+                l0s = []
+                for v in seq.tolist():
+                    lv = v + n0 if v < 0 else v
+                    if not (0 <= lv < n0):
+                        raise IndexError(
+                            f"isel: index {v} out of range for axis '{a}' (size {n0})")
+                    l0s.append(int(lv))
+                resolved[i] = ("list", l0s)
             else:
-                raise TypeError(f"isel: index for axis '{a}' must be int or slice, got {type(idx).__name__}")
+                raise TypeError(
+                    f"isel: index for axis '{a}' must be int, slice, or list of ints, "
+                    f"got {type(idx).__name__}")
 
         dropped = {i for i, r in resolved.items() if r[0] == "int"}
         keep = [i for i in range(ndim) if i not in dropped]
@@ -1286,7 +1538,12 @@ class Pyramid:
         channel_indices = None
         if "c" in indexers:
             r = resolved[axstr.index("c")]
-            channel_indices = [r[1]] if r[0] == "int" else list(range(r[1], r[2], r[3]))
+            if r[0] == "int":
+                channel_indices = [r[1]]
+            elif r[0] == "slice":
+                channel_indices = list(range(r[1], r[2], r[3]))
+            else:  # list
+                channel_indices = list(r[1])
 
         new_arrays, new_scales, new_translations = [], [], []
         for p in paths:
@@ -1296,6 +1553,7 @@ class Pyramid:
                 lvl_trans = [0.0] * ndim
             slices = [slice(None)] * ndim
             sc, tr = list(lvl_scale), list(lvl_trans)
+            list_takes = []  # (axis_index, [level indices]) applied after the basic slice
             for i, r in resolved.items():
                 f = lvl_scale[i] / base_scale[i] if base_scale[i] else 1.0  # true factor from pixel scale
                 shp = arr.shape[i]
@@ -1303,7 +1561,7 @@ class Pyramid:
                     li = min(int(round(r[1] / f)), shp - 1)
                     slices[i] = li
                     tr[i] = lvl_trans[i] + li * lvl_scale[i]
-                else:
+                elif r[0] == "slice":
                     _, s0, e0, st0 = r
                     ls = min(max(int(round(s0 / f)), 0), shp)
                     le = min(max(int(round(e0 / f)), ls), shp)
@@ -1311,7 +1569,24 @@ class Pyramid:
                     slices[i] = slice(ls, le, lstep)
                     sc[i] = lvl_scale[i] * lstep
                     tr[i] = lvl_trans[i] + ls * lvl_scale[i]
-            new_arrays.append(arr[tuple(slices)])
+                else:  # list -- keep axis, gather chosen positions (deferred take)
+                    l0s = r[1]
+                    lis = [min(int(round(x / f)), shp - 1) for x in l0s]
+                    list_takes.append((i, lis))
+                    step0 = _uniform_step(l0s)
+                    if step0 is not None:  # a strided subsample: scale is exact
+                        lstep = max(1, int(round(step0 / f))) if len(l0s) > 1 else 1
+                        sc[i] = lvl_scale[i] * lstep
+                    # non-uniform: leave scale as-is (best-effort; data still gathered)
+                    tr[i] = lvl_trans[i] + lis[0] * lvl_scale[i]
+            out = arr[tuple(slices)]
+            # apply fancy selections one axis at a time: a single advanced index per
+            # getitem gives orthogonal selection (a shared tuple would cross-product).
+            drop = {j for j, rr in resolved.items() if rr[0] == "int"}
+            for i, lis in list_takes:
+                pos = sum(1 for j in range(i) if j not in drop)  # axis position after drops
+                out = out[(slice(None),) * pos + (np.asarray(lis, dtype=int),)]
+            new_arrays.append(out)
             new_scales.append([sc[i] for i in keep])
             new_translations.append([tr[i] for i in keep])
 
@@ -1369,30 +1644,67 @@ class Pyramid:
             indexers[axstr[i]] = k
         return self.isel(**indexers)
 
-    def sublevels(self, high: int = 0, low: Optional[int] = None) -> 'Pyramid':
-        """Return a new pyramid holding a contiguous subset of resolution LEVELS.
+    def select_levels(self, *levels) -> 'Pyramid':
+        """Return a new pyramid holding an arbitrary subset of resolution LEVELS
+        (not necessarily contiguous). The FINEST selected level becomes level 0 of
+        the output; each kept level keeps its own pixel scale/translation verbatim.
 
-        `high` is the finest (highest-resolution) level index to keep and `low`
-        the coarsest, both indexing the existing pyramid (0 = finest). The
-        selected finest level becomes level 0 of the output; each kept level keeps
-        its own pixel scale/translation verbatim. If `low is None`, only `high` is
-        returned (a single-level pyramid). Negative indices are allowed.
+        Levels may be given as individual indices, a single list/tuple/range, or a
+        slice; negative indices count from the coarsest; duplicates are dropped and
+        the result is ordered finest -> coarsest:
 
-            pyr.sublevels(0, 4)   # levels 0..4 (5-level pyramid)
-            pyr.sublevels(1)      # just level 1 (1-level pyramid)
+            pyr.select_levels(0, 2, 3)      # levels 0, 2 and 3
+            pyr.select_levels(2)            # just level 2 (a single-level pyramid)
+            pyr.select_levels([1, 3, 4])
+            pyr.select_levels(range(0, 3))  # a contiguous run (levels 0, 1, 2)
+            pyr.select_levels(slice(1, 5))  # levels 1..4
+
+        DEFERRED-aware: on a pyramid that still carries a `downscale()` plan (only
+        level 0 is materialised, the rest is a recipe), the plan is first resolved
+        lazily (no compute). For a CONTIGUOUS selection the result stays deferred -
+        re-based to the finest kept level, with a narrowed plan for the coarser kept
+        levels (derived from that base at write time). So `downscale(8).select_levels(
+        range(3, 8))` costs the base ONE compute at level-3 resolution and never
+        builds levels 0..2. A non-contiguous selection is returned as lazy arrays.
         """
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
-        n = self.meta.nlayers
-        h = high + n if high < 0 else high
-        lo = h if low is None else (low + n if low < 0 else low)
-        if not (0 <= h < n and 0 <= lo < n):
-            raise IndexError(f"sublevels: level indices out of range (pyramid has {n} levels)")
-        if h > lo:
-            h, lo = lo, h
-        paths = self.meta.resolution_paths
-        sel = list(range(h, lo + 1))
+        plan = getattr(self, '_downscale_plan', None)
+        if plan is not None:
+            return self._select_levels_deferred(levels, plan)
+        sel = self._resolve_level_indices(levels, self.meta.nlayers)
+        new = self._select_materialized(sel)
+        sc = getattr(self, '_storage_chunks', None)
+        if sc is not None:
+            new._storage_chunks = sc
+        return new
 
+    @staticmethod
+    def _resolve_level_indices(specs, n) -> 'List[int]':
+        """Flatten the variadic `select_levels` specs (individual ints, a single
+        list/tuple/range, or a slice) into a sorted, unique, ascending list of valid
+        level indices (finest first). Negative indices count from the coarsest."""
+        if len(specs) == 1 and isinstance(specs[0], slice):
+            idxs: List[int] = list(range(*specs[0].indices(n)))
+        elif len(specs) == 1 and isinstance(specs[0], (list, tuple, range)):
+            idxs = list(specs[0])
+        else:
+            idxs = list(specs)
+        if not idxs:
+            raise ValueError("select_levels: choose at least one level")
+        out = []
+        for i in idxs:
+            ii = int(i)
+            ii = ii + n if ii < 0 else ii
+            if not (0 <= ii < n):
+                raise IndexError(f"select_levels: level {i} out of range (pyramid has {n} levels)")
+            out.append(ii)
+        return sorted(set(out))
+
+    def _select_materialized(self, sel: 'List[int]') -> 'Pyramid':
+        """Build a new pyramid from the given (sorted, unique) level indices, taking
+        each level's array + coordinate metadata; the first becomes level 0."""
+        paths = self.meta.resolution_paths
         arrays = [self.dask_arrays[paths[k]] for k in sel]
         scales = [self.meta.get_scale(paths[k]) for k in sel]
         new = Pyramid().from_arrays(
@@ -1413,6 +1725,335 @@ class Pyramid:
             new.meta._pending_changes = True
         return new
 
+    def _select_levels_deferred(self, levels, plan: dict) -> 'Pyramid':
+        """`select_levels` on a still-deferred pyramid (see `select_levels`).
+
+        Resolve the plan into a full lazy pyramid, then select the requested levels.
+        A CONTIGUOUS selection stays deferred (finest kept -> new base + a narrowed
+        plan for the coarser kept levels); a non-contiguous one is returned as the
+        selected lazy arrays."""
+        keys = ('n_layers', 'min_dimension_size', 'scale_factor',
+                'downscale_method', 'backend', 'smart_scale_factor')
+        dk = {k: plan[k] for k in keys}
+        # resolve the plan into a full lazy pyramid WITHOUT disturbing self's plan
+        saved = self.__dict__.pop('_downscale_plan', None)
+        try:
+            full = self.downscale(defer=False, **dk)   # lazy: no compute, all levels
+        finally:
+            if saved is not None:
+                self._downscale_plan = saved
+
+        sel = self._resolve_level_indices(levels, full.meta.nlayers)
+        sc = getattr(self, '_storage_chunks', None)
+
+        if sel == list(range(sel[0], sel[-1] + 1)):
+            # contiguous -> keep the coarser kept levels DEFERRED, re-based on level sel[0]
+            new = full._select_materialized([sel[0]])   # finest kept -> single-level base
+            n_kept = len(sel)
+            if n_kept > 1:
+                narrowed = {k: plan[k] for k in keys}
+                narrowed['n_layers'] = n_kept
+                new._downscale_plan = narrowed
+        else:
+            # non-contiguous -> select the resolved lazy levels directly
+            new = full._select_materialized(sel)
+        if sc is not None:
+            new._storage_chunks = sc
+        return new
+
+    def _clone_metadata_only(self) -> 'Pyramid':
+        """A new Pyramid SHARING this one's level arrays with a DEEP-COPIED metadata
+        dict, so metadata edits (omero, etc.) never mutate the original. The pixel
+        data is unchanged; the deferred downscale plan and storage chunks are carried
+        (metadata-only edits are shape-preserving). Basis for `set_channels` /
+        `set_display_range`."""
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        paths = self.meta.resolution_paths
+        new = Pyramid().from_arrays(
+            [self.dask_arrays[p] for p in paths], axis_order=self.meta.axis_order,  # type: ignore
+            unit_list=self.meta.unit_list, scales=[self.meta.get_scale(p) for p in paths],  # type: ignore
+            version=self.meta.version, name=self.meta.tag,  # type: ignore
+        )
+        if self.meta.metadata and new.meta and new.meta.metadata:
+            new.meta.metadata = copy.deepcopy(self.meta.metadata)
+            new.meta._pending_changes = True
+        plan = getattr(self, '_downscale_plan', None)
+        if plan is not None:
+            new._downscale_plan = dict(plan)
+        sc = getattr(self, '_storage_chunks', None)
+        if sc is not None:
+            new._storage_chunks = sc
+        # metadata-only edits keep the geometry, so the attached labels stay valid
+        new._labels = dict(self._labels)
+        return new
+
+    # ------------------------------------------------------------------
+    # NGFF labels/ collection (label images attached to this source image)
+    # ------------------------------------------------------------------
+
+    @property
+    def labels(self) -> 'LabelCollection':
+        """The image's NGFF ``labels/`` collection as a read-only mapping
+        ``name -> label Pyramid`` (see `LabelCollection`). Populated when reading an
+        image that has a ``labels/`` group, or by `add_image_label`. Empty for a
+        plain in-memory pyramid."""
+        return LabelCollection(self._labels)
+
+    def _resolve_label_name(self, image_label: 'Pyramid', name: Optional[str]) -> str:
+        if name is not None:
+            return name
+        ms = image_label.meta.multiscales if image_label.meta is not None else None
+        nm = ms.get('name') if isinstance(ms, dict) else None
+        # 'unnamed' is the library's placeholder name (from_arrays/from_array default);
+        # treat it as no-name so the caller is forced to supply a real label name.
+        if nm and nm != 'unnamed':
+            return str(nm)
+        raise ValueError(
+            "add_image_label: could not determine a label name from the label "
+            "pyramid's metadata (no meaningful multiscales 'name'); pass name=..."
+        )
+
+    def add_image_label(self, image_label: 'Pyramid', name: Optional[str] = None, *,
+                        source: Optional[Dict[str, Any]] = None) -> 'Pyramid':
+        """Attach a label image to this (source) image, returning a NEW `Pyramid`
+        whose `labels` collection includes it - the in-memory equivalent of an NGFF
+        ``<image>/labels/<name>`` (the pixel data is unchanged).
+
+        Parameters
+        ----------
+        image_label : Pyramid
+            The label pyramid (an integer-labelled multiscale image). It becomes a
+            label entry; an ``image-label`` metadata block is ensured (a minimal
+            ``{"version": ...}`` is created if absent) and its ``source`` is set to
+            point back at this image (``{"image": "../../"}`` per NGFF) unless
+            `source` is given.
+        name : str, optional
+            The name to register the label under. Defaults to the label pyramid's own
+            ``multiscales`` name; if that is missing, `name` is REQUIRED.
+        source : dict, optional
+            Override for the image-label ``source`` back-link.
+
+        ::
+
+            img = IO().read_pyramid("image.ome.zarr")
+            img = img.add_image_label(nuclei_pyr, "nuclei")
+            img.labels.names            # ['nuclei']
+            img.labels["nuclei"]        # -> Pyramid (the label image)
+        """
+        if not isinstance(image_label, Pyramid):
+            raise TypeError("add_image_label: image_label must be a Pyramid")
+        if image_label.meta is None:
+            raise ValueError("add_image_label: image_label pyramid is not initialized")
+        label_name = self._resolve_label_name(image_label, name)
+
+        # deep-copy the label's metadata so we can stamp image-label without mutating
+        # the caller's pyramid, then ensure the image-label block + source back-link
+        label = image_label._clone_metadata_only()
+        if label.meta is not None and label.meta.metadata is not None:
+            # a label image carries image-label, not omero (the source pyramid it was
+            # derived from may have left an omero block behind - drop it)
+            label.meta.metadata.pop('omero', None)
+            il = dict(label.meta.metadata.get('image-label') or {})
+            il.setdefault('version', label.meta.version)
+            il['source'] = source if source is not None else {'image': '../../'}
+            label.meta.metadata['image-label'] = il
+            label.meta._pending_changes = True
+
+        new = self._clone_metadata_only()
+        new._labels = dict(self._labels)
+        new._labels[label_name] = label
+        return new
+
+    def validate(self) -> 'Pyramid':
+        """Validate the pyramid's metadata / dtype invariants, raising on violation
+        and returning ``self`` on success (so it chains). A first, lightweight schema
+        check; richer validation (e.g. via pydantic) may follow.
+
+        - Must carry NGFF ``multiscales`` metadata (a resolution pyramid).
+        - A LABEL image (``meta.is_label``) must use an INTEGER pixel type - never
+          BOOLEAN (a boolean mask is a segmentation output, not a labelled image) and
+          never float - and must NOT carry ``omero`` (intensity-display metadata).
+        """
+        if self.meta is None or not self.meta.is_multiscales:
+            raise ValueError("Pyramid has no valid NGFF multiscales metadata")
+        if self.meta.is_label:
+            dtype = self.base_array.dtype
+            if np.issubdtype(dtype, np.bool_):
+                raise TypeError(
+                    "label image has BOOLEAN dtype: a boolean mask is a segmentation "
+                    "output, not a labelled image. Convert to an integer type first - "
+                    "e.g. .astype('uint16') (any bitsize that fits your label ids)."
+                )
+            if not np.issubdtype(dtype, np.integer):
+                raise TypeError(
+                    f"label image has non-integer dtype {dtype!r}: label ids are "
+                    "non-negative integers. Convert with .astype('uint16') etc."
+                )
+            if self.meta.metadata is not None and self.meta.metadata.get('omero') is not None:
+                raise ValueError(
+                    "label image must not carry omero metadata (omero is intensity-"
+                    "display metadata for images, not labels)."
+                )
+        return self
+
+    def set_image_label(self, *, colors: Optional[List[dict]] = None,
+                        properties: Optional[List[dict]] = None,
+                        source: Optional[Dict[str, Any]] = None,
+                        version: Optional[str] = None,
+                        object_features: Optional[Any] = None) -> 'Pyramid':
+        """Set (merge) this pyramid's OME ``image-label`` metadata, returning a NEW
+        `Pyramid` (pixel data unchanged - only metadata). Marks the pyramid as a LABEL
+        image: an ``image-label`` block is ensured and any ``omero`` block is dropped
+        (a label carries image-label, not omero). Only the given fields are written;
+        the others are preserved. The label-image counterpart of `set_channels`.
+
+        Parameters
+        ----------
+        colors : list of dict, optional
+            ``image-label.colors`` - per label-value display colours, each
+            ``{"label-value": int, "rgba": [r, g, b, a]}``.
+        properties : list of dict, optional
+            ``image-label.properties`` - per-object measurements, each a dict with a
+            ``"label-value"`` key plus arbitrary columns (e.g. from
+            ``pyrametric.extract_features``).
+        source : dict, optional
+            ``image-label.source`` back-link (e.g. ``{"image": "../../"}``).
+        version : str, optional
+            Override the image-label version (defaults to the pyramid's NGFF version).
+        object_features : optional
+            A convenience shortcut: any object exposing ``to_ngffcolors()`` and
+            ``to_ngffprops()`` (e.g. ``pyrametric.ObjectFeatures``). Its output
+            fills ``colors``/``properties`` when those are not passed explicitly
+            (explicit ``colors``/``properties`` win). Duck-typed - no dependency on
+            the labels package.
+
+        ::
+
+            lbl_pyr = lbl_pyr.set_image_label(object_features=of)          # from measurements
+            lbl_pyr = lbl_pyr.set_image_label(                            # or literal values
+                colors=[{"label-value": 1, "rgba": [255, 0, 0, 255]}],
+                properties=[{"label-value": 1, "area": 812.0}],
+            )
+            img = img.add_image_label(lbl_pyr, name="nuclei")   # colours/properties carried
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        if object_features is not None:
+            if colors is None:
+                colors = object_features.to_ngffcolors()
+            if properties is None:
+                properties = object_features.to_ngffprops()
+        new = self._clone_metadata_only()
+        if new.meta is not None and new.meta.metadata is not None:
+            new.meta.metadata.pop('omero', None)   # a label carries image-label, not omero
+            il = dict(new.meta.metadata.get('image-label') or {})
+            il['version'] = version if version is not None else il.get('version', new.meta.version)
+            if colors is not None:
+                il['colors'] = colors
+            if properties is not None:
+                il['properties'] = properties
+            if source is not None:
+                il['source'] = source
+            new.meta.metadata['image-label'] = il
+            new.meta._pending_changes = True
+        return new.validate()   # declaring a label: enforce integer dtype / no omero
+
+    def rename(self, name: str) -> 'Pyramid':
+        """Return a NEW `Pyramid` with its multiscales ``name`` set to `name` (pixel
+        data and all other metadata unchanged). `name` is the image/series identifier
+        in the NGFF ``multiscales`` metadata (read back via ``pyr.meta.tag``).
+
+        ::
+
+            pyr = pyr.rename("nuclei")
+            pyr.meta.tag            # 'nuclei'
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        if not isinstance(name, str) or not name:
+            raise ValueError("rename: name must be a non-empty string")
+        new = self._clone_metadata_only()
+        if new.meta is not None and new.meta.metadata is not None:
+            ms = new.meta.metadata.get('multiscales')
+            if ms:
+                ms[0]['name'] = name
+                new.meta._pending_changes = True
+        return new
+
+    def set_channels(self, overrides: Dict[Union[int, str], Dict[str, Any]]) -> 'Pyramid':
+        """Update per-channel omero display metadata, returning a NEW `Pyramid`
+        (pixel data unchanged - only metadata). SPARSE and MERGING: only the named
+        channels and named fields are touched; everything else is preserved.
+
+        `overrides` maps a channel KEY to a dict of fields to change:
+
+        - key: an ``int`` channel index, or a ``str`` matching a channel's current
+          ``label``.
+        - fields: any omero channel field, commonly
+            * ``"color"``  - a standard colour NAME (``"red"``, ``"green"``,
+              ``"magenta"``, ...), a hex string with or without '#' (``"FF0000"``,
+              ``"#FF0000"``, or 3-digit ``"F00"``), or an ``(r, g, b)`` triple;
+              stored as OME hex 'RRGGBB'.
+            * ``"label"``  - channel name
+            * ``"active"`` - bool (whether the channel is displayed)
+            * ``"window"`` - a dict MERGED into the existing window, so you may pass
+              only ``{"start": .., "end": ..}`` and keep ``min``/``max``. For a
+              DATA-DRIVEN window (computed from the pixels) use `set_display_range`.
+
+        ::
+
+            pyr = pyr.set_channels({0: {"color": "FF0000", "label": "DAPI"},
+                                    2: {"active": False}})
+
+        If the pyramid has no omero channels yet (e.g. built via `from_arrays`),
+        defaults are auto-populated for the length of the 'c' axis first.
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        if not isinstance(overrides, dict):
+            raise TypeError("set_channels: overrides must be a dict {channel_key: {field: value}}")
+
+        new = self._clone_metadata_only()
+        if new.meta is None or new.meta.metadata is None:
+            raise RuntimeError("set_channels: pyramid has no metadata to edit")
+
+        # ensure omero channels exist (from_arrays leaves them empty)
+        omero = new.meta.metadata.setdefault("omero", {})
+        channels = omero.get("channels", [])
+        if not channels:
+            axstr = new.meta.axis_order
+            base = new.dask_arrays[new.meta.resolution_paths[0]]
+            nch = base.shape[axstr.index("c")] if "c" in axstr else 1
+            new.meta.autocompute_omerometa(nch, base.dtype)
+            omero = new.meta.metadata["omero"]
+            channels = omero["channels"]
+
+        # resolve str keys against the current labels
+        label_to_idx = {c.get("label"): i for i, c in enumerate(channels) if c.get("label") is not None}
+        for key, fields in overrides.items():
+            if isinstance(key, str):
+                if key not in label_to_idx:
+                    raise KeyError(f"set_channels: no channel with label {key!r} "
+                                   f"(labels: {sorted(label_to_idx)})")
+                idx = label_to_idx[key]
+            else:
+                idx = int(key)
+            if not (0 <= idx < len(channels)):
+                raise IndexError(f"set_channels: channel index {idx} out of range (0..{len(channels) - 1})")
+            if not isinstance(fields, dict):
+                raise TypeError(f"set_channels: value for channel {key!r} must be a dict of fields")
+            for field, value in fields.items():
+                if field == "color":
+                    channels[idx]["color"] = normalize_color(value)   # name/hex/rgb -> 'RRGGBB'
+                elif field == "window" and isinstance(value, dict):
+                    channels[idx].setdefault("window", {}).update(value)   # merge, keep min/max
+                else:
+                    channels[idx][field] = value
+
+        new.meta._pending_changes = True
+        return new
+
     def set_display_range(self, method: str = "minmax", *, p_low: float = 1.0, p_high: float = 99.0,
                           stats_level=None, auto_max_bytes: int = 1 << 30) -> 'Pyramid':
         """Recompute each channel's omero display `window` from the data, returning
@@ -1426,7 +2067,8 @@ class Pyramid:
 
         The statistic is computed per channel on `stats_level` (None = finest, an
         int, or "auto" = finest level <= `auto_max_bytes`) - a streaming,
-        memory-safe reduction.
+        memory-safe reduction. This is the DATA-DRIVEN window setter; for literal
+        per-channel values (colour, label, an explicit window) use `set_channels`.
         """
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
@@ -1473,12 +2115,8 @@ class Pyramid:
             lows, highs = mins, maxs
 
         # clone (share arrays, deep-copy metadata), then rewrite the omero windows
-        new = Pyramid().from_arrays(
-            [self.dask_arrays[p] for p in paths], axis_order=axstr, unit_list=self.meta.unit_list,  # type: ignore
-            scales=[self.meta.get_scale(p) for p in paths], version=self.meta.version, name=self.meta.tag,  # type: ignore
-        )
-        if self.meta.metadata and new.meta and new.meta.metadata:
-            new.meta.metadata = copy.deepcopy(self.meta.metadata)
+        new = self._clone_metadata_only()
+        if new.meta is not None and new.meta.metadata is not None:
             channels = new.meta.metadata.get("omero", {}).get("channels", [])  # type: ignore
             for k in range(len(chans)):
                 if k < len(channels):
@@ -1514,6 +2152,17 @@ class Pyramid:
         if self.meta.metadata and new.meta and new.meta.metadata:
             new.meta.metadata = copy.deepcopy(self.meta.metadata)
             new.meta._pending_changes = True
+        # Elementwise ops are SHAPE-PRESERVING, so a deferred downscale plan (and the
+        # recorded storage chunks) stay valid on the transformed base: carry them
+        # forward. This lets `pyr.downscale(...).select_levels(...) ** 2 > 0.5` keep
+        # deferring - the op runs once on the finest kept level and the writer derives
+        # the coarser levels from it (the plan "floats" to the end of the pipeline).
+        plan = getattr(self, '_downscale_plan', None)
+        if plan is not None:
+            new._downscale_plan = dict(plan)
+        sc = getattr(self, '_storage_chunks', None)
+        if sc is not None:
+            new._storage_chunks = sc
         return new
 
     def _binary_op(self, other, func, reflected: bool = False) -> 'Pyramid':

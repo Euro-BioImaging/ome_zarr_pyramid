@@ -41,7 +41,7 @@ IO().write_pyramid(pyr, "copy.ome.zarr", overwrite=True)
 
 ### Everything is a `Pyramid`
 
-**Every operation returns a new `Pyramid`.** Selecting (`isel`, `sublevels`), the
+**Every operation returns a new `Pyramid`.** Selecting (`isel`, `select_levels`), the
 elementwise operators (`+ - * / > == & ~ …`), `downscale` and `rechunk` all produce a
 fresh, lazy `Pyramid`, with **all resolution levels and metadata preserved**, so they
 compose and chain naturally. Nothing is materialised until you `.compute()` an array or write
@@ -80,7 +80,8 @@ channel0_pyr = pyr.isel(c=0)                 # -> Pyramid: channel 0 (drops the 
 zrange_pyr   = pyr.isel(z=slice(10, 40))     # -> Pyramid: a z-range (scale/translation updated)
 frame_pyr    = pyr.isel(t=0, c=1)            # -> Pyramid: one timepoint, one channel
 
-top3_pyr     = pyr.sublevels(0, 2)           # -> Pyramid: resolution levels 0..2 (finest three)
+top3_pyr     = pyr.select_levels(0, 1, 2)    # -> Pyramid: the finest three resolution levels
+skip_pyr     = pyr.select_levels(0, 2, 4)    # -> Pyramid: an arbitrary (non-contiguous) subset
 ```
 
 `isel` is xarray-style: an **int** selects one position and drops that axis, a
@@ -176,3 +177,17 @@ IO().write_pyramid(pyr, "https://s3.example.com/bucket/out.ome.zarr")  # needs [
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+```python
+pyr = Pyramid().from_arrays(
+  [lvl0],
+  axis_order = 'zyx',
+  ...
+)
+pyr_full = pyr.downscale(n_layers = 8)
+pyr_subset = pyr_full.select_levels(range(3, 8))   # levels 3..7 (contiguous run)
+pyr_subset_computed = (pyr_subset ** 2) > 0.5
+IO().write_pyramid(pyr_subset_computed, "out.ome.zarr")
+
+```

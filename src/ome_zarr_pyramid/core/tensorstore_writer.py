@@ -160,6 +160,30 @@ def _create_zarr_array(
     )
 
 
+def create_group_array(group, name, shape, chunks, dtype, zarr_format,
+                       compressor_config=None, dimension_names=None):
+    """Create a zarr array as a child of `group`, so it inherits the group's store
+    (works for a LOCAL group or one backed by an fsspec/s3fs mapping - the basis of
+    the remote write path). Verified for zarr v2 and v3."""
+    dtype = _normalize_dtype(dtype, None)
+    shape = tuple(int(s) for s in shape)
+    chunks = tuple(int(min(s, c)) for s, c in zip(shape, chunks))
+    kwargs = dict(name=str(name), shape=shape, chunks=chunks, dtype=dtype, overwrite=True)
+    # match the LOCAL writer's chunk-key separator (DEFAULT_DIMENSION_SEPARATOR = '/').
+    # zarr v2 defaults to '.'; `create_array` takes no `dimension_separator`, so set it
+    # via chunk_key_encoding. v3 already uses '/' by default.
+    if zarr_format == ZARR_V2:
+        kwargs['chunk_key_encoding'] = {'name': 'v2',
+                                        'configuration': {'separator': DEFAULT_DIMENSION_SEPARATOR}}
+    if zarr_format == ZARR_V3 and dimension_names is not None:
+        kwargs['dimension_names'] = list(dimension_names)
+    if compressor_config is not None:
+        c = compressor_config.build(zarr_format=zarr_format)
+        if c is not None:
+            kwargs['compressors'] = [c]
+    return group.create_array(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Shared write helpers
 # ---------------------------------------------------------------------------
@@ -309,8 +333,33 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
     return tuple(region_arr.tolist())
 
 
+# s3fs storage options applied to every https:// store (e.g. {'anon': True} for a
+# public/anonymous bucket, or {'key':..., 'secret':...}). Configure once via
+# `set_s3_storage_options(...)` (also settable through `write_pyramid(storage_options=...)`).
+_S3_STORAGE_OPTIONS: dict = {}
+
+
+def set_s3_storage_options(**options) -> None:
+    """Set the s3fs storage options used for all subsequent https:// reads/writes.
+
+    Examples: ``set_s3_storage_options(anon=True)`` for a public/anonymous-write
+    bucket; ``set_s3_storage_options(key=..., secret=...)`` for explicit credentials.
+    Call with no arguments to clear (back to the default credential chain).
+    """
+    global _S3_STORAGE_OPTIONS
+    _S3_STORAGE_OPTIONS = dict(options)
+
+
+def get_s3_storage_options() -> dict:
+    return dict(_S3_STORAGE_OPTIONS)
+
+
 def wrap_output_path(output_path: str):
-    """Resolve an output path to a local filesystem path or an s3fs mapping."""
+    """Resolve an output path to a local filesystem path or an s3fs mapping.
+
+    For an ``https://`` path, s3fs storage options from `set_s3_storage_options`
+    (e.g. ``anon=True``) are applied; the endpoint is taken from the URL host.
+    """
     if output_path.startswith('https://'):
         try:
             import s3fs
@@ -320,14 +369,15 @@ def wrap_output_path(output_path: str):
                 "pip install 'ome_zarr_pyramid[s3]'"
             ) from e
         endpoint_url = 'https://' + output_path.replace('https://', '').split('/')[0]
-        relpath = output_path.replace(endpoint_url, '')
-        fs = s3fs.S3FileSystem(
-            client_kwargs={
-                'endpoint_url': endpoint_url,
-            },
-            endpoint_url=endpoint_url
-        )
-        fs.makedirs(relpath, exist_ok=True)
+        # 'bucket/key/...': strip the endpoint AND the leading slash (s3fs paths are
+        # bucket-relative, no leading '/').
+        relpath = output_path[len(endpoint_url):].lstrip('/')
+        opts = dict(_S3_STORAGE_OPTIONS)
+        client_kwargs = {'endpoint_url': endpoint_url, **opts.pop('client_kwargs', {})}
+        fs = s3fs.S3FileSystem(endpoint_url=endpoint_url, client_kwargs=client_kwargs, **opts)
+        # NOTE: do NOT makedirs here - S3 has no real directories, and
+        # makedirs(create_parents=True) would try to CREATE THE BUCKET (needs perms /
+        # fails on an existing public bucket). Zarr creates the objects on write.
         mapped = fs.get_mapper(relpath)
     else:
         os.makedirs(output_path, exist_ok=True)

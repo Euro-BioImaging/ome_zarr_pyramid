@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.0.5"
+version = "0.0.6"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 requires-python = ">=3.8"
