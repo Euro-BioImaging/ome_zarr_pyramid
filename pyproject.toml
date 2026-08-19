@@ -4,18 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.0.6"
+version = "0.0.7"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
-requires-python = ">=3.8"
-authors = [ { name = "Bugra Özdemir", email = "bugraa.ozdemir@gmail.com" } ]
+# 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
+# optional dyna backend needs dyna-zarr, which is 3.11+.
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Bugra Oezdemir", email = "bugraa.ozdemir@gmail.com"},
+]
 keywords = [
     "ome-zarr", "ome", "ngff", "zarr", "pyramid", "multiscale", "image-pyramid",
     "bioimage", "bioimaging", "microscopy", "image-processing",
     "dask", "tensorstore", "out-of-core", "lazy",
 ]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Science/Research",
@@ -24,14 +33,29 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
     "Topic :: Scientific/Engineering :: Visualization",
 ]
+# Every one of these is imported at MODULE LOAD, so the package is unimportable without
+# it. They were missing until a clean-venv install check caught them: a dev environment
+# happened to provide them, so both the test suite and `twine check` stayed green while
+# `pip install ome_zarr_pyramid` produced something that raised ModuleNotFoundError on
+# `import`.
 dependencies = [
     "zarr",
     "dask",
     "tensorstore",
+    "numpy",
+    "numcodecs",          # utils/metadata_utils.py (blosc thread config)
+    "pydantic>=2",        # utils/compressor_config.py (ConfigDict/field_validator = v2)
+    "scikit-image",       # utils/metadata_utils.py (transform)
+    "joblib",             # utils/metadata_utils.py (Parallel)
 ]
 
 [project.optional-dependencies]
 s3 = ["s3fs"]
+# The dyna backend: `Pyramid.dynamic_arrays` and the memory-bounded write path in
+# `IO.write_pyramid(backend="dyna")`. Imported lazily at each call site, so a plain
+# install stays light. Pinned >=0.0.5 because 0.0.4 is YANKED (its wheel omitted the
+# dyna_zarr.operations subpackage and could not be imported at all).
+dyna = ["dyna-zarr>=0.0.6"]
 
 [project.urls]
 Homepage = "https://github.com/Euro-BioImaging/ome_zarr_pyramid"

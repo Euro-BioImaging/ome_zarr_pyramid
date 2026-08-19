@@ -677,7 +677,13 @@ class PyramidIO:
         """Write a dyna_zarr-backed pyramid: each level is streamed to disk via
         dyna_zarr.io.write (memory-bounded), then the shared NGFF group metadata is written.
         Local stores only for now."""
-        from dyna_zarr import io as dyna_io
+        try:
+            from dyna_zarr import io as dyna_io
+        except ImportError as e:  # pragma: no cover - optional backend
+            raise ImportError(
+                "the 'dyna' write backend requires the optional dyna-zarr package: "
+                "pip install 'ome_zarr_pyramid[dyna]'"
+            ) from e
         path = Path(path) if isinstance(path, str) else path
         zf = pyramid.meta.zarr_format
         zarr_group = tensorstore_writer._zarr_group(str(path), overwrite=overwrite, zarr_format=zf)

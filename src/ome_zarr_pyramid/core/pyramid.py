@@ -832,6 +832,36 @@ class LabelCollection(Mapping):
         return f"LabelCollection({self.names})"
 
 
+class _TensorStoreArrayAdapter:
+    """ndarray-like view over a TensorStore, with a NUMPY dtype.
+
+    `da.from_array` only needs shape/dtype/ndim/__getitem__, but a raw TensorStore reports
+    a tensorstore dtype that numpy cannot interpret. This presents the same data with
+    `np.dtype`, so the array participates in dask normally.
+    """
+
+    __slots__ = ("_ts", "_dtype")
+
+    def __init__(self, ts_array, np_dtype):
+        self._ts = ts_array
+        self._dtype = np_dtype
+
+    @property
+    def shape(self):
+        return tuple(self._ts.shape)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def ndim(self):
+        return len(self._ts.shape)
+
+    def __getitem__(self, key):
+        return np.asarray(self._ts[key].read().result())
+
+
 class Pyramid:
     """NGFF-compliant image pyramid supporting multiple array storage modes.
     
@@ -1091,7 +1121,20 @@ class Pyramid:
 
     @property
     def dask_arrays(self) -> Dict[str, da.Array]:
-        """Get all layers as dask arrays."""
+        """Get all layers as dask arrays - the counterpart to `dynamic_arrays`.
+
+        A dyna ``DynamicArray`` layer RAISES rather than being converted. There is no lazy
+        dask view of a pull-model chain, so the only way to produce a dask array from one is
+        to materialize the whole level - a silent, unbounded read triggered by nothing more
+        than touching this property. Refusing keeps the failure at the call site, where the
+        caller can pick `dynamic_arrays` (stay lazy) or write the pyramid first (then the
+        layers are zarr-backed and this is lazy again).
+
+        Passing it through unchanged - the older behaviour - was worse still: the property
+        lied about its return type, and callers that reasonably assumed dask failed far
+        away, e.g. `AttributeError: 'numpy.int32' object has no attribute 'compute'` from
+        `labels.max().compute()` inside a measurement pass.
+        """
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
         result = {}
@@ -1099,9 +1142,65 @@ class Pyramid:
             arr = self.layers[path]
             if isinstance(arr, zarr.Array):
                 result[str(path)] = da.from_zarr(arr)
+            elif isinstance(arr, da.Array):
+                result[str(path)] = arr
+            elif hasattr(arr, "_with_transform"):        # dyna DynamicArray
+                raise TypeError(
+                    f"layer {path!r} is a dyna DynamicArray; `dask_arrays` would have to "
+                    f"materialize the whole level to produce a dask array. Use "
+                    f"`dynamic_arrays` to stay lazy on the dyna backend, or write the "
+                    f"pyramid and read it back (zarr layers convert lazily)."
+                )
+            elif hasattr(arr, "read") and hasattr(arr, "spec"):
+                # A TensorStore layer (the eager `downscale(defer=False)` path builds
+                # these). Its `.dtype` is a tensorstore dtype that `np.dtype()` cannot
+                # interpret, and `da.from_array` normalizes chunks from `arr.dtype` BEFORE
+                # looking at any `meta=`, so it raises
+                # "Cannot interpret dtype("int32") as a data type". Give dask a numpy view
+                # of the dtype by declaring the chunks and dtype explicitly.
+                np_dtype = np.dtype(arr.dtype.numpy_dtype)
+                result[str(path)] = da.from_array(
+                    _TensorStoreArrayAdapter(arr, np_dtype), chunks="auto")
             else:
-                result[str(path)] = arr  # type: ignore
+                result[str(path)] = da.from_array(arr)
         return result
+
+    @property
+    def supports_dyna(self) -> bool:
+        """True if `dynamic_arrays` would succeed - i.e. the dyna backend is usable here.
+
+        Two independent conditions, both required:
+
+        1. the optional ``dyna_zarr`` package is importable, and
+        2. every layer is something ``DynamicArray`` can wrap: zarr-backed, an in-memory
+           ``numpy`` array, or already a ``DynamicArray``. A **dask** layer cannot be -
+           dyna is a pull-model backend and does not consume dask graphs - so a
+           dask-backed pyramid is dask-only and ``dynamic_arrays`` raises ``TypeError``.
+
+        Note a numpy-backed layer is already fully resident, so ops over it are bounded by
+        the ARRAY, not by the read region: dyna's memory-boundedness guarantee only holds
+        for the zarr-backed case.
+
+        Cheap and side-effect free: it inspects layer types without building anything, so
+        callers offering ``backend="auto"`` can probe it per call rather than guarding a
+        heavy property with try/except.
+
+        Distinct from ``io._is_dyna_pyramid``, which asks whether the layers ALREADY are
+        DynamicArrays (to pick the write path). This asks whether they COULD be.
+        """
+        if self.meta is None:
+            return False
+        try:
+            from dyna_zarr import DynamicArray
+        except ImportError:
+            return False
+        try:
+            layers = [self.layers[path] for path in self.meta.resolution_paths]
+        except Exception:
+            return False
+        return bool(layers) and all(
+            isinstance(arr, (DynamicArray, zarr.Array, np.ndarray)) for arr in layers
+        )
 
     @property
     def dynamic_arrays(self) -> Dict[str, 'DynamicArray']:
@@ -1119,19 +1218,24 @@ class Pyramid:
             from dyna_zarr import DynamicArray
         except ImportError as e:  # pragma: no cover - optional backend
             raise ImportError(
-                "dynamic_arrays requires the optional 'dyna_zarr' package"
+                "dynamic_arrays requires the optional dyna-zarr package: "
+                "pip install 'ome_zarr_pyramid[dyna]'"
             ) from e
         result = {}
         for path in self.meta.resolution_paths:
             arr = self.layers[path]
             if isinstance(arr, DynamicArray):
                 result[str(path)] = arr
-            elif isinstance(arr, zarr.Array):
+            elif isinstance(arr, (zarr.Array, np.ndarray)):
+                # numpy is wrappable, but note it is already resident: the pull model gives
+                # laziness and op fusion here, not memory-boundedness.
                 result[str(path)] = DynamicArray(arr)
             else:
                 raise TypeError(
-                    f"layer {path!r} is a {type(arr).__name__}; the dyna_zarr backend needs a "
-                    f"zarr-backed or DynamicArray layer (cannot wrap an in-memory dask/numpy array)"
+                    f"layer {path!r} is a {type(arr).__module__}.{type(arr).__name__}; the "
+                    f"dyna backend needs a zarr-backed, numpy or DynamicArray layer. A dask "
+                    f"layer cannot be wrapped (dyna does not consume dask graphs) - use "
+                    f"backend='dask', or write the pyramid and read it back."
                 )
         return result
 
@@ -1770,8 +1874,12 @@ class Pyramid:
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
         paths = self.meta.resolution_paths
+        # Reuse the EXISTING layer objects: this clone is metadata-only, so converting
+        # through `dask_arrays` would be pointless work - and it refuses a dyna layer
+        # rather than materializing it, which would break `add_image_label` on a
+        # dyna-backed label pyramid.
         new = Pyramid().from_arrays(
-            [self.dask_arrays[p] for p in paths], axis_order=self.meta.axis_order,  # type: ignore
+            [self.layers[p] for p in paths], axis_order=self.meta.axis_order,  # type: ignore
             unit_list=self.meta.unit_list, scales=[self.meta.get_scale(p) for p in paths],  # type: ignore
             version=self.meta.version, name=self.meta.tag,  # type: ignore
         )

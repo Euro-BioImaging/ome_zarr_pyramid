@@ -41,3 +41,37 @@ def test_axis_order_variants(make_pyramid):
 def test_layers_property(pyr3d):
     pyr, _ = pyr3d
     assert set(pyr.layers) == {"0"}
+
+
+def test_dask_arrays_refuses_dyna_layers(tmp_path):
+    """`dask_arrays` must REFUSE a dyna layer rather than materialize the level.
+
+    There is no lazy dask view of a pull-model chain, so converting one means reading the
+    whole level - a silent, unbounded cost triggered by touching a property. Callers should
+    use `dynamic_arrays`, or write the pyramid first (zarr layers convert lazily).
+    """
+    import numpy as np
+    import pytest
+    from ome_zarr_pyramid import IO, Pyramid
+
+    pytest.importorskip("dyna_zarr")
+    data = (np.arange(8 * 16 * 16) % 7).reshape(1, 1, 8, 16, 16).astype("int32")
+    path = tmp_path / "src.zarr"
+    IO().write_pyramid(Pyramid().from_array(data, scale=[1, 1, 1, 1, 1]),
+                       str(path), overwrite=True)
+    disk = IO().read_pyramid(str(path))
+
+    # zarr layers: lazy, no error
+    assert disk.dask_arrays["0"].shape == data.shape
+
+    # a pyramid actually BUILT from DynamicArray layers -> refused
+    # (`.layers` returns a fresh dict, so assigning into it would not stick)
+    dyna_pyr = Pyramid().from_arrays(
+        [disk.dynamic_arrays[p] for p in disk.meta.resolution_paths],
+        axis_order=disk.meta.axis_order,
+        unit_list=disk.meta.unit_list,
+        scales=[disk.meta.get_scale(p) for p in disk.meta.resolution_paths],
+    )
+    assert type(dyna_pyr.layers["0"]).__name__ == "DynamicArray"
+    with pytest.raises(TypeError, match="DynamicArray"):
+        dyna_pyr.dask_arrays
