@@ -40,7 +40,10 @@ def test_deferred_downscale_expands_on_write(make_pyramid, zarr_path):
     are materialized only when the pyramid is written."""
     pyr, _ = make_pyramid(shape=(2, 64, 64), axis_order="cyx", scales=[[1.0, 1.0, 1.0]])
     planned = pyr.downscale(n_layers=3, defer=True)
-    assert planned.nlayers == 1                         # nothing built yet
+    # levels are VISIBLE (resolved lazily) while the pixel derivation stays deferred:
+    # the writer still streams level 0 once and builds the rest from the on-disk base.
+    assert planned.nlayers == 3
+    assert getattr(planned, "_downscale_plan", None) is not None
 
     IO().write_pyramid(planned, zarr_path, overwrite=True)
     back = IO().read_pyramid(zarr_path)

@@ -506,7 +506,9 @@ class PyramidIO:
         if remote:
             if storage_options is not None:   # e.g. {'anon': True} for a public bucket
                 tensorstore_writer.set_s3_storage_options(**storage_options)
-            if getattr(pyramid, '_downscale_plan', None) is not None and layers is None:
+            if (getattr(pyramid, '_downscale_plan', None) is not None
+                    and getattr(pyramid, '_downscale_plan_active', False)
+                    and layers is None):
                 raise NotImplementedError(
                     "writing a DEFERRED downscale() pyramid to a remote store is not "
                     "supported (it re-reads the base from the store; S3 read is not "
@@ -537,7 +539,20 @@ class PyramidIO:
         # only level 0 plus a plan; expand it PROGRESSIVELY FROM DISK so an expensive
         # lazy base is computed once, not re-run per output level. (Skip when a
         # specific `layers` subset is requested - that path is used internally here.)
+        # THE PLAN WINS. A pyramid can carry both real levels and a plan, because ops
+        # propagate the plan across every level they transform. When both are present the
+        # plan is the more recent intent - it says what the pyramid should become - so it
+        # is applied and the pre-existing coarser levels are rebuilt from the base. (The
+        # plan path writes level 0 and re-reads it to expand the rest, so it narrows to
+        # the base itself; feeding it several levels used to make it look for a level it
+        # had not written yet - `KeyError: '1'`.)
+        # Only an ACTIVE plan is written. A plan inherited through an op is DORMANT: it
+        # records what the source's levels were (factors, shapes, count) but commits to
+        # nothing, so an op chain does not silently produce levels the caller never asked
+        # for. `Pyramid.downscale()` activates it - that is what asking looks like.
         plan = getattr(pyramid, '_downscale_plan', None)
+        if plan is not None and not getattr(pyramid, '_downscale_plan_active', False):
+            plan = None
         if plan is not None and layers is None:
             self._write_with_plan(
                 pyramid, path, plan, overwrite=overwrite,
@@ -765,10 +780,17 @@ class PyramidIO:
                 return p.rechunk()
             return p
 
-        # 1) write base only (rechunked to storage chunks), plan removed to avoid recursion
+        # 1) write base only (rechunked to storage chunks), plan removed to avoid recursion.
+        # NARROW to level 0 first: the pyramid may still carry coarser levels (ops
+        # propagate the plan across all of them), and writing with `layers=[base]` alone
+        # would leave the group metadata advertising levels that were never written, so
+        # the re-read in step 2 fails with `KeyError`. The plan rebuilds those levels.
         saved = pyramid.__dict__.pop('_downscale_plan', None)
         try:
-            base = _rechunked(pyramid)
+            source = (pyramid.select_levels(base_path0)
+                      if len(pyramid.meta.resolution_paths) > 1 else pyramid)
+            source.__dict__.pop('_downscale_plan', None)
+            base = _rechunked(source)
             self.write_pyramid(base, path, layers=[base_path0], overwrite=overwrite, **write_kwargs)
         finally:
             if saved is not None:
@@ -796,9 +818,42 @@ class PyramidIO:
         base_da = disk.dask_arrays[disk.meta.resolution_paths[0]]
         ndim = base_da.ndim
         level_arrays = [base_da]
+        # Per-level factors, SOLVED against each target shape rather than rounded from
+        # the ratio. `round(base/tgt)` silently produced an off-by-one level whenever the
+        # rounded ratio did not actually reproduce `tgt` (e.g. base=101 tgt=50), and it
+        # cannot express an irregular progression at all. `_solve_axis_factor` verifies.
+        from ome_zarr_pyramid.utils.scale import _solve_axis_factor, _level_size
+        dmethod = plan.get('downscale_method', 'simple')
+        planned = plan.get('level_scale_factors')
+        pshapes = plan.get('level_shapes')
         for i in range(1, len(fpaths)):
-            tgt = full.dask_arrays[fpaths[i]].shape
-            factor = tuple(max(1, int(round(base_da.shape[a] / tgt[a]))) for a in range(ndim))
+            # When the plan carries DERIVED per-level factors, they - not the shapes
+            # `downscale(defer=False)` regenerates - are authoritative. That expansion
+            # applies one `scale_factor` repeatedly, so it cannot reproduce an irregular
+            # or anisotropic progression (base 64 with levels 64/32 -> level 2 factor
+            # (2,4,4), which `scale_factor**2` renders as (1,1,64,16,16)).
+            if planned is not None and i < len(planned):
+                factor = tuple(int(f) for f in planned[i])
+                tgt = (tuple(pshapes[i]) if pshapes is not None and i < len(pshapes)
+                       else tuple(_level_size(base_da.shape[a], factor[a], dmethod)
+                                  for a in range(ndim)))
+            else:
+                tgt = full.dask_arrays[fpaths[i]].shape
+                solved = [_solve_axis_factor(base_da.shape[a], tgt[a], dmethod)
+                          for a in range(ndim)]
+                factor = tuple(int(f) if f is not None
+                               else max(1, int(round(base_da.shape[a] / tgt[a])))
+                               for a, f in enumerate(solved))
+            got = tuple(_level_size(base_da.shape[a], factor[a], dmethod) for a in range(ndim))
+            if got != tuple(tgt):
+                raise ValueError(
+                    f"cannot reproduce level {i} of the downscale plan exactly: "
+                    f"base {tuple(base_da.shape)} with factor {factor} gives {got}, "
+                    f"but the plan requires {tuple(tgt)}. No integer downscale factor "
+                    f"maps the base to that shape under method '{dmethod}' (no backend "
+                    f"accepts a target shape). Re-plan with .downscale(...) or use "
+                    f"drop_downscale_plan()."
+                )
             level_arrays.append(method(base_da, scale_factor=factor))
 
         unit_clean = [u for u in full.meta.unit_list if u is not None]

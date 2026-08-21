@@ -1,0 +1,104 @@
+name: Tests
+
+# Runs the test suite on every push and pull request to the main branches, and
+# can be kicked off by hand from the Actions tab.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  # A new push to the same branch cancels an in-flight run for it.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every Python the package claims support for (requires-python >=3.11).
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          # This package is developed on Windows, and the store/path handling has hit
+          # platform-specific issues before (chunk-alignment PermissionError on the
+          # local zarr store; a drive letter parsed as a URL scheme).
+          - os: windows-latest
+            python-version: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v -o addopts=""
+
+  install-check:
+    # Builds the wheel, installs it into a CLEAN venv from OUTSIDE the repo, and runs the
+    # suite against the RESOLVED PyPI dependencies. The job above uses `-e .`, which tests
+    # the SOURCE TREE, so two whole classes of release bug are invisible there:
+    #   - a module missing from the wheel (dyna-zarr 0.0.4 shipped UNIMPORTABLE this way,
+    #     with green CI, and had to be yanked);
+    #   - an UNDECLARED dependency (this package went a release without declaring
+    #     pydantic/numpy/numcodecs/scikit-image/joblib - they were simply present in the
+    #     dev environment).
+    # `twine check` catches neither: it validates metadata, not resolution.
+    name: Wheel installs and tests pass on resolved deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Build, install into a clean venv, run the suite
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/python -m pip install --upgrade pip
+          /tmp/fresh/bin/python -m pip install "$(ls dist/*.whl)[dev]" pytest
+          # Import every shipped subpackage explicitly - the check that catches a wheel
+          # whose `packages` list quietly omitted one.
+          cd /tmp && /tmp/fresh/bin/python -c "
+          import ome_zarr_pyramid, ome_zarr_pyramid.core, ome_zarr_pyramid.utils
+          from ome_zarr_pyramid import Pyramid, IO
+          print('ome_zarr_pyramid', ome_zarr_pyramid.__version__, 'imports cleanly from the wheel')
+          "
+          # copy the tests out: running from the repo root would put ./src back on
+          # sys.path and defeat the point of installing the wheel
+          cp -r "$GITHUB_WORKSPACE/tests" /tmp/wheel_tests
+          cd /tmp && /tmp/fresh/bin/python -m pytest /tmp/wheel_tests -v -o addopts=""
+
+  lint:
+    name: Package metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Build and check the distribution
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*

@@ -6,7 +6,7 @@ import itertools
 import os
 from fractions import Fraction
 from math import gcd, lcm
-from typing import Union, Optional, Dict, Any, Tuple, Callable
+from typing import Union, Optional, Dict, Any, Tuple, Callable, Sequence, List
 
 import dask.array as da
 import numpy as np
@@ -476,8 +476,13 @@ class Downscaler:
             self.base_array_root = None
             if isinstance(self.array, da.Array):
                 array_obj = self.array
+            elif isinstance(self.array, np.ndarray):
+                # A real numpy array is NOT a Delayed: `from_delayed` looked for `.key`
+                # and raised `AttributeError: 'numpy.ndarray' object has no attribute
+                # 'key'`, so downscaling an in-memory Pyramid failed outright.
+                array_obj = da.from_array(self.array, chunks=self.output_chunks or 'auto')
             else:
-                # Convert to dask if it's a numpy array or other type
+                # A dask Delayed (or anything else exposing shape/dtype).
                 array_obj = da.from_delayed(self.array, shape=self.array.shape, dtype=self.array.dtype)  # type: ignore
 
         self.param_names = ['array', 'scale_factor', 'n_layers', 'scale', 'output_chunks', 'backend', 'downscale_method', 'smart_scale_factor']
@@ -588,3 +593,98 @@ class Downscaler:
                 logger.warning(f"The given parameter name '{key}' is not valid, ignoring it..")
         await self.run()
         return self
+
+
+# --- deriving a downscale plan from an EXISTING pyramid's levels ---------------------
+#
+# `scale_factor=None` used to mean "assume 2 on z/y/x". That silently rewrote any source
+# whose levels were not built that way. These helpers instead SOLVE for the factors the
+# source actually used, and refuse rather than guess.
+#
+# The hard constraint: no backend accepts a target shape. `ts.downsample`, stride slicing
+# and `da.coarsen` all take integer FACTORS, and the level shape is whatever that
+# produces. So a level is reproducible only if some integer factor maps base -> it under
+# the rounding rule of the chosen method. `(10,10) -> (7,7)` is not reachable by any
+# factor and must fail loudly.
+#
+# Rounding differs by method and decides reachability on odd axes:
+#     base=101 f=2  ->  stride/ts: 51 (ceil)   coarsen(mean/median): 50 (floor)
+
+def _level_size(base: int, factor: int, downscale_method: str = 'simple') -> int:
+    """Size `downscale_method` yields for one axis. Mirrors the executors exactly."""
+    if factor <= 1:
+        return base
+    if downscale_method in ('mean', 'median'):
+        return max(1, base // factor)          # da.coarsen(trim_excess=True) -> floor
+    return max(1, -(-base // factor))          # stride / ts.downsample       -> ceil
+
+
+def _solve_axis_factor(base: int, target: int, downscale_method: str = 'simple') -> Optional[int]:
+    """Smallest integer factor with `_level_size(base, f) == target`, else None.
+
+    Searched rather than derived: `ceil(base/f)` is not invertible from a rounded ratio
+    (base=101 target=50 has NO ceil solution, while target=51 has one), so the rounded
+    ratio is only a starting guess and every candidate must be verified.
+    """
+    if target <= 0 or target > base:
+        return None
+    if target == base:
+        return 1
+    guess = max(1, int(round(base / target)))
+    for f in range(max(1, guess - 2), guess + 3):     # solutions are contiguous & tight
+        if _level_size(base, f, downscale_method) == target:
+            return f
+    return None
+
+
+def derive_scale_factors(shapes: Sequence[Sequence[int]],
+                         downscale_method: str = 'simple'
+                         ) -> Optional[List[Tuple[int, ...]]]:
+    """Per-level integer factors (relative to base) reproducing `shapes` EXACTLY.
+
+    Returns one tuple per level including level 0 (all ones), or None when any level is
+    unreachable - an irregular progression is fine (levels need not share a factor), but
+    a level no integer factor can produce is not.
+
+    Verified, not merely solved: the derived factors are applied back and the resulting
+    shapes compared to `shapes`, so a caller that trusts the result cannot be handed a
+    pyramid that is a voxel off.
+    """
+    if not shapes:
+        return None
+    base = tuple(int(s) for s in shapes[0])
+    factors: List[Tuple[int, ...]] = [tuple(1 for _ in base)]
+    for level in shapes[1:]:
+        level = tuple(int(s) for s in level)
+        if len(level) != len(base):
+            return None
+        solved = [_solve_axis_factor(b, t, downscale_method) for b, t in zip(base, level)]
+        if any(f is None for f in solved):
+            return None
+        factor = tuple(int(f) for f in solved)  # type: ignore[arg-type]
+        if tuple(_level_size(b, f, downscale_method)
+                 for b, f in zip(base, factor)) != level:
+            return None                          # verification: must round-trip
+        factors.append(factor)
+    return factors
+
+
+def derive_downscale_plan(shapes: Sequence[Sequence[int]],
+                          downscale_method: str = 'simple') -> Optional[dict]:
+    """Plan fields describing `shapes`, or None if they cannot be reproduced.
+
+    `None` is the signal to WARN and fall back to building a fresh plan; it never means
+    "close enough".
+    """
+    if len(shapes) < 2:
+        return None
+    factors = derive_scale_factors(shapes, downscale_method)
+    if factors is None:
+        return None
+    return {
+        'n_layers': len(shapes),
+        'scale_factor': factors[1] if len(factors) > 1 else None,
+        'level_scale_factors': factors,
+        'level_shapes': [tuple(int(s) for s in sh) for sh in shapes],
+        'downscale_method': downscale_method,
+    }

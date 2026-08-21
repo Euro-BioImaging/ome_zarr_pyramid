@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.0.7"
+version = "0.0.8"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 # 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
@@ -43,10 +43,8 @@ dependencies = [
     "dask",
     "tensorstore",
     "numpy",
-    "numcodecs",          # utils/metadata_utils.py (blosc thread config)
+    "numcodecs",          # utils/compressor_config.py, core/pyramid.py (codec configs)
     "pydantic>=2",        # utils/compressor_config.py (ConfigDict/field_validator = v2)
-    "scikit-image",       # utils/metadata_utils.py (transform)
-    "joblib",             # utils/metadata_utils.py (Parallel)
 ]
 
 [project.optional-dependencies]
@@ -56,6 +54,12 @@ s3 = ["s3fs"]
 # install stays light. Pinned >=0.0.5 because 0.0.4 is YANKED (its wheel omitted the
 # dyna_zarr.operations subpackage and could not be imported at all).
 dyna = ["dyna-zarr>=0.0.6"]
+dev = [
+    "pytest>=7.0",
+    # The suite exercises the dyna paths (Pyramid.dynamic_arrays, supports_dyna,
+    # backend="dyna" writes); without this they would silently skip.
+    "dyna-zarr>=0.0.6",
+]
 
 [project.urls]
 Homepage = "https://github.com/Euro-BioImaging/ome_zarr_pyramid"

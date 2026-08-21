@@ -7,6 +7,7 @@ and full TensorStore integration for high-performance operations.
 
 import asyncio
 import copy
+import warnings
 import operator
 from collections.abc import Mapping
 from pathlib import Path
@@ -892,7 +893,13 @@ class Pyramid:
     def __repr__(self) -> str:
         """Return string representation of pyramid."""
         try:
-            return f"NGFF with {self.nlayers} layers."
+            n = self.nlayers
+            planned = getattr(self, '_downscale_plan', None)
+            if planned is not None:
+                # Say so explicitly: `nlayers` alone reads 1 on a planned pyramid, which
+                # looks like the levels were lost.
+                return f"NGFF with {n} layers (+ a deferred downscale plan)."
+            return f"NGFF with {n} layers."
         except (AttributeError, TypeError):
             return f"NGFF."
 
@@ -1354,6 +1361,61 @@ class Pyramid:
             new_pyr.meta._pending_changes = True
         return new_pyr
 
+    def drop_downscale_plan(self) -> 'Pyramid':
+        """Return a copy with any deferred downscale plan removed.
+
+        `downscale()` MERGES with a carried plan, so it cannot be used to clear one - and a
+        plan propagates across ops by design. This is the explicit way out: write only the
+        levels the pyramid actually has, ignoring what an upstream step intended.
+
+        A no-op (returns a copy) when there is no plan.
+        """
+        was_active = getattr(self, '_downscale_plan_active', False)
+        new = self._clone_metadata_only()
+        new.__dict__.pop('_downscale_plan', None)
+        new.__dict__.pop('_downscale_plan_active', None)
+        if was_active and len(new.meta.resolution_paths) > 1:
+            # An ACTIVE plan has already been expanded into visible levels, so removing
+            # the recipe alone would leave those levels behind and drop nothing. Narrow
+            # back to the base, which is what "write only what this pyramid really has"
+            # means for a pyramid whose levels came from a plan.
+            base = new.select_levels(new.meta.resolution_paths[0])
+            base.__dict__.pop('_downscale_plan', None)
+            base.__dict__.pop('_downscale_plan_active', None)
+            return base
+        return new
+
+    def derive_downscale_plan(self,
+                              downscale_method: str = 'simple',
+                              warn: bool = True) -> Optional[dict]:
+        """Plan reproducing THIS pyramid's existing levels exactly, or None.
+
+        Solves for the integer factor each level was built with, per level and per axis,
+        and verifies by applying them back. Returns None (with a warning) when the levels
+        cannot be reproduced - an irregular progression is fine, but a shape no integer
+        factor yields is not, because no backend accepts a target shape: `ts.downsample`,
+        stride slicing and `da.coarsen` all take FACTORS. `(10,10) -> (7,7)` is
+        unreachable, as is a floor-rounded odd level under a ceil-rounding method.
+
+        None means "no plan" - the caller should let the write path build a fresh one -
+        and never "close enough".
+        """
+        from ome_zarr_pyramid.utils.scale import derive_downscale_plan as _derive
+        if self.meta is None or len(self.meta.resolution_paths) < 2:
+            return None
+        shapes = [tuple(self.layers[p].shape) for p in self.meta.resolution_paths]
+        plan = _derive(shapes, downscale_method)
+        if plan is None and warn:
+            warnings.warn(
+                "could not derive a downscale plan from this pyramid's levels: "
+                f"{shapes} cannot be reproduced by any integer scale factor under "
+                f"method '{downscale_method}' (downscaling backends take factors, not "
+                "target shapes). Proceeding WITHOUT a plan; a write that needs coarser "
+                "levels will build a fresh one, whose shapes may differ from these.",
+                RuntimeWarning, stacklevel=2,
+            )
+        return plan
+
     def downscale(self,
                   n_layers: Optional[int] = None,
                   min_dimension_size: int = 64,
@@ -1402,8 +1464,16 @@ class Pyramid:
             Stop downscaling once the largest dimension reaches this size (used
             only when ``n_layers is None``). Default 64.
         scale_factor : sequence, optional
-            Per-axis stride between levels; defaults to 2 on z/y/x and 1 on
-            t/c (from ``defaults.scale_factor_map``).
+            Per-axis stride between levels. When omitted on a pyramid that ALREADY
+            has levels, it is DERIVED from those levels (per level and per axis) so
+            an anisotropic or irregular source round-trips unchanged, rather than
+            being forced to 2 on z/y/x. Derivation is verified by applying the
+            factors back; if the levels cannot be reproduced by any integer factor
+            (no backend accepts a target shape - `ts.downsample`, stride slicing and
+            `da.coarsen` all take factors), a RuntimeWarning is raised and the
+            defaults are used, which MAY change the level shapes. On a single-level
+            pyramid it defaults to 2 on z/y/x and 1 on t/c (from
+            ``defaults.scale_factor_map``). See ``derive_downscale_plan``.
         downscale_method : str
             'simple' (nearest/stride - correct for LABELS), 'mean', or 'median'.
         defer : bool
@@ -1414,8 +1484,16 @@ class Pyramid:
             the plan when deferred.
         """
         if defer:
-            # record the recipe; the writer expands it progressively from disk
-            self._downscale_plan = {
+            # Record the recipe; the writer expands it progressively from disk.
+            # MERGE with any plan already carried rather than replacing it: ops propagate
+            # a plan across a pipeline precisely so the intent survives, so the method
+            # named `downscale` must not be the one that silently discards it. Explicitly
+            # passed arguments win; omitted ones (left at their `None`/default) inherit.
+            # Consequences: a bare `.downscale()` on an already-planned pyramid is a no-op,
+            # `.downscale(n_layers=4)` keeps the carried `scale_factor`, and a pyramid with
+            # no plan gets one built from the defaults. Use `drop_downscale_plan()` to
+            # start over.
+            recipe = {
                 'n_layers': n_layers,
                 'min_dimension_size': min_dimension_size,
                 'scale_factor': scale_factor,
@@ -1423,7 +1501,57 @@ class Pyramid:
                 'backend': backend,
                 'smart_scale_factor': smart_scale_factor,
             }
-            return self
+            carried = getattr(self, '_downscale_plan', None)
+            if carried is not None and n_layers is None and carried.get('n_layers'):
+                # Activating a DORMANT plan with no arguments: adopt the level count it
+                # derived from the source, so `.downscale()` means "give me the levels my
+                # source had" rather than recomputing from min_dimension_size.
+                recipe['n_layers'] = carried['n_layers']
+            if carried is not None:
+                defaults = {'n_layers': None, 'min_dimension_size': 64,
+                            'scale_factor': None, 'downscale_method': 'simple',
+                            'backend': 'numpy', 'smart_scale_factor': None}
+                recipe = {k: (v if v != defaults[k] else carried.get(k, v))
+                          for k, v in recipe.items()}
+                # The derived per-level keys are not part of `recipe`'s own six fields,
+                # so the comprehension above would DROP them and the merged plan would
+                # fall back to a single repeated factor. Carry them, unless the caller
+                # named a scale_factor - which supersedes what was derived.
+                if scale_factor is None:
+                    for k in ('level_scale_factors', 'level_shapes'):
+                        if carried.get(k) is not None:
+                            recipe[k] = carried[k]
+            if len(self.meta.resolution_paths) > 1:
+                # The pyramid already HAS levels and the caller named no scale_factor:
+                # derive it from those levels instead of assuming 2 on z/y/x, so a
+                # source built with an anisotropic or irregular progression round-trips.
+                # Derivation is verified or refused - on refusal we keep the defaults and
+                # `derive_downscale_plan` has already warned that shapes may change.
+                if scale_factor is None and (carried is None
+                                             or carried.get('scale_factor') is None):
+                    derived = self.derive_downscale_plan(
+                        downscale_method=recipe.get('downscale_method', 'simple'))
+                    if derived is not None:
+                        recipe['scale_factor'] = derived['scale_factor']
+                        recipe['level_scale_factors'] = derived['level_scale_factors']
+                        recipe['level_shapes'] = derived['level_shapes']
+                        if n_layers is None and (carried is None
+                                                 or carried.get('n_layers') is None):
+                            recipe['n_layers'] = derived['n_layers']
+                # Asking to (re)downscale a pyramid that ALREADY has levels: narrow to
+                # level 0 first, so the plan describes the whole result. Leaving the old
+                # levels in place would make the plan unactionable - the writer builds the
+                # base and then expands from disk, so it must be handed a single level -
+                # and `write_pyramid` would fall back to writing the existing levels,
+                # silently ignoring the new recipe.
+                base = self.select_levels(self.meta.resolution_paths[0])
+                return base._materialize_plan(recipe)
+            # ACTIVATION. A dormant plan inherited from the source records what the
+            # source's levels were but commits to nothing; `downscale()` is what turns
+            # that record into levels. A bare `downscale()` therefore activates exactly
+            # what was derived (the source's own level count and per-axis factors) -
+            # explicit arguments override, having already been merged into `recipe`.
+            return self._materialize_plan(recipe)
         asyncio.run(self.update_downscaler(
             scale_factor=scale_factor,
             n_layers=n_layers,
@@ -1434,6 +1562,56 @@ class Pyramid:
             **kwargs,
         ))
         return self.get_downscaled_pyramid()
+
+    def _materialize_plan(self, recipe: dict) -> 'Pyramid':
+        """Expand `recipe` into VISIBLE lazy levels, keeping the plan for the writer.
+
+        A deferred plan used to be write-only state: `nlayers`, `resolution_paths`,
+        `layers` and the scales all reported a single level while a write emitted the
+        full stack. That is not laziness, it is a hidden disagreement between the object
+        and the store it produces.
+
+        Resolving the recipe into a full lazy pyramid costs ~3 ms and computes NOTHING
+        (measured on a 5-level 1200x1200 source), so the levels can simply be visible.
+        The coarser levels are lazy arrays derived from level 0 - dask `simple/mean/
+        median_downscale`, or a TensorStore `downsample` view for a zarr-backed base -
+        so reading a slice of one is a normal lazy read.
+
+        `_downscale_plan` is still carried, and the WRITER still uses it: writing streams
+        level 0 to the store once and derives the coarser levels from the ON-DISK base,
+        so an expensive lazy base is computed once rather than once per level. Pulling
+        pixels through a resolved coarse level instead re-runs the base graph - which is
+        why the plan, not these arrays, drives the write.
+        """
+        keys = ('n_layers', 'min_dimension_size', 'scale_factor',
+                'downscale_method', 'backend', 'smart_scale_factor')
+        dk = {k: recipe.get(k) for k in keys}
+        if dk.get('min_dimension_size') is None:
+            dk['min_dimension_size'] = 64
+        saved = self.__dict__.pop('_downscale_plan', None)
+        try:
+            full = self.downscale(defer=False, **dk)
+        except Exception as exc:
+            # Keep the pyramid usable (the plan still drives the write), but do NOT fail
+            # silently: this fallback once turned a hard `Downscaler` bug into a pyramid
+            # that quietly reported - and wrote - a single level.
+            if saved is not None:
+                self._downscale_plan = saved
+            self._downscale_plan = recipe
+            self._downscale_plan_active = True
+            warnings.warn(
+                f"could not expand the downscale plan into levels ({type(exc).__name__}: "
+                f"{exc}); the pyramid still reports its existing levels, and the plan "
+                f"will be applied at write time.",
+                RuntimeWarning, stacklevel=3,
+            )
+            return self
+        full._downscale_plan = recipe
+        full._downscale_plan_active = True
+        sc = getattr(self, '_storage_chunks', None)
+        if sc is not None:
+            full._storage_chunks = sc
+        return full
 
     def _resolve_level_chunks(self, chunk_shape, chunk_size_mb, level, shape, axes, dtype):
         """Per-axis chunk tuple for one level, capped at `shape`."""
@@ -1894,6 +2072,11 @@ class Pyramid:
             new._storage_chunks = sc
         # metadata-only edits keep the geometry, so the attached labels stay valid
         new._labels = dict(self._labels)
+        of = getattr(self, '_object_features', None)
+        if of is not None:
+            # ride along with `_labels`: metadata-only edits (rename/set_channels/...)
+            # are shape-preserving, so the measurements stay valid.
+            new._object_features = of
         return new
 
     # ------------------------------------------------------------------
@@ -1907,6 +2090,41 @@ class Pyramid:
         image that has a ``labels/`` group, or by `add_image_label`. Empty for a
         plain in-memory pyramid."""
         return LabelCollection(self._labels)
+
+    @property
+    def object_features(self):
+        """Per-object measurements attached to this label image, or None.
+
+        Set by `set_image_label(object_features=...)` - e.g. what
+        `pyrametric.label_pyramid(..., properties=True)` measures for free during the
+        labeling pass. Returns that object unchanged (duck-typed; typically a
+        `pyrametric.ObjectFeatures` with `.table`, `.to_frame()`, `.filter_by_size()`).
+
+        On a pyramid read back from a store there is no in-memory handle, so this
+        RECONSTRUCTS one from the NGFF `image-label.properties` block (via
+        `pyrametric.object_features.features_from_pyramid`) and caches it - far cheaper
+        than re-measuring the volume, and exact for what this package wrote. Returns
+        None when there is neither a handle nor such metadata, or when pyrametric is not
+        installed; use `pyrametric.extract_features` to measure features that were never
+        written.
+        """
+        of = getattr(self, '_object_features', None)
+        if of is not None:
+            return of
+        md = (self.meta.metadata if self.meta is not None else None) or {}
+        if not (md.get('image-label') or {}).get('properties'):
+            return None
+        try:
+            # Optional dependency, imported lazily: ozp does not depend on the labels
+            # package (`set_image_label(object_features=...)` is duck-typed for the same
+            # reason). Without it, the metadata is still there to read directly.
+            from pyrametric.object_features import features_from_pyramid
+        except ImportError:
+            return None
+        of = features_from_pyramid(self)
+        if of is not None:
+            self._object_features = of
+        return of
 
     def _resolve_label_name(self, image_label: 'Pyramid', name: Optional[str]) -> str:
         if name is not None:
@@ -1970,6 +2188,11 @@ class Pyramid:
 
         new = self._clone_metadata_only()
         new._labels = dict(self._labels)
+        of = getattr(self, '_object_features', None)
+        if of is not None:
+            # ride along with `_labels`: metadata-only edits (rename/set_channels/...)
+            # are shape-preserving, so the measurements stay valid.
+            new._object_features = of
         new._labels[label_name] = label
         return new
 
@@ -2053,6 +2276,14 @@ class Pyramid:
             if properties is None:
                 properties = object_features.to_ngffprops()
         new = self._clone_metadata_only()
+        if object_features is not None:
+            # KEEP the measured table, do not just serialize it. `image-label.properties`
+            # is a display format - NGFF display names, nested `object-coordinates` - so
+            # recovering usable arrays from it means re-measuring the whole volume, even
+            # though the measurement was already done (free, from the labeling pass).
+            # Held duck-typed and read-only via `.object_features`; no import of the
+            # labels package, exactly as `object_features=` above is already duck-typed.
+            new._object_features = object_features
         if new.meta is not None and new.meta.metadata is not None:
             new.meta.metadata.pop('omero', None)   # a label carries image-label, not omero
             il = dict(new.meta.metadata.get('image-label') or {})

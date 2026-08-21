@@ -6,7 +6,7 @@ deferred progressive downscaling) are the public surface. Image PROCESSING opera
 (filters, segmentation, features, ...) live in the sibling ``pyrops`` package.
 """
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 __author__ = "Bugra Oezdemir"
 
 from ome_zarr_pyramid.core.io import IO

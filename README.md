@@ -119,6 +119,12 @@ full_pyr = pyr.downscale(min_dimension_size=128)     # -> Pyramid (until largest
 IO().write_pyramid(full_pyr, "out.ome.zarr", overwrite=True)
 ```
 
+Downsampling defaults to **stride** (nearest-neighbour, `downscale_method="simple"`)
+at an **isotropic 2x on the spatial axes** (`z`/`y`/`x`; `t`/`c` stay 1). On a pyramid
+that already has levels, the per-axis factors are instead **derived from those levels**
+so an anisotropic or irregular source round-trips unchanged — pass `scale_factor=`
+explicitly to override, and see `Pyramid.derive_downscale_plan()`.
+
 This matters when level 0 is an expensive lazy graph: the base is computed a **single**
 time (during its own write) instead of being recomputed for every pyramid level.
 

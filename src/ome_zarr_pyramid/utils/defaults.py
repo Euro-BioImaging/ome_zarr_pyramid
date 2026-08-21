@@ -16,7 +16,7 @@ unit_map = {
 scale_factor_map = {
     't': 1,
     'c': 1,
-    'z': 1,
+    'z': 2,   # ISOTROPIC in the spatial axes: z is halved like y/x, not kept.
     'y': 2,
     'x': 2
 }
