@@ -39,3 +39,7 @@ Thumbs.db
 
 # Local scratch / data
 *.zarr/
+
+# Other
+reports/
+benchmarks/

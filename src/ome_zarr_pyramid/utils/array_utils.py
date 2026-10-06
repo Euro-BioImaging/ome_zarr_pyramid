@@ -1,11 +1,13 @@
 """Array processing utilities for Dask, Zarr, and NumPy arrays."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import math
 from typing import Optional, Tuple, Union
 
 import numpy as np
 import zarr
-from dask import array as da
 
 try:
     import cupy as cp
@@ -14,6 +16,10 @@ except ImportError:
     cupy_available = False
 
 from ome_zarr_pyramid.utils.logging_config import get_logger
+from ome_zarr_pyramid.utils.optional_deps import is_dask_array, require
+
+if TYPE_CHECKING:
+    from dask import array as da
 
 logger = get_logger(__name__)
 
@@ -28,6 +34,7 @@ def asdask(data, chunks='auto') -> da.Array:
     Returns:
         Dask array
     """
+    da = require("dask.array", "asdask")
     assert isinstance(data, (da.Array, zarr.Array, np.ndarray)), \
         f'data must be of type: {da.Array, zarr.Array, np.ndarray}'
     if isinstance(data, zarr.Array):
@@ -56,6 +63,7 @@ def as_dask_array(
         TypeError: If array type is not supported
         ValueError: If cupy backend requested but not available
     """
+    da = require("dask.array", "as_dask_array")
     if cupy_available:
         assert isinstance(array, (da.Array, zarr.Array, np.ndarray, cp.ndarray)), \
             f"The given array type {type(array)} cannot be parsed."

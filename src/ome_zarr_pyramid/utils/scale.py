@@ -1,20 +1,27 @@
 """Downscaling utilities for creating image pyramids with TensorStore and Dask support."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import asyncio
 import dataclasses
+import threading
 import itertools
 import os
 from fractions import Fraction
 from math import gcd, lcm
 from typing import Union, Optional, Dict, Any, Tuple, Callable, Sequence, List
 
-import dask.array as da
 import numpy as np
 import tensorstore as ts
 import zarr
 
 from ome_zarr_pyramid.utils.logging_config import get_logger
 from ome_zarr_pyramid.utils.storage_utils import make_kvstore
+from ome_zarr_pyramid.utils.optional_deps import is_dask_array, is_installed, require
+
+if TYPE_CHECKING:
+    import dask.array as da
 
 logger = get_logger(__name__)
 
@@ -216,6 +223,7 @@ def mean_downscale(
     if len(scale_factor) != arr.ndim:  # type: ignore
         raise ValueError("scale_factors must have the same length as the array's number of dimensions")
     axes = dict({idx: factor for idx, factor in enumerate(scale_factor)})  # type: ignore
+    da = require("dask.array", "mean downscaling of a dask array")
     downscaled_arr = da.coarsen(da.mean, arr,
                                 axes=axes, trim_excess=True).astype(arr.dtype)
     return downscaled_arr
@@ -249,6 +257,7 @@ def median_downscale(
     if len(scale_factor) != arr.ndim:  # type: ignore
         raise ValueError("scale_factors must have the same length as the array's number of dimensions")
     axes = dict({idx: factor for idx, factor in enumerate(scale_factor)})  # type: ignore
+    da = require("dask.array", "median downscaling of a dask array")
     downscaled_arr = da.coarsen(da.median, arr,
                                 axes=axes, trim_excess=True).astype(arr.dtype)
     return downscaled_arr
@@ -287,6 +296,71 @@ async def ts_downscale(
     factors = [int(np.round(factor)) for factor in scale_factor]
     ts_method = 'stride' if downscale_method == 'simple' else downscale_method
     return ts.downsample(arr, factors, method=ts_method)
+
+
+def _is_tensorstore(arr) -> bool:
+    return hasattr(arr, "read") and hasattr(arr, "spec")
+
+
+_view_loop = None
+_view_loop_lock = threading.Lock()
+
+
+def _views_event_loop() -> asyncio.AbstractEventLoop:
+    """The event loop the read functions of ``as_tensorstore``'s views run
+    on: this module's own, on a daemon thread, alive as long as the process.
+    (Left to TensorStore, a view would take the loop running where it was
+    made -- that of an ``asyncio.run`` call, closed by the time the view is
+    read -- or fail where none is running.)"""
+    global _view_loop
+    with _view_loop_lock:
+        if _view_loop is None or _view_loop.is_closed():
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, name="ome_zarr_pyramid-views",
+                             daemon=True).start()
+            _view_loop = loop
+        return _view_loop
+
+
+def as_tensorstore(arr) -> ts.TensorStore:
+    """An in-memory array as a TensorStore to downsample without dask: a
+    numpy array copied into one, a DynamicArray that merely wraps a
+    TensorStore unwrapped, any other DynamicArray (or anything that reads
+    numpy regions) behind a ``virtual_chunked`` view that reads it region by
+    region, lazily.
+
+    The view's read function is a coroutine that does the read on a worker
+    thread: a read that itself goes through TensorStore (a DynamicArray over
+    a TensorStore level, transformed) must not block one of TensorStore's
+    own threads waiting for another -- under load that deadlocks the pool."""
+    if _is_tensorstore(arr):
+        return arr
+    if isinstance(arr, np.ndarray):
+        return ts.array(arr)
+    if getattr(arr, "_transform", "?") is None and getattr(arr, "_is_tensorstore", False):
+        return arr._ts_array
+    dtype = np.dtype(getattr(arr.dtype, "numpy_dtype", arr.dtype))
+    chunks = getattr(arr, "chunks", None)
+    layout = None
+    if chunks and all(isinstance(c, (int, np.integer)) for c in chunks):
+        layout = ts.ChunkLayout(read_chunk_shape=[int(c) for c in chunks])
+
+    async def read(domain, array, params):
+        array[...] = await asyncio.to_thread(lambda: np.asarray(arr[domain.index_exp]))
+
+    kwargs = {"chunk_layout": layout} if layout is not None else {}
+    return ts.virtual_chunked(read, dtype=ts.dtype(dtype.name), shape=tuple(arr.shape),
+                              loop=_views_event_loop(), **kwargs)
+
+
+def crop_to_level(arr, base_shape, factors, downscale_method: str):
+    """Cut a TensorStore downsample (ceil-sized) to the level size
+    ``_level_size`` defines -- floor for mean / median, as ``da.coarsen``
+    gives -- so a level is the same with or without dask."""
+    want = tuple(_level_size(int(b), int(f), downscale_method) for b, f in zip(base_shape, factors))
+    if tuple(arr.shape) == want:
+        return arr
+    return arr[tuple(slice(0, w) for w in want)]
 
 
 @dataclasses.dataclass
@@ -394,6 +468,8 @@ class Downscaler:
     dm: 'DownscaleManager' = dataclasses.field(default=None, init=False, repr=False)  # type: ignore
     # Assigned in run()
     method: Callable = dataclasses.field(default=None, init=False, repr=False)  # type: ignore
+    # True when an in-memory array is downsampled by TensorStore (no dask)
+    _in_memory_ts: bool = dataclasses.field(default=False, init=False, repr=False)
     _downscaled_arrays: list = dataclasses.field(default_factory=list, init=False, repr=False)
 
     def get_tensorstore_context(self) -> Optional[Dict[str, Any]]:
@@ -464,25 +540,33 @@ class Downscaler:
                 array_obj = ts.open(ts_spec, **open_kwargs).result()
                 logger.info(f"[Downscaler] Successfully opened zarr array with TensorStore")
             else:
-                # Fall back to Dask for zarr arrays without file path info
+                # an in-memory zarr array (no store path): downsampled by TensorStore in
+                # memory - dask only for a pyramid that is ALREADY dask (dyna-first: an
+                # installed dask is not a reason to turn a non-dask pyramid into one)
                 self.base_array_root = None
-                if not isinstance(self.array, da.Array):
-                    array_obj = da.from_array(self.array, chunks=self.output_chunks or self.array.chunks)  # type: ignore
-                else:
+                if is_dask_array(self.array):
                     array_obj = self.array
+                else:
+                    array_obj = as_tensorstore(self.array)
+                    self._in_memory_ts = True
             
         else:
             # Dask array or numpy array - optimize for in-memory processing
             self.base_array_root = None
-            if isinstance(self.array, da.Array):
+            if is_dask_array(self.array):
                 array_obj = self.array
-            elif isinstance(self.array, np.ndarray):
-                # A real numpy array is NOT a Delayed: `from_delayed` looked for `.key`
-                # and raised `AttributeError: 'numpy.ndarray' object has no attribute
-                # 'key'`, so downscaling an in-memory Pyramid failed outright.
-                array_obj = da.from_array(self.array, chunks=self.output_chunks or 'auto')
+            elif hasattr(self.array, "_with_transform"):
+                # a dyna DynamicArray: stride by lazy slicing, mean / median through
+                # TensorStore (`get_method`); no dask
+                array_obj = self.array
+            elif _is_tensorstore(self.array) or isinstance(self.array, np.ndarray):
+                # TensorStore or numpy: downsampled by TensorStore in memory, with or
+                # without dask installed (dyna-first; dask only for dask pyramids)
+                array_obj = as_tensorstore(self.array)
+                self._in_memory_ts = True
             else:
                 # A dask Delayed (or anything else exposing shape/dtype).
+                da = require("dask.array", "downscaling a dask Delayed")
                 array_obj = da.from_delayed(self.array, shape=self.array.shape, dtype=self.array.dtype)  # type: ignore
 
         self.param_names = ['array', 'scale_factor', 'n_layers', 'scale', 'output_chunks', 'backend', 'downscale_method', 'smart_scale_factor']
@@ -514,7 +598,13 @@ class Downscaler:
         NotImplementedError
             If an unsupported downscaling method is requested.
         """
-        if self.base_array_root is None:  # array is dask array
+        if hasattr(self.array, "_with_transform"):      # a dyna DynamicArray
+            if self.downscale_method == 'simple':
+                return simple_downscale                  # lazy slicing, no TensorStore
+            self.array = as_tensorstore(self.array)
+            self._in_memory_ts = True
+            return ts_downscale
+        if self.base_array_root is None and not self._in_memory_ts:  # array is dask array
             if self.downscale_method == 'simple':
                 method: Callable = simple_downscale
             elif self.downscale_method == "mean":
@@ -567,6 +657,10 @@ class Downscaler:
         else:
             results = []
         
+        if self._in_memory_ts:              # the level sizes dask's coarsen gives
+            factors = [tuple(int(np.round(x)) for x in f) for f in self.dm.scale_factors]
+            results = [crop_to_level(r, self.array.shape, factors[i + 1], self.downscale_method)
+                       for i, r in enumerate(results)]
         self._downscaled_arrays = [self.array]
         for idx in range(len(results)):
             self._downscaled_arrays.append(results[idx])

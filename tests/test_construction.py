@@ -14,6 +14,8 @@ def test_from_arrays_basic(pyr3d):
 
 
 def test_dask_arrays_match_source(pyr3d, compute):
+    import pytest
+    pytest.importorskip("dask")
     pyr, data = pyr3d
     assert set(pyr.dask_arrays) == {"0"}
     np.testing.assert_array_equal(compute(pyr), data)
@@ -55,6 +57,7 @@ def test_dask_arrays_refuses_dyna_layers(tmp_path):
     from ome_zarr_pyramid import IO, Pyramid
 
     pytest.importorskip("dyna_zarr")
+    pytest.importorskip("dask")
     data = (np.arange(8 * 16 * 16) % 7).reshape(1, 1, 8, 16, 16).astype("int32")
     path = tmp_path / "src.zarr"
     IO().write_pyramid(Pyramid().from_array(data, scale=[1, 1, 1, 1, 1]),

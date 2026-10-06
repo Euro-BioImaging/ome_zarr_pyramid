@@ -280,7 +280,7 @@ def test_plan_survives_materialization():
 
 def test_visible_levels_are_not_computed():
     """Resolving must stay lazy: no block of the expensive base may run."""
-    import dask.array as da
+    da = pytest.importorskip("dask.array")
     calls = {"n": 0}
 
     def expensive(block):
@@ -301,7 +301,7 @@ def test_write_still_computes_the_base_once(tmp_path):
     """Visible levels must not cost the optimization the plan exists for: writing
     derives the coarser levels from the ON-DISK base, so an expensive lazy base is
     computed once, not once per level."""
-    import dask.array as da
+    da = pytest.importorskip("dask.array")
     calls = {"n": 0}
 
     def expensive(block):

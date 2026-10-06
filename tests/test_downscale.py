@@ -8,7 +8,7 @@ def test_downscale_sync_builds_levels(make_pyramid):
     pyr, _ = make_pyramid(shape=(2, 64, 64), axis_order="cyx", scales=[[1.0, 1.0, 1.0]])
     ds = pyr.downscale(n_layers=3, defer=False)
     assert ds.nlayers == 3
-    shapes = [ds.dask_arrays[p].shape for p in ds.meta.resolution_paths]
+    shapes = [ds.layers[p].shape for p in ds.meta.resolution_paths]
     assert shapes[0] == (2, 64, 64)
     # each level halves the spatial axes (2x factor)
     assert shapes[1] == (2, 32, 32)
@@ -41,7 +41,7 @@ def test_downscale_defer_is_lazy(make_pyramid):
 def test_min_dimension_size_caps_levels(make_pyramid):
     pyr, _ = make_pyramid(shape=(1, 128, 128), axis_order="cyx")
     ds = pyr.downscale(min_dimension_size=32, defer=False)
-    smallest = ds.dask_arrays[ds.meta.resolution_paths[-1]].shape
+    smallest = ds.layers[ds.meta.resolution_paths[-1]].shape
     assert min(smallest[-2:]) >= 32
 
 
@@ -60,7 +60,7 @@ def test_get_downscaled_pyramid_auto_depth(make_pyramid):
     (the `min_dimension_size` default) - not a single no-op level."""
     pyr, _ = make_pyramid(shape=(3, 512, 512), axis_order="cyx")
     ds = pyr.get_downscaled_pyramid()
-    shapes = [ds.dask_arrays[p].shape for p in ds.meta.resolution_paths]
+    shapes = [ds.layers[p].shape for p in ds.meta.resolution_paths]
     assert ds.nlayers == 4                              # 512 -> 256 -> 128 -> 64
     assert min(shapes[-1][-2:]) >= 64
     assert min(shapes[-1][-2:]) < 128
@@ -79,7 +79,7 @@ def test_select_levels_contiguous(make_pyramid):
     sub = ds.select_levels(1, 2)
     assert sub.nlayers == 2
     # the selected finest level becomes level 0 of the output
-    assert sub.dask_arrays["0"].shape == ds.dask_arrays["1"].shape
+    assert sub.layers["0"].shape == ds.layers["1"].shape
 
 
 def test_select_levels_non_contiguous(make_pyramid):
@@ -87,9 +87,9 @@ def test_select_levels_non_contiguous(make_pyramid):
     ds = pyr.downscale(n_layers=4, defer=False)      # 128,64,32,16
     sub = ds.select_levels(0, 2, 3)                  # skip level 1
     assert sub.nlayers == 3
-    assert sub.dask_arrays["0"].shape == ds.dask_arrays["0"].shape
-    assert sub.dask_arrays["1"].shape == ds.dask_arrays["2"].shape
-    assert sub.dask_arrays["2"].shape == ds.dask_arrays["3"].shape
+    assert sub.layers["0"].shape == ds.layers["0"].shape
+    assert sub.layers["1"].shape == ds.layers["2"].shape
+    assert sub.layers["2"].shape == ds.layers["3"].shape
 
 
 def test_select_levels_accepts_list_and_slice(make_pyramid):
@@ -101,17 +101,39 @@ def test_select_levels_accepts_list_and_slice(make_pyramid):
     assert ds.select_levels(-1).nlayers == 1         # negative index (coarsest)
 
 
-def test_rechunk_chunk_shape(pyr3d):
-    pyr, _ = pyr3d
+def _written_chunks(pyr, tmp_path):
+    """The chunks `pyr` is stored with (rechunk is the STORAGE-chunk knob)."""
+    import zarr
+    from ome_zarr_pyramid import IO
+    path = tmp_path / "rechunked.zarr"
+    IO().write_pyramid(pyr, str(path), overwrite=True)
+    return tuple(zarr.open_group(str(path), mode="r")["0"].chunks)
+
+
+def test_rechunk_chunk_shape(pyr3d, tmp_path):
+    pyr, data = pyr3d
     rc = pyr.rechunk(chunk_shape=(3, 8, 8))
-    assert rc.dask_arrays["0"].chunksize == (3, 8, 8)
+    assert rc._storage_chunks == (3, 8, 8)
+    assert _written_chunks(rc, tmp_path) == (3, 8, 8)
+    np.testing.assert_array_equal(np.asarray(rc.layers["0"]), data)
 
 
-def test_rechunk_chunk_size_mb(pyr3d):
+def test_rechunk_chunk_size_mb(pyr3d, tmp_path):
     pyr, _ = pyr3d
     rc = pyr.rechunk(chunk_size_mb=0.001)
     # a tiny target produces chunks no larger than the array
-    assert all(c <= s for c, s in zip(rc.dask_arrays["0"].chunksize, pyr.shape))
+    chunks = _written_chunks(rc, tmp_path)
+    assert all(c <= s for c, s in zip(chunks, pyr.shape))
+    assert chunks == rc._storage_chunks
+
+
+def test_rechunk_of_a_dask_pyramid_rechunks_the_graph(pyr3d):
+    """A dask-backed pyramid is rechunked by dask (the processing chunks)."""
+    da = pytest.importorskip("dask.array")
+    from ome_zarr_pyramid import Pyramid
+    pyr, data = pyr3d
+    dpyr = Pyramid().from_arrays([da.from_array(data, chunks=(1, 16, 16))], axis_order="cyx")
+    assert dpyr.rechunk(chunk_shape=(3, 8, 8)).layers["0"].chunksize == (3, 8, 8)
 
 
 # --- a pyramid with BOTH real levels and a deferred plan ---------------------------------

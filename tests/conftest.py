@@ -5,11 +5,30 @@ indexing, downscaling, metadata, operators) and `IO` (NGFF read/write). Legacy
 process/creation/CLI modules are intentionally out of scope.
 """
 
-import numpy as np
-import pytest
-import zarr
+import os
+import sys
 
-from ome_zarr_pyramid.core.pyramid import Pyramid
+
+class _NoDask:
+    """``OZP_BLOCK_DASK=1``: dask (an optional extra) is not installed, as far
+    as this test run can tell -- the whole suite runs without it, and the tests
+    of dask-only features skip (``pytest.importorskip("dask")``)."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name.partition(".")[0] in ("dask", "distributed"):
+            raise ModuleNotFoundError(f"No module named {name!r} (blocked: OZP_BLOCK_DASK)",
+                                      name=name)
+        return None
+
+
+if os.environ.get("OZP_BLOCK_DASK") == "1":
+    sys.meta_path.insert(0, _NoDask())
+
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+import zarr  # noqa: E402
+
+from ome_zarr_pyramid.core.pyramid import Pyramid  # noqa: E402
 
 
 def _default_chunks(shape):
@@ -54,9 +73,10 @@ def pyr4d(make_pyramid):
 
 @pytest.fixture
 def compute():
-    """`compute(pyr, level="0")` -> the materialized NumPy array of a level."""
+    """`compute(pyr, level="0")` -> the materialized NumPy array of a level
+    (zarr, dask, DynamicArray or TensorStore: with or without dask)."""
     def _c(pyr, level="0"):
-        return np.asarray(pyr.dask_arrays[level].compute())
+        return np.asarray(pyr.layers[level])
     return _c
 
 

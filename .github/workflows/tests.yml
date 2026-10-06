@@ -47,6 +47,28 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v -o addopts=""
 
+  no-dask:
+    # dask is optional: the whole suite must pass with dask NOT installed (the tests of
+    # dask-only features skip). `.[dev]` would bring dask in, so install pytest alone.
+    name: pytest without dask
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install (no dask)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+          python -c "import importlib.util as u, sys; sys.exit(u.find_spec('dask') is not None)"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v -o addopts=""
+
   install-check:
     # Builds the wheel, installs it into a CLEAN venv from OUTSIDE the repo, and runs the
     # suite against the RESOLVED PyPI dependencies. The job above uses `-e .`, which tests

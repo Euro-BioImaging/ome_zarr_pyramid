@@ -5,6 +5,9 @@ reader/writer pipeline (`write_with_queue_async`) plus higher-level
 orchestration for building and downscaling a multiscale pyramid
 (`downscale_with_tensorstore_async`, `store_multiscale_async`).
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import asyncio
 import gc
@@ -17,7 +20,6 @@ from pathlib import Path
 from queue import Queue
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
-import dask.array as da
 import numpy as np
 import tensorstore as ts
 import zarr
@@ -32,6 +34,10 @@ from ome_zarr_pyramid.utils.array_utils import (
 )
 from ome_zarr_pyramid.utils.compressor_config import CompressorConfig
 from ome_zarr_pyramid.utils.logging_config import get_logger
+from ome_zarr_pyramid.utils.optional_deps import is_dask_array
+
+if TYPE_CHECKING:
+    import dask.array as da
 
 logger = get_logger(__name__)
 
@@ -537,7 +543,7 @@ async def write_with_queue_async(
         input_chunks=input_chunks
     )
     # If arr is a dask array, rechunk it to match the read region shape
-    if isinstance(arr, da.Array):
+    if is_dask_array(arr):
         arr = arr.rechunk(region_shape)
 
     # === OPEN WITH TENSORSTORE FOR WRITING ===

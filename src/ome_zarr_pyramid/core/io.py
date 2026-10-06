@@ -4,6 +4,9 @@ Implements async vectorized writes with TensorStore, queue-based producer-consum
 pipelines, and threading for optimal performance on multi-resolution datasets.
 Based on the dyna_zarr architecture for efficient large-scale I/O.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import asyncio
 import gc
@@ -13,21 +16,23 @@ import os
 import threading
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Dict, List, Optional, Tuple, Union
 
-import dask.array as da
 import numpy as np
 import tensorstore as ts
 import zarr
 
 from ome_zarr_pyramid.core import tensorstore_writer
 from ome_zarr_pyramid.core.pyramid import Pyramid
-from ome_zarr_pyramid.utils.array_utils import get_chunk_shape
+from ome_zarr_pyramid.utils.array_utils import get_array_chunks, get_chunk_shape
 from ome_zarr_pyramid.utils.logging_config import get_logger
+from ome_zarr_pyramid.utils.optional_deps import is_dask_array, is_installed, require
 from ome_zarr_pyramid.utils.storage_utils import make_kvstore
+
+if TYPE_CHECKING:
+    import dask.array as da
 
 logger = get_logger(__name__)
 
@@ -73,37 +78,183 @@ def _read_label_names(labels_group: zarr.Group) -> list:
 
 
 def _is_remote_store(path) -> bool:
-    """True for an object-store URL (https:// / s3://) that must NOT be treated as a
-    local filesystem `Path` (which would mangle the URL)."""
+    """True for a URL (s3://, gs://, az://, https://, ...) that must NOT be treated as a
+    local filesystem `Path` (which would mangle it). ``file://`` is local."""
     s = str(path)
-    return s.startswith("https://") or s.startswith("s3://")
+    return "://" in s and not s.startswith("file://")
 
 
-def _is_dyna_pyramid(pyramid) -> bool:
-    """True if the pyramid's in-memory layers are dyna_zarr DynamicArrays (the memory-bounded
-    pull backend), so writing should stream via dyna_zarr.io.write. False for zarr/dask/numpy
-    layers, or when dyna_zarr isn't installed."""
+def _is_legacy_https(path) -> bool:
+    """ozp's original remote convention: ``https://<s3-endpoint>/<bucket>/<key>`` with
+    s3fs-style storage_options, written by the 'sync' engine. Kept for existing callers;
+    the dyna engine takes ``s3://bucket/key`` with obstore-style options instead."""
+    return str(path).startswith("https://")
+
+
+def _object_store_group(url: str, zarr_format: int, mode: str,
+                        storage_options: Optional[dict] = None) -> zarr.Group:
+    """A zarr group on an object store, through obstore - with the SAME storage_options
+    names dyna uses for the arrays (``endpoint``, ``region``, ``skip_signature``,
+    ``client_options``, ...; credentials from the standard environment variables)."""
     try:
-        from dyna_zarr import DynamicArray
-    except ImportError:
-        return False
-    if pyramid.meta is None:
-        return False
-    try:
-        first = pyramid.layers[pyramid.meta.resolution_paths[0]]
-    except Exception:
-        return False
-    return isinstance(first, DynamicArray)
+        import obstore
+    except ImportError as exc:
+        raise ImportError("remote OME-Zarr (s3://, gs://, az://) needs obstore: "
+                          "pip install 'ome_zarr_pyramid[remote]'") from exc
+    from zarr.storage import ObjectStore
+    store = ObjectStore(obstore.store.from_url(url, **(storage_options or {})),
+                        read_only=(mode == "r"))
+    return zarr.open_group(store, mode=mode, zarr_format=zarr_format)
 
 
-def _resolve_dyna_chunks(chunk_shape, level_path, arr):
-    """Storage chunks for a dyna level write: an explicit ``chunk_shape`` (tuple, or a
-    ``{level: tuple}`` dict), else the array's own chunks (preserving the read chunking)."""
-    if chunk_shape is None:
-        return arr.chunks
-    if isinstance(chunk_shape, dict):
-        return chunk_shape.get(int(level_path), chunk_shape.get(str(level_path), arr.chunks))
-    return tuple(chunk_shape)
+_ENGINES = ('auto', 'dyna', 'sync', 'tensorstore')
+
+
+def _resolve_engine(pyramid, backend, *, remote, use_multiprocessing, path=None) -> str:
+    """The write engine for ``write_pyramid(backend=...)``.
+
+    ``'auto'`` picks dyna wherever it can stream the pyramid. An EXPLICIT engine is
+    honoured or refused, never swapped for another (fail loudly)."""
+    if backend not in _ENGINES:
+        raise ValueError(f"backend must be one of {_ENGINES}, got {backend!r}")
+    has_dask = pyramid._has_dask_layer()
+    if use_multiprocessing and has_dask and backend in ('auto', 'dyna'):
+        raise ValueError(
+            "use_multiprocessing cannot write dask-backed levels (their graphs are not "
+            "shipped to worker processes; dask parallelises them itself). Drop "
+            "use_multiprocessing.")
+    legacy_https = remote and _is_legacy_https(path)
+    if backend == 'auto':
+        # the legacy https:// convention (s3fs options) keeps the sync writer; every
+        # other target - local, s3://, gs://, az:// - goes through dyna
+        engine = 'sync' if legacy_https else 'dyna'
+        if use_multiprocessing and engine != 'dyna':
+            raise ValueError(
+                "use_multiprocessing runs on the dyna engine, which takes s3:// URLs with "
+                "storage_options={'endpoint': ...}, not the legacy https:// form. Drop "
+                "use_multiprocessing, or use the s3:// form.")
+        return engine
+    if backend == 'dyna':
+        if legacy_https:
+            raise ValueError(
+                "the dyna engine writes object stores as s3://bucket/key (or gs://, az://) "
+                "with obstore-style storage_options, e.g. {'endpoint': 'https://host'}; the "
+                "https://host/bucket/key form is the legacy 'sync' convention. Use the "
+                "s3:// form, or backend='sync'.")
+        return 'dyna'
+    if use_multiprocessing:
+        raise ValueError(
+            f"use_multiprocessing runs on the dyna engine (one process per level); "
+            f"backend={backend!r} has no multiprocessing mode. Use backend='auto' or "
+            f"'dyna', or drop use_multiprocessing.")
+    if backend == 'tensorstore' and remote:
+        raise ValueError(
+            "backend='tensorstore' writes local stores only. Use backend='auto' or "
+            "'dyna' for a remote target.")
+    if backend == 'sync' and remote and not legacy_https:
+        raise ValueError(
+            f"backend='sync' writes remote stores only in the legacy https://host/bucket/key "
+            f"form; {str(path)!r} needs the dyna engine (backend='auto' or 'dyna').")
+    return backend
+
+
+def _dyna_write_level(arr, output_path: str, kwargs: dict) -> str:
+    """Write one level with ``dyna_zarr.io.write``; returns what it reported on stdout.
+
+    Module-level so a spawned worker process can import it (Windows uses spawn)."""
+    import contextlib
+    import io as _stdio
+    from dyna_zarr import io as dyna_io
+    buf = _stdio.StringIO()
+    with contextlib.redirect_stdout(buf):    # dyna reports grid decisions on stdout
+        dyna_io.write(arr, output_path, **kwargs)
+    return buf.getvalue()
+
+
+def _dask_write_level(x, output_path: str, kwargs: dict) -> str:
+    """The dask pump: push a dask level into a dyna sink (``io.create_sink``).
+
+    dask schedules its own graph (threaded, ``max_workers`` threads); dyna creates and
+    owns the output with the same settings io.write would use. The graph is rechunked to
+    the sink's write unit (chunk, or shard when sharded), so every concurrent write is a
+    whole unit. Measured on 1.2 GB: 1.24 s, vs 3.5 s into a zarr-python array and 5.2 s
+    through the 'sync' writer (reports/write_audit.md)."""
+    import dask
+    import dask.array as da
+    from dyna_zarr import io as dyna_io
+    sink_kw = {k: v for k, v in kwargs.items() if k not in ('region_size_mb', 'max_workers')}
+    sink = dyna_io.create_sink(output_path, x.shape, x.dtype, **sink_kw)
+    with dask.config.set(scheduler='threads', num_workers=int(kwargs.get('max_workers', 4))):
+        da.store(x.rechunk(sink.write_unit), sink, lock=False)
+    return ""
+
+
+def _per_level(spec, level: int, name: str, tuple_form: bool = False):
+    """One level's value from a per-level option: a ``{level: value}`` dict, a
+    per-level sequence (scalar options), or one value for every level."""
+    if isinstance(spec, dict):
+        if level in spec:
+            v = spec[level]
+        elif str(level) in spec:
+            v = spec[str(level)]
+        else:
+            raise ValueError(f"{name} dict has no entry for resolution level {level}")
+    elif not tuple_form and isinstance(spec, (tuple, list)):
+        if level >= len(spec):
+            raise ValueError(f"{name} has {len(spec)} entries but resolution level "
+                             f"{level} was requested")
+        v = spec[level]
+    else:
+        v = spec
+    return tuple(int(x) for x in v) if tuple_form else v
+
+
+def _resolve_compressor(pyramid, compressor, compressor_params):
+    """The codec to write: an explicit name (+ params) or ``CompressorConfig``, else
+    the pyramid's own (None: let the writer inherit the input's / use its default)."""
+    from ome_zarr_pyramid.utils.compressor_config import CompressorConfig
+    if compressor is None:
+        return pyramid.compressor
+    if isinstance(compressor, CompressorConfig):
+        return compressor
+    return CompressorConfig(name=compressor, params=dict(compressor_params or {}))
+
+
+_BLOSC_SHUFFLE = {'noshuffle': 0, 'shuffle': 1, 'bitshuffle': 2}
+
+
+def _to_dyna_codecs(cfg):
+    """ozp ``CompressorConfig`` -> dyna ``Codecs`` (None passes through)."""
+    if cfg is None:
+        return None
+    from dyna_zarr import Codecs
+    name = (cfg.name or 'none').lower()
+    p = dict(cfg.params or {})
+    if name in ('', 'none'):
+        return Codecs(None)
+    if name == 'blosc':
+        shuffle = p.get('shuffle', 1)
+        if isinstance(shuffle, str):
+            shuffle = _BLOSC_SHUFFLE.get(shuffle.lower(), 1)
+        return Codecs('blosc', clevel=int(p.get('clevel', 5)), cname=p.get('cname', 'lz4'),
+                      shuffle=int(shuffle))
+    if name in ('zstd', 'gzip', 'bz2'):
+        default = {'zstd': 1, 'gzip': 5, 'bz2': 1}[name]
+        return Codecs(name, clevel=int(p.get('level', p.get('clevel', default))))
+    raise ValueError(f"compressor {cfg.name!r} cannot be written by the dyna engine "
+                     f"(blosc, zstd, gzip, bz2 or none)")
+
+
+def _inherited_shard_coefficients(base):
+    """The base level's sharding as per-axis coefficients (shard = coefficient x chunk),
+    so every level of the pyramid is sharded alike; None when the base is unsharded."""
+    shards, chunks = getattr(base, 'shards', None), getattr(base, 'chunks', None)
+    if not shards or not chunks or len(shards) != len(chunks):
+        return None
+    if any(int(s) % int(c) for s, c in zip(shards, chunks)):
+        return None
+    coefs = tuple(int(s) // int(c) for s, c in zip(shards, chunks))
+    return None if all(k == 1 for k in coefs) else coefs
 
 
 def _store_join(path, *parts):
@@ -117,11 +268,16 @@ def _store_join(path, *parts):
     return p
 
 
-def _open_store_group(path, zarr_format: int, mode: str = "a") -> zarr.Group:
-    """Open/create a zarr group for attr read/write, S3-aware: an https:// path is
-    resolved to an s3fs mapping; a local path is used directly."""
+def _open_store_group(path, zarr_format: int, mode: str = "a",
+                      storage_options: Optional[dict] = None) -> zarr.Group:
+    """Open/create a zarr group for attr read/write: local directly; an object-store URL
+    (s3://, gs://, az://) through obstore with dyna-style storage_options; the legacy
+    https:// form through an s3fs mapping (options set by `set_s3_storage_options`)."""
     if _is_remote_store(path):
-        store = tensorstore_writer.wrap_output_path(str(path))
+        if _is_legacy_https(path):
+            store = tensorstore_writer.wrap_output_path(str(path))
+        else:
+            return _object_store_group(str(path), zarr_format, mode, storage_options)
     else:
         store = str(path)
     return zarr.open_group(store, mode=mode, zarr_format=zarr_format)
@@ -180,121 +336,6 @@ def _compute_region_shape_for_layer(
     return tuple(region_shape)
 
 
-def _write_layer_process_worker(task: dict) -> Tuple[str, int, int]:
-    """Module-level worker that writes one pyramid layer inside a dedicated process.
-
-    Defined at module level so it is importable by spawned worker processes on
-    Windows (which uses 'spawn' instead of 'fork').  Each worker independently
-    re-opens its own zarr store handles, so no file descriptors or async event
-    loops are shared across process boundaries.
-
-    Within the process a single reader thread produces regions into a queue and
-    *threads_per_layer* writer threads drain it concurrently.
-
-    Parameters
-    ----------
-    task : dict
-        source_zarr_path   – str, filesystem path to the source zarr group root
-        source_layer_path  – str, layer key inside the source group
-        dest_zarr_path     – str, filesystem path to the destination zarr group root
-        dest_layer_path    – str, layer key inside the destination group
-        region_slices_raw  – list[list[list[int,int]]], per-region list of
-                             [start, stop] pairs for each dimension
-        threads_per_layer  – int, writer-thread count (and queue depth) per process
-        verbose            – bool
-
-    Returns
-    -------
-    tuple of (dest_layer_path, regions_written, total_regions)
-    """
-    import zarr
-    import numpy as np
-    import threading
-    import gc
-    from queue import Queue, Empty  # noqa: F401 (needed in worker process)
-
-    source_zarr_path  = task['source_zarr_path']
-    source_layer_path = task['source_layer_path']
-    dest_zarr_path    = task['dest_zarr_path']
-    dest_layer_path   = task['dest_layer_path']
-    region_slices_raw = task['region_slices_raw']
-    threads_per_layer = max(1, task['threads_per_layer'])
-    verbose           = task['verbose']
-
-    source_array = zarr.open_group(source_zarr_path, mode='r')[source_layer_path]
-    dest_array   = zarr.open_group(dest_zarr_path,   mode='r+')[dest_layer_path]
-
-    region_slices = [
-        tuple(slice(s[0], s[1]) for s in reg)
-        for reg in region_slices_raw
-    ]
-    total   = len(region_slices)
-    queue   = Queue(maxsize=threads_per_layer * 4)
-    written: list = [0]
-    error:   list = [None]
-
-    def _reader():
-        try:
-            for slices in region_slices:
-                if error[0]:
-                    break
-                queue.put((slices, np.asarray(source_array[slices])))
-        except Exception as exc:
-            error[0] = exc
-        finally:
-            for _ in range(threads_per_layer):
-                queue.put(None)   # sentinel per writer
-
-    def _writer():
-        while True:
-            try:
-                item = queue.get(timeout=2.0)
-            except Exception:
-                continue
-            if item is None:
-                break
-            slices, data = item
-            dest_array[slices] = data
-            written[0] += 1
-            queue.task_done()
-
-    reader_t  = threading.Thread(target=_reader, daemon=True)
-    writer_ts = [threading.Thread(target=_writer, daemon=True) for _ in range(threads_per_layer)]
-
-    reader_t.start()
-    for wt in writer_ts:
-        wt.start()
-    reader_t.join()
-    for wt in writer_ts:
-        wt.join()
-
-    if error[0]:
-        raise error[0]
-
-    gc.collect()
-    return dest_layer_path, written[0], total
-
-
-def _create_layer_array(dest_path: Path,
-                         layer_path: str,
-                         shape: Tuple[int, ...],
-                         chunks: Tuple[int, ...],
-                         dtype,
-                         pyramid: Pyramid) -> None:
-    """Create a destination layer array, honoring the pyramid's zarr format and compressor."""
-    zarr_format = pyramid.meta.zarr_format if pyramid.meta else 2
-    tensorstore_writer._create_zarr_array(
-        store_path=str(dest_path / layer_path),
-        shape=shape,
-        chunks=chunks,
-        dtype=dtype,
-        compressor_config=pyramid.compressor,
-        zarr_format=zarr_format,
-        overwrite=False,
-        dimension_names=list(pyramid.axes) if zarr_format == 3 else None,
-    )
-
-
 class PyramidIO:
     """High-performance I/O handler for NGFF-compliant OME Zarr Pyramids.
     
@@ -321,40 +362,52 @@ class PyramidIO:
 
     def read_pyramid(self,
                      path: Union[str, Path],
-                     include_labels: bool = True) -> Pyramid:
+                     include_labels: bool = True,
+                     storage_options: Optional[dict] = None) -> Pyramid:
         """Read a pyramid from an NGFF-compliant zarr store.
 
         Parameters
         ----------
         path : str or Path
-            Path to the zarr store containing the NGFF pyramid
+            Path to the zarr store containing the NGFF pyramid, or an object-store URL
+            (s3://, gs://, az://).
         include_labels : bool
             Also discover the image's NGFF ``labels/`` collection and populate the
             returned pyramid's `Pyramid.labels` (lazy - only metadata + lazy arrays
-            are loaded). Default True; set False to skip the scan.
+            are loaded). Default True; set False to skip the scan. Local stores only.
+        storage_options : dict, optional
+            For a URL: obstore-style options (``endpoint``, ``region``,
+            ``skip_signature``, ``client_options``, ...), the same names the writer and
+            dyna use. Credentials come from the standard environment variables.
 
         Returns
         -------
         Pyramid
             Loaded pyramid with metadata and arrays
         """
-        path = Path(path) if isinstance(path, str) else path
-
-        if not path.exists():
-            raise FileNotFoundError(f"Path does not exist: {path}")
+        remote = _is_remote_store(path) and not _is_legacy_https(path)
+        if not remote:
+            path = Path(path) if isinstance(path, str) else path
+            if not path.exists():
+                raise FileNotFoundError(f"Path does not exist: {path}")
 
         if self.verbose:
             logger.info(f"[PyramidIO] Reading pyramid from: {path}")
 
         try:
             pyramid = Pyramid()
-            pyramid.from_ngff(str(path))
+            if remote:
+                # the format is read from the store; open_group detects v2 / v3
+                pyramid.from_ngff(_object_store_group(str(path), None, "r", storage_options))
+                include_labels = False   # label discovery walks a local directory tree
+            else:
+                pyramid.from_ngff(str(path))
 
             # remember the on-disk chunking so ops that rechunk for processing can be
             # written back with the ORIGINAL storage chunks by default (see rechunk).
             try:
-                base = pyramid.dask_arrays[pyramid.meta.resolution_paths[0]]
-                pyramid._storage_chunks = tuple(base.chunksize)
+                base = pyramid.layers[pyramid.meta.resolution_paths[0]]
+                pyramid._storage_chunks = tuple(int(c) for c in base.chunks)
             except Exception:
                 pass
 
@@ -415,7 +468,7 @@ class PyramidIO:
                       region_size_mb: float = 8.0,
                       gc_interval: float = 15.0,
                       use_multiprocessing: bool = False,
-                      backend: str = 'sync',
+                      backend: str = 'auto',
                       compressor: Optional[str] = None,
                       compressor_params: Optional[dict] = None,
                       max_concurrency: int = 4,
@@ -427,8 +480,31 @@ class PyramidIO:
                       include_labels: bool = True,
                       labels_group_path: Optional[Union[str, Path]] = None,
                       label_name: Optional[str] = None,
-                      storage_options: Optional[dict] = None) -> None:
+                      storage_options: Optional[dict] = None,
+                      shard_coefficients=None,
+                      io_backend: str = 'tensorstore') -> None:
         """Write a pyramid using region-wise processing.
+
+        Write engines (``backend``):
+
+        * ``'auto'`` (default): ``'dyna'``, except a remote (https://) target, which
+          still goes to ``'sync'`` until the remote dyna path lands.
+        * ``'dyna'``: dyna owns every write. numpy, zarr, TensorStore and DynamicArray
+          levels are PULLED by ``dyna_zarr.io.write`` (memory-bounded); dask levels are
+          PUSHED into a dyna sink by ``dask.array.store`` (the dask pump; dask schedules
+          its own graph on threads). The fastest engine measured
+          (reports/write_audit.md), and the only one that writes shards. Refuses remote
+          targets (for now).
+        * ``'sync'``: the threaded zarr-python writer (legacy).
+        * ``'tensorstore'``: the async TensorStore writer (legacy, local only).
+
+        ``compressor`` / ``compressor_params`` (a name + params, or a
+        ``CompressorConfig``) override the pyramid's codec on every engine.
+        ``shard_coefficients`` (a per-axis tuple, or ``{level: tuple}``; shard =
+        coefficients x chunks, zarr v3 only) and ``io_backend`` (dyna's byte backend:
+        ``'tensorstore'`` or ``'zarrista'``) need the dyna engine and are refused by the
+        others. Without ``shard_coefficients`` a sharded base level's sharding is kept
+        and applied to every level.
 
         Handles BOTH image and label pyramids: a label image is detected via
         ``pyramid.meta.is_label`` (it carries an ``image-label`` block) and its
@@ -445,16 +521,14 @@ class PyramidIO:
         read -> process -> write round-trip keeps the original chunking even if an op
         rechunked the dask arrays to its tile size.
 
-        Two parallelism strategies are available:
+        Parallelism:
 
-        * ``use_multiprocessing=False`` (default): one reader thread per layer
-          feeds a shared pool of *max_workers* writer threads.  Works with any
-          input array type (zarr, dask, numpy).
-
-        * ``use_multiprocessing=True``: one OS process per layer, each with its
-          own reader + writer threads.  Provides complete event-loop isolation
-          and true CPU-level parallelism across layers.  Requires the source
-          pyramid to be backed by a zarr store on disk.
+        * ``use_multiprocessing=False`` (default): threads - each level is written
+          with ``max_workers`` concurrent regions, one level after another.
+        * ``use_multiprocessing=True`` (dyna engine only): one spawned process per
+          level, all levels at once, each with its own ``max_workers`` regions - so
+          peak memory is up to (number of levels) x one write. Works for every pyramid
+          the dyna engine writes (zarr, numpy, TensorStore, op chains: they pickle).
 
         Parameters
         ----------
@@ -473,11 +547,10 @@ class PyramidIO:
         gc_interval : float, optional
             Seconds between GC runs (threading path only). Default is 15.0.
         use_multiprocessing : bool, optional
-            Use process-per-layer parallelism. Default is False.
+            Process-per-level parallelism on the dyna engine. Default is False.
         backend : str, optional
-            ``'sync'`` (default) uses the threaded zarr-array writer above.
-            ``'tensorstore'`` uses the async TensorStore producer-consumer
-            writer (see :func:`write_pyramid_async`).
+            The write engine: ``'auto'`` (default), ``'dyna'``, ``'sync'`` or
+            ``'tensorstore'`` - see above.
         compressor, compressor_params, max_concurrency, num_readers,
         queue_size, max_concurrent_layers : optional
             Only used when ``backend='tensorstore'`` - see
@@ -503,20 +576,31 @@ class PyramidIO:
         # LOCAL 'file' kvstore and cannot write to S3; multiprocessing can't share the
         # remote store.) One writer, one source of truth.
         remote = _is_remote_store(path)
-        if remote:
+        engine = _resolve_engine(pyramid, backend, remote=remote,
+                                 use_multiprocessing=use_multiprocessing, path=path)
+        if engine != 'dyna':
+            # options only the dyna engine implements: refuse rather than silently drop
+            dropped = [name for name, given in (
+                ("shard_coefficients", shard_coefficients is not None),
+                ("io_backend", io_backend != 'tensorstore')) if given]
+            if dropped:
+                raise ValueError(
+                    f"{', '.join(dropped)} need(s) the dyna write engine, but this write "
+                    f"uses {engine!r}. Pass backend='dyna' (or 'auto' for a pyramid dyna "
+                    f"can stream), or drop {', '.join(dropped)}.")
+        if remote and engine != 'dyna':
+            # the legacy https:// path: s3fs-style options, set module-wide
             if storage_options is not None:   # e.g. {'anon': True} for a public bucket
                 tensorstore_writer.set_s3_storage_options(**storage_options)
             if (getattr(pyramid, '_downscale_plan', None) is not None
                     and getattr(pyramid, '_downscale_plan_active', False)
                     and layers is None):
                 raise NotImplementedError(
-                    "writing a DEFERRED downscale() pyramid to a remote store is not "
-                    "supported (it re-reads the base from the store; S3 read is not "
-                    "implemented). Use downscale(defer=False), or write a single level."
+                    "writing a DEFERRED downscale() pyramid to a legacy https:// target is "
+                    "not supported. Use the s3:// form (dyna engine), downscale(defer=False), "
+                    "or write a single level."
                 )
-            backend = 'sync'
-            use_multiprocessing = False
-        else:
+        elif not remote:
             path = Path(path) if isinstance(path, str) else path
 
         # capture any attached labels NOW (top-level image write only): the storage
@@ -532,7 +616,8 @@ class PyramidIO:
         label_block = pyramid.meta.image_label if layers is None else None
         label_version, label_zarr_format = pyramid.meta.version, pyramid.meta.zarr_format
         if layers is None and labels_group_path is not None and label_name is not None:
-            lg = _open_store_group(labels_group_path, label_zarr_format, mode="a")
+            lg = _open_store_group(labels_group_path, label_zarr_format, mode="a",
+                                   storage_options=storage_options)
             _register_label_name(lg, label_name, label_version)
 
         # A DEFERRED-downscale pyramid (from `Pyramid.downscale(defer=True)`) carries
@@ -554,40 +639,45 @@ class PyramidIO:
         if plan is not None and not getattr(pyramid, '_downscale_plan_active', False):
             plan = None
         if plan is not None and layers is None:
+            extra = ({'shard_coefficients': shard_coefficients, 'io_backend': io_backend,
+                      'storage_options': storage_options}
+                     if engine == 'dyna' else {})
             self._write_with_plan(
                 pyramid, path, plan, overwrite=overwrite,
                 chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb,
                 max_workers=max_workers, region_size_mb=region_size_mb,
                 gc_interval=gc_interval, use_multiprocessing=use_multiprocessing,
-                backend=backend, compressor=compressor,
+                backend=engine, compressor=compressor,
                 compressor_params=compressor_params, max_concurrency=max_concurrency,
                 num_readers=num_readers, queue_size=queue_size,
-                max_concurrent_layers=max_concurrent_layers,
+                max_concurrent_layers=max_concurrent_layers, **extra,
             )
             self._write_side_metadata(
                 path, label_block=label_block, label_version=label_version,
                 label_zarr_format=label_zarr_format, attached_labels=attached_labels,
                 overwrite=overwrite, backend=backend, compressor=compressor,
-                compressor_params=compressor_params)
+                compressor_params=compressor_params, storage_options=storage_options)
             return
 
-        # dyna_zarr backend: the pyramid's layers are DynamicArrays (a memory-bounded,
-        # pull-based op chain). Write each level via dyna_zarr.io.write, which streams the
-        # whole read -> op-chain -> write pipeline region by region. Reuses the same group +
-        # NGFF-metadata machinery as the sync path (connect_to_group / save_changes).
-        if layers is None and _is_dyna_pyramid(pyramid):
-            if remote:
-                raise NotImplementedError(
-                    "writing a dyna_zarr-backed pyramid to a remote store is not supported "
-                    "yet; write locally (the dyna backend's remote write is still local-only)")
+        # dyna engine: every level through dyna_zarr.io.write, which streams the whole
+        # read -> op-chain -> write pipeline region by region (numpy / zarr / TensorStore
+        # levels are wrapped as DynamicArrays). Also serves the internal layer-subset
+        # writes of the plan path.
+        if engine == 'dyna':
             self._write_pyramid_dyna(
-                pyramid, path, overwrite=overwrite, chunk_shape=chunk_shape,
-                region_size_mb=region_size_mb, max_workers=max_workers)
+                pyramid, path, layers=layers, overwrite=overwrite,
+                chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb,
+                shard_coefficients=shard_coefficients, compressor=compressor,
+                compressor_params=compressor_params, region_size_mb=region_size_mb,
+                max_workers=max_workers, io_backend=io_backend,
+                use_multiprocessing=use_multiprocessing, storage_options=storage_options)
+            if layers is not None:
+                return    # internal sub-write: the caller writes the side metadata
             self._write_side_metadata(
                 path, label_block=label_block, label_version=label_version,
                 label_zarr_format=label_zarr_format, attached_labels=attached_labels,
                 overwrite=overwrite, backend=backend, compressor=compressor,
-                compressor_params=compressor_params)
+                compressor_params=compressor_params, storage_options=storage_options)
             return
 
         # apply the storage chunking before writing (explicit spec, else restore the
@@ -599,7 +689,7 @@ class PyramidIO:
             elif getattr(pyramid, '_storage_chunks', None) is not None:
                 pyramid = pyramid.rechunk()
 
-        if backend == 'tensorstore':
+        if engine == 'tensorstore':
             self.write_pyramid_tensorstore(
                 pyramid=pyramid,
                 path=path,
@@ -618,7 +708,7 @@ class PyramidIO:
                 path, label_block=label_block, label_version=label_version,
                 label_zarr_format=label_zarr_format, attached_labels=attached_labels,
                 overwrite=overwrite, backend=backend, compressor=compressor,
-                compressor_params=compressor_params)
+                compressor_params=compressor_params, storage_options=storage_options)
             return
 
         if self.verbose:
@@ -640,26 +730,18 @@ class PyramidIO:
                 group_store, overwrite=overwrite, zarr_format=pyramid.meta.zarr_format
             )
 
-            if use_multiprocessing:
-                self._write_all_layers_multiprocessing(
-                    pyramid=pyramid,
-                    zarr_group=zarr_group,
-                    layers_to_write=layers_to_write,
-                    dest_path=path,
-                    max_workers=max_workers,
-                    region_size_mb=region_size_mb,
-                )
-            else:
-                self._write_all_layers_unified(
-                    pyramid=pyramid,
-                    zarr_group=zarr_group,
-                    layers_to_write=layers_to_write,
-                    dest_path=path,
-                    max_workers=max_workers,
-                    region_size_mb=region_size_mb,
-                    gc_interval=gc_interval,
-                )
-            
+            self._write_all_layers_unified(
+                pyramid=pyramid,
+                zarr_group=zarr_group,
+                layers_to_write=layers_to_write,
+                dest_path=path,
+                max_workers=max_workers,
+                region_size_mb=region_size_mb,
+                gc_interval=gc_interval,
+                compressor_config=_resolve_compressor(pyramid, compressor,
+                                                      compressor_params),
+            )
+
             # Write NGFF metadata - always write to the destination group, even
             # if the in-memory metadata hasn't changed since it was read.
             pyramid.meta.connect_to_group(zarr_group)
@@ -685,31 +767,99 @@ class PyramidIO:
             path, label_block=label_block, label_version=label_version,
             label_zarr_format=label_zarr_format, attached_labels=attached_labels,
             overwrite=overwrite, backend=backend, compressor=compressor,
-            compressor_params=compressor_params)
+            compressor_params=compressor_params, storage_options=storage_options)
 
-    def _write_pyramid_dyna(self, pyramid, path, *, overwrite, chunk_shape,
-                            region_size_mb, max_workers):
-        """Write a dyna_zarr-backed pyramid: each level is streamed to disk via
-        dyna_zarr.io.write (memory-bounded), then the shared NGFF group metadata is written.
-        Local stores only for now."""
-        try:
-            from dyna_zarr import io as dyna_io
-        except ImportError as e:  # pragma: no cover - optional backend
-            raise ImportError(
-                "the 'dyna' write backend requires the optional dyna-zarr package: "
-                "pip install 'ome_zarr_pyramid[dyna]'"
-            ) from e
-        path = Path(path) if isinstance(path, str) else path
-        zf = pyramid.meta.zarr_format
-        zarr_group = tensorstore_writer._zarr_group(str(path), overwrite=overwrite, zarr_format=zf)
-        das = pyramid.dynamic_arrays
-        for p in pyramid.meta.resolution_paths:
-            arr = das[str(p)]
-            chunks = _resolve_dyna_chunks(chunk_shape, p, arr)
-            dyna_io.write(arr, str(path / str(p)),
-                          chunks=tuple(chunks) if chunks is not None else None,
-                          zarr_format=int(zf), region_size_mb=region_size_mb,
-                          max_workers=max_workers)
+    def _write_pyramid_dyna(self, pyramid, path, *, layers, overwrite, chunk_shape,
+                            chunk_size_mb, shard_coefficients, compressor, compressor_params,
+                            region_size_mb, max_workers, io_backend,
+                            use_multiprocessing=False, storage_options=None):
+        """The dyna engine: every level streamed through ``dyna_zarr.io.write``
+        (memory-bounded), then the NGFF group metadata. Local or object store (s3://,
+        gs://, az://): the arrays through dyna, the group through obstore, both with the
+        same ``storage_options``.
+
+        dyna owns the bytes: chunk solving, codecs, shards, overwrite rule. ozp only
+        resolves what dyna cannot know - its per-level forms (``{level: ...}`` dicts and
+        per-level sequences), the chunking recorded on the pyramid, the pyramid's codec,
+        the base level's sharding (applied to every level) and the v3 dimension names.
+        """
+        remote = _is_remote_store(path)
+        path = str(path) if remote else Path(path)
+        zf = int(pyramid.meta.zarr_format)
+        paths = [str(p) for p in pyramid.meta.resolution_paths]
+        todo = paths if layers is None else [str(p) for p in layers]
+        # dask levels stay dask - they are PUSHED into a dyna sink (the dask pump);
+        # everything else is wrapped as a DynamicArray and PULLED by io.write
+        from dyna_zarr import DynamicArray
+        das = {}
+        for p in paths:
+            a = pyramid.layers[p]
+            das[p] = a if (is_dask_array(a) or isinstance(a, DynamicArray)) else DynamicArray(a)
+
+        codecs = _to_dyna_codecs(_resolve_compressor(pyramid, compressor, compressor_params))
+        if shard_coefficients is None and zf == 3:
+            shard_coefficients = _inherited_shard_coefficients(das[paths[0]])
+        if shard_coefficients is not None and zf != 3:
+            raise ValueError(
+                f"shard_coefficients need zarr v3, but this pyramid is OME-Zarr "
+                f"{pyramid.meta.version} (zarr v{zf}).")
+        recorded = dict(getattr(pyramid, '_level_chunks', None) or {})
+        storage = getattr(pyramid, '_storage_chunks', None)
+
+        if remote:
+            zarr_group = _object_store_group(path, zf, "w" if overwrite else "a",
+                                             storage_options)
+        else:
+            zarr_group = tensorstore_writer._zarr_group(str(path), overwrite=overwrite,
+                                                        zarr_format=zf)
+        jobs = []                                    # (level path, array, output, kwargs)
+        for lvl, p in enumerate(paths):
+            if p not in todo:
+                continue
+            arr = das[p]
+            kw = dict(zarr_format=zf, region_size_mb=region_size_mb, max_workers=max_workers,
+                      backend=io_backend, overwrite=False)
+            # chunks: an exact shape -> chunks=, a size -> chunk_size_mb= (dyna solves it);
+            # neither -> what the pyramid recorded, else dyna's default (the input's own)
+            if chunk_shape is not None:
+                kw['chunks'] = _per_level(chunk_shape, lvl, 'chunk_shape', tuple_form=True)
+            elif chunk_size_mb is not None:
+                kw['chunk_size_mb'] = float(_per_level(chunk_size_mb, lvl, 'chunk_size_mb'))
+            elif p in recorded:
+                kw['chunks'] = tuple(recorded[p])
+            elif storage is not None and len(storage) == arr.ndim:
+                kw['chunks'] = tuple(min(int(c), int(s)) for c, s in zip(storage, arr.shape))
+            elif is_dask_array(arr):
+                kw['chunks'] = tuple(int(c) for c in get_array_chunks(arr))   # dask's own grid
+            if codecs is not None:
+                kw['compressor'] = codecs
+            if shard_coefficients is not None:
+                kw['shard_coefficients'] = _per_level(shard_coefficients, lvl,
+                                                      'shard_coefficients', tuple_form=True)
+            if zf == 3:
+                kw['dimension_names'] = tuple(pyramid.axes)
+            if remote and storage_options:
+                kw['storage_options'] = dict(storage_options)
+            jobs.append((p, arr, str(_store_join(path, p)), kw))
+
+        if use_multiprocessing and len(jobs) > 1:
+            # one spawned process per level, all levels at once (the arrays pickle:
+            # zarr / TensorStore by reference, numpy staging by value, op chains as-is)
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=len(jobs),
+                                     mp_context=multiprocessing.get_context("spawn")) as ex:
+                futures = [(p, ex.submit(_dyna_write_level, arr, out, kw))
+                           for p, arr, out, kw in jobs]
+                logs = [(p, f.result()) for p, f in futures]   # re-raises a worker error
+        else:
+            logs = [(p, (_dask_write_level if is_dask_array(arr) else _dyna_write_level)(
+                        arr, out, kw)) for p, arr, out, kw in jobs]
+        if self.verbose:
+            for p, log in logs:
+                if log.strip():
+                    logger.info(f"[PyramidIO] level {p}: " + " | ".join(
+                        ln.strip() for ln in log.splitlines() if ln.strip()))
         # write the multiscales / omero metadata onto the group (same as the sync path)
         pyramid.meta.connect_to_group(zarr_group)
         pyramid.meta._pending_changes = True
@@ -717,22 +867,25 @@ class PyramidIO:
 
     def _write_side_metadata(self, path, *, label_block, label_version, label_zarr_format,
                              attached_labels: dict, overwrite: bool, backend: str = 'sync',
-                             compressor=None, compressor_params=None) -> None:
+                             compressor=None, compressor_params=None,
+                             storage_options=None) -> None:
         """Post-array-write side metadata, shared by every write_pyramid exit:
         (1) if this is a LABEL image, attach its ``image-label`` block to the written
         group (belt-and-suspenders across backends; `save_changes` already writes it on
         the sync path); (2) write any attached image `labels` into ``<path>/labels/<name>``."""
         if label_block is not None:
-            group = _open_store_group(path, label_zarr_format, mode="a")
+            group = _open_store_group(path, label_zarr_format, mode="a",
+                                      storage_options=storage_options)
             _attach_image_label(group, label_block, label_version)
         if attached_labels:
             self._write_attached_labels(attached_labels, path, overwrite=overwrite,
                                         backend=backend, compressor=compressor,
-                                        compressor_params=compressor_params)
+                                        compressor_params=compressor_params,
+                                        storage_options=storage_options)
 
     def _write_attached_labels(self, labels: dict, path, *, overwrite: bool,
                                backend: str = 'sync', compressor=None,
-                               compressor_params=None) -> None:
+                               compressor_params=None, storage_options=None) -> None:
         """Write each entry of a pyramid's `labels` collection as an OME-Zarr label
         image under ``<path>/labels/<name>`` (registering it in the ``labels/`` group),
         carrying each label's own ``image-label`` metadata. The counterpart of
@@ -752,6 +905,7 @@ class PyramidIO:
                 label_name=name,
                 overwrite=overwrite,
                 backend=backend, compressor=compressor, compressor_params=compressor_params,
+                storage_options=storage_options,
             )
 
 
@@ -797,7 +951,9 @@ class PyramidIO:
                 pyramid._downscale_plan = saved
 
         # 2) re-read the on-disk base (zarr-backed -> downscaling reads from DISK)
-        disk = self.read_pyramid(str(path))
+        storage_options = write_kwargs.get('storage_options')
+        disk = self.read_pyramid(str(path), include_labels=False,
+                                 storage_options=storage_options)
 
         # 3) expand the plan for the level count / shapes / scales (metadata only)
         dk = {k: plan[k] for k in ('n_layers', 'min_dimension_size', 'scale_factor',
@@ -811,13 +967,31 @@ class PyramidIO:
         # 4) build coarser levels as DASK arrays by downsampling the ON-DISK base
         # (reads the stored base, never the expensive source graph; keeps everything
         # dask so chunking is controllable and there is no tensorstore dtype snag).
-        import dask.array as da  # local import
-        from ome_zarr_pyramid.utils.scale import mean_downscale, median_downscale, simple_downscale
-        method = {'simple': simple_downscale, 'mean': mean_downscale,
-                  'median': median_downscale}.get(plan.get('downscale_method', 'simple'), simple_downscale)
-        base_da = disk.dask_arrays[disk.meta.resolution_paths[0]]
+        from ome_zarr_pyramid.utils.scale import (as_tensorstore, crop_to_level, mean_downscale,
+                                                  median_downscale, simple_downscale)
+        # dask levels only for the legacy engines; the dyna engine streams DynamicArray
+        # levels (it cannot consume dask graphs)
+        if is_installed("dask") and write_kwargs.get('backend') in ('sync', 'tensorstore'):
+            method = {'simple': simple_downscale, 'mean': mean_downscale,
+                      'median': median_downscale}.get(plan.get('downscale_method', 'simple'),
+                                                      simple_downscale)
+            base_da = disk.dask_arrays[disk.meta.resolution_paths[0]]
+        else:
+            # no dask: the stored base as a DynamicArray; stride levels by lazy slicing,
+            # mean / median by TensorStore's downsample of the stored base, cut to the
+            # level sizes dask's coarsen gives
+            base_da = disk._arrays()[disk.meta.resolution_paths[0]]
+            base_ts = as_tensorstore(base_da)
+
+            def method(base, scale_factor, _m=plan.get('downscale_method', 'simple')):
+                if _m not in ('mean', 'median'):
+                    return simple_downscale(base, scale_factor=scale_factor)
+                from dyna_zarr import DynamicArray
+                level = ts.downsample(base_ts, [int(f) for f in scale_factor], method=_m)
+                return DynamicArray(crop_to_level(level, base.shape, scale_factor, _m))
         ndim = base_da.ndim
         level_arrays = [base_da]
+        level_factors = [tuple([1] * ndim)]
         # Per-level factors, SOLVED against each target shape rather than rounded from
         # the ratio. `round(base/tgt)` silently produced an off-by-one level whenever the
         # rounded ratio did not actually reproduce `tgt` (e.g. base=101 tgt=50), and it
@@ -838,12 +1012,25 @@ class PyramidIO:
                        else tuple(_level_size(base_da.shape[a], factor[a], dmethod)
                                   for a in range(ndim)))
             else:
-                tgt = full.dask_arrays[fpaths[i]].shape
-                solved = [_solve_axis_factor(base_da.shape[a], tgt[a], dmethod)
-                          for a in range(ndim)]
-                factor = tuple(int(f) if f is not None
-                               else max(1, int(round(base_da.shape[a] / tgt[a])))
-                               for a, f in enumerate(solved))
+                tgt = full.layers[fpaths[i]].shape
+                # The factor the level's SCALE metadata states comes first: it is what the
+                # written store will claim. The shape alone is ambiguous whenever an extent
+                # is not divisible (41 -> 6 fits factors 7 AND 8), and the solver returns
+                # the smallest fit - 7 - while the metadata said 8: pixels and physical
+                # coordinates silently disagreed.
+                s0, si = full.meta.get_scale(fpaths[0]), full.meta.get_scale(fpaths[i])
+                stated = [si[a] / s0[a] if s0[a] else None for a in range(ndim)]
+                factor = []
+                for a in range(ndim):
+                    st = stated[a]
+                    if (st is not None and abs(st - round(st)) < 1e-6 and round(st) >= 1
+                            and _level_size(base_da.shape[a], int(round(st)), dmethod) == tgt[a]):
+                        factor.append(int(round(st)))
+                        continue
+                    f = _solve_axis_factor(base_da.shape[a], tgt[a], dmethod)
+                    factor.append(int(f) if f is not None
+                                  else max(1, int(round(base_da.shape[a] / tgt[a]))))
+                factor = tuple(factor)
             got = tuple(_level_size(base_da.shape[a], factor[a], dmethod) for a in range(ndim))
             if got != tuple(tgt):
                 raise ValueError(
@@ -855,37 +1042,78 @@ class PyramidIO:
                     f"drop_downscale_plan()."
                 )
             level_arrays.append(method(base_da, scale_factor=factor))
+            level_factors.append(factor)
 
-        unit_clean = [u for u in full.meta.unit_list if u is not None]
-        full_dask = Pyramid().from_arrays(
-            arrays=level_arrays, axis_order=full.meta.axis_order,
-            unit_list=unit_clean if unit_clean else None,
-            scales=[full.meta.get_scale(p) for p in fpaths],
-            version=full.meta.version,
-            name=full.meta.multiscales.get('name', 'unnamed') if full.meta.metadata else 'unnamed',
-        )
-        full_dask._storage_chunks = getattr(pyramid, '_storage_chunks', None)
-        full_dask = _rechunked(full_dask)
-        # `full_dask` was rebuilt via from_arrays (axes/scales/units/name only), so
-        # overlay the SOURCE pyramid's non-dataset metadata (omero channels/colours/
-        # windows and any custom top-level attrs). Without this, writing the extra
-        # levels re-saves the group attrs and clobbers omero set via set_channels /
-        # set_display_range. Keep full_dask's own `multiscales` (all levels, correct
-        # scales/translations).
-        import copy as _copy
-        src_md = pyramid.meta.metadata if pyramid.meta is not None else None
-        if src_md and full_dask.meta is not None and full_dask.meta.metadata is not None:
-            # mirror the source's non-`multiscales` metadata EXACTLY: add its
-            # omero/image-label/custom attrs, and DROP any keys full_dask auto-added
-            # that the source lacks (e.g. from_arrays' empty omero on a label image).
-            # Keep full_dask's own `multiscales` (all levels + correct scales).
-            ms = full_dask.meta.metadata.get('multiscales')
-            new_md = {k: _copy.deepcopy(v) for k, v in src_md.items() if k != 'multiscales'}
-            if ms is not None:
-                new_md['multiscales'] = ms
-            full_dask.meta.metadata = new_md
-            full_dask.meta._pending_changes = True
-        self.write_pyramid(full_dask, path, layers=extra, overwrite=False, **write_kwargs)
+        def _build(arrays):
+            """The full pyramid over `arrays`, carrying the source's metadata."""
+            unit_clean = [u for u in full.meta.unit_list if u is not None]
+            full_dask = Pyramid().from_arrays(
+                arrays=arrays, axis_order=full.meta.axis_order,
+                unit_list=unit_clean if unit_clean else None,
+                scales=[full.meta.get_scale(p) for p in fpaths],
+                version=full.meta.version,
+                name=full.meta.multiscales.get('name', 'unnamed') if full.meta.metadata else 'unnamed',
+            )
+            full_dask._storage_chunks = getattr(pyramid, '_storage_chunks', None)
+            full_dask = _rechunked(full_dask)
+            # `full_dask` was rebuilt via from_arrays (axes/scales/units/name only), so
+            # overlay the SOURCE pyramid's non-dataset metadata (omero channels/colours/
+            # windows and any custom top-level attrs). Without this, writing the extra
+            # levels re-saves the group attrs and clobbers omero set via set_channels /
+            # set_display_range. Keep full_dask's own `multiscales` (all levels, correct
+            # scales/translations).
+            import copy as _copy
+            src_md = pyramid.meta.metadata if pyramid.meta is not None else None
+            if src_md and full_dask.meta is not None and full_dask.meta.metadata is not None:
+                # mirror the source's non-`multiscales` metadata EXACTLY: add its
+                # omero/image-label/custom attrs, and DROP any keys full_dask auto-added
+                # that the source lacks (e.g. from_arrays' empty omero on a label image).
+                # Keep full_dask's own `multiscales` (all levels + correct scales).
+                ms = full_dask.meta.metadata.get('multiscales')
+                new_md = {k: _copy.deepcopy(v) for k, v in src_md.items() if k != 'multiscales'}
+                if ms is not None:
+                    new_md['multiscales'] = ms
+                full_dask.meta.metadata = new_md
+                full_dask.meta._pending_changes = True
+            return full_dask
+
+        level_kwargs = dict(write_kwargs)
+        if (level_kwargs.get('backend') == 'dyna' and level_kwargs.get('compressor') is None
+                and pyramid.compressor is not None):
+            # full_dask was rebuilt from arrays, so its compressor fell back to the
+            # default: write the coarser levels with the SOURCE's codec, like level 0
+            level_kwargs['compressor'] = pyramid.compressor
+
+        # CASCADE ('simple' on the dyna engine): level i from the STORED level i-1, not
+        # from L0. Stride composes exactly (L0[::a][::b] == L0[::a*b]), so the pixels are
+        # identical, while L0 is read once instead of once per level (1.2 GB / 4 levels:
+        # 3.9 -> 2.1 GB read, every level still written in whole chunks). Not for
+        # mean/median, which do not compose exactly (rounding twice; median of medians),
+        # nor with use_multiprocessing (a cascade is sequential by nature).
+        cascade = (level_kwargs.get('backend') == 'dyna' and dmethod == 'simple'
+                   and not level_kwargs.get('use_multiprocessing'))
+        if not cascade:
+            self.write_pyramid(_build(level_arrays), path, layers=extra, overwrite=False,
+                               **level_kwargs)
+            return
+        from dyna_zarr import DynamicArray
+        for i in range(1, len(fpaths)):
+            prev, cur = level_factors[i - 1], level_factors[i]
+            if all(c % p == 0 for c, p in zip(cur, prev)):
+                if _is_remote_store(path):
+                    from dyna_zarr import io as dyna_io
+                    parent = dyna_io.read(str(_store_join(path, fpaths[i - 1])),
+                                          storage_options=storage_options)
+                else:
+                    parent = DynamicArray(zarr.open_array(str(Path(path) / fpaths[i - 1]),
+                                                          mode='r'))
+                rel = tuple(c // p for c, p in zip(cur, prev))
+                stepped = simple_downscale(parent, scale_factor=rel)
+                if tuple(stepped.shape) == tuple(level_arrays[i].shape):
+                    level_arrays[i] = stepped
+                # else: keep the from-L0 level (an irregular progression)
+            self.write_pyramid(_build(level_arrays), path, layers=[fpaths[i]],
+                               overwrite=False, **level_kwargs)
 
     def write_labels(self,
                      label_pyramid: Pyramid,
@@ -1051,7 +1279,8 @@ class PyramidIO:
                                    dest_path: Union[str, Path],
                                    max_workers: int = 4,
                                    region_size_mb: float = 8.0,
-                                   gc_interval: float = 15.0) -> None:
+                                   gc_interval: float = 15.0,
+                                   compressor_config=None) -> None:
         """Write all layers concurrently using a unified queue-based pipeline.
         
         All regions from all layers are placed in a single queue and processed
@@ -1068,13 +1297,14 @@ class PyramidIO:
             # `Pyramid.downscale()` on a read pyramid) expose a ts dtype, which
             # zarr.create / np.dtype can't consume directly.
             dtype = tensorstore_writer._normalize_dtype(array.dtype, array)
-            if hasattr(array, 'chunksize'):
-                # dask array: `.chunks` is a tuple of per-axis chunk-size tuples;
-                # `.chunksize` is the (uniform) tuple of ints we want.
-                chunks = tuple(int(c) for c in array.chunksize)
-            elif hasattr(array, 'chunks'):
-                # zarr array: `.chunks` is already a tuple of ints.
-                chunks = tuple(int(c) for c in array.chunks)
+            # the storage chunks `rechunk` recorded, else the array's own (dask's
+            # chunksize, zarr's / a DynamicArray's chunks, a TensorStore's layout)
+            recorded = (getattr(pyramid, '_level_chunks', None) or {}).get(str(layer_path))
+            own = get_array_chunks(array)
+            if recorded is not None:
+                chunks = tuple(int(c) for c in recorded)
+            elif own is not None:
+                chunks = tuple(int(c) for c in own)
             else:
                 chunks = tuple([256] * len(shape))
             
@@ -1084,7 +1314,8 @@ class PyramidIO:
                 zf = pyramid.meta.zarr_format if pyramid.meta else 2
                 tensorstore_writer.create_group_array(
                     zarr_group, layer_path, shape, chunks, dtype, zf,
-                    pyramid.compressor, list(pyramid.axes) if zf == 3 else None)
+                    compressor_config if compressor_config is not None else pyramid.compressor,
+                    list(pyramid.axes) if zf == 3 else None)
 
             zarr_array = zarr_group[layer_path]
             
@@ -1142,7 +1373,7 @@ class PyramidIO:
                     for region_slice in info['region_slices']:
                         if state.get('error'):
                             break
-                        if isinstance(array, da.Array):
+                        if is_dask_array(array):
                             data = array[region_slice].compute()
                         else:
                             data = np.asarray(array[region_slice])
@@ -1251,10 +1482,6 @@ class PyramidIO:
         if self.verbose:
             logger.info(f"[PyramidIO] Wrote all {total_regions} regions in {elapsed:.1f}s ({throughput:.1f} regions/s)")
 
-    # ------------------------------------------------------------------
-    # Multiprocessing path (one OS process per layer)
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _get_store_path(zarr_group: zarr.Group) -> Optional[str]:
         """Return the filesystem root of a zarr group's store, or None."""
@@ -1273,113 +1500,17 @@ class PyramidIO:
                 pass
         return None
 
-    def _write_all_layers_multiprocessing(self,
-                                          pyramid: Pyramid,
-                                          zarr_group: zarr.Group,
-                                          layers_to_write: List[str],
-                                          dest_path: Union[str, Path],
-                                          max_workers: int = 4,
-                                          region_size_mb: float = 8.0) -> None:
-        """Write all layers in parallel using one OS process per layer.
-
-        Each process re-opens its own zarr handles, giving complete event-loop
-        isolation and true CPU parallelism across layers.  Within each process,
-        *threads_per_layer* writer threads drain a per-layer read queue.
-
-        Requires the source pyramid to be backed by an accessible zarr store on
-        disk (i.e. ``pyramid.gr`` must not be None).  For in-memory pyramids
-        use ``use_multiprocessing=False``.
-        """
-        if pyramid.gr is None:
-            raise ValueError(
-                "Multiprocessing mode requires a disk-backed pyramid (pyramid.gr is None). "
-                "Call write_pyramid(..., use_multiprocessing=False) for in-memory pyramids."
-            )
-
-        source_zarr_path = self._get_store_path(pyramid.gr)
-        if source_zarr_path is None:
-            raise ValueError(
-                "Cannot determine source zarr path for multiprocessing. "
-                "Use write_pyramid(..., use_multiprocessing=False) instead."
-            )
-
-        dest_zarr_path = str(dest_path)
-        num_layers      = len(layers_to_write)
-        # Distribute worker budget evenly; every layer gets at least 1 writer thread
-        threads_per_layer = max(1, max_workers // num_layers)
-
-        start_time   = time.time()
-        total_regions = 0
-        tasks: List[dict] = []
-
-        for layer_path in layers_to_write:
-            array  = pyramid.layers[layer_path]
-            shape  = tuple(int(s) for s in array.shape)
-            dtype  = tensorstore_writer._normalize_dtype(array.dtype, array)  # ts dtype -> np.dtype
-            chunks = tuple(int(c) for c in getattr(array, 'chunks', tuple([256] * len(shape))))
-
-            # Pre-create destination array in main process (metadata write; safe)
-            if layer_path not in zarr_group:
-                _create_layer_array(Path(dest_path), layer_path, shape, chunks, dtype, pyramid)
-
-            region_shape = _compute_region_shape_for_layer(shape, chunks, region_size_mb, dtype)
-
-            # Serialise slices as plain [[start,stop],...] lists (slices aren't picklable)
-            region_slices_raw = [
-                [[int(start_indices[i]),
-                  int(min(start_indices[i] + int(region_shape[i]), int(shape[i])))]
-                 for i in range(len(shape))]
-                for start_indices in itertools.product(
-                    *[range(0, int(s), int(r)) for s, r in zip(shape, region_shape)]
-                )
-            ]
-            total_regions += len(region_slices_raw)
-
-            if self.verbose:
-                logger.info(f"[PyramidIO] Layer {layer_path}: {len(region_slices_raw)} regions")
-
-            tasks.append({
-                'source_zarr_path':  source_zarr_path,
-                'source_layer_path': layer_path,
-                'dest_zarr_path':    dest_zarr_path,
-                'dest_layer_path':   layer_path,
-                'region_slices_raw': region_slices_raw,
-                'threads_per_layer': threads_per_layer,
-                'verbose':           self.verbose,
-            })
-
-        if self.verbose:
-            logger.info(
-                f"[PyramidIO] Writing {total_regions} total regions across "
-                f"{num_layers} layers using {num_layers} processes × "
-                f"{threads_per_layer} threads each"
-            )
-
-        with ProcessPoolExecutor(max_workers=num_layers) as executor:
-            futures = {executor.submit(_write_layer_process_worker, t): t['dest_layer_path']
-                       for t in tasks}
-            for fut in as_completed(futures):
-                layer_path, written, total = fut.result()   # propagates exceptions
-                if self.verbose:
-                    logger.info(f"[PyramidIO] Layer {layer_path}: wrote {written}/{total} regions")
-
-        elapsed    = time.time() - start_time
-        throughput = total_regions / elapsed if elapsed > 0 else 0
-        if self.verbose:
-            logger.info(
-                f"[PyramidIO] Wrote all {total_regions} regions in "
-                f"{elapsed:.1f}s ({throughput:.1f} regions/s)"
-            )
-
 
 class IO:
     """Convenience wrapper for high-performance pyramid I/O operations."""
 
-    def read_pyramid(self, path: Union[str, Path], include_labels: bool = True) -> Pyramid:
-        """Read a pyramid from a path. `include_labels` also loads the image's NGFF
-        ``labels/`` collection into `Pyramid.labels` (lazy). See
+    def read_pyramid(self, path: Union[str, Path], include_labels: bool = True,
+                     storage_options: Optional[dict] = None) -> Pyramid:
+        """Read a pyramid from a path or object-store URL. `include_labels` also loads
+        the image's NGFF ``labels/`` collection into `Pyramid.labels` (lazy). See
         :meth:`PyramidIO.read_pyramid`."""
-        return PyramidIO().read_pyramid(path, include_labels=include_labels)
+        return PyramidIO().read_pyramid(path, include_labels=include_labels,
+                                        storage_options=storage_options)
 
     def read_labels(self, path: Union[str, Path], name: Optional[str] = None) -> Pyramid:
         """Read a single OME-Zarr label image as a `Pyramid` (with ``image-label``
@@ -1394,14 +1525,12 @@ class IO:
                       max_workers: int = 4,
                       region_size_mb: float = 8.0,
                       use_multiprocessing: bool = False,
-                      backend: str = 'sync',
+                      backend: str = 'auto',
                       **kwargs) -> None:
-        """Write a pyramid to a path using high-performance async processing.
-
-        ``backend='tensorstore'`` dispatches to the async TensorStore writer;
-        any extra ``**kwargs`` (``compressor``, ``compressor_params``,
-        ``max_concurrency``, ``num_readers``, ``queue_size``,
-        ``max_concurrent_layers``, ``gc_interval``) are forwarded to it.
+        """Write a pyramid to a path. ``backend`` picks the write engine
+        (``'auto'``, ``'dyna'``, ``'sync'``, ``'tensorstore'``); extra ``**kwargs``
+        (``compressor``, ``chunk_shape``, ``shard_coefficients``, ...) are forwarded.
+        See :meth:`PyramidIO.write_pyramid`.
         """
         return PyramidIO().write_pyramid(
             pyramid=pyramid,

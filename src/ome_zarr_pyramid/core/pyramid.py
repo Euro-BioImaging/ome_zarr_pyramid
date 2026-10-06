@@ -4,6 +4,9 @@ This module provides a modernized implementation following the multiscales.py de
 from eubi_bridge, with support for multiple array types, better separation of concerns,
 and full TensorStore integration for high-performance operations.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import asyncio
 import copy
@@ -13,7 +16,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
-import dask.array as da
 import numpy as np
 import zarr
 
@@ -21,9 +23,86 @@ from ome_zarr_pyramid.utils import defaults
 from ome_zarr_pyramid.utils.compressor_config import CompressorConfig
 from ome_zarr_pyramid.utils.json_utils import make_json_safe
 from ome_zarr_pyramid.utils.logging_config import get_logger
+from ome_zarr_pyramid.utils.optional_deps import is_dask_array, require
 from ome_zarr_pyramid.utils.scale import Downscaler
 
+if TYPE_CHECKING:
+    import dask.array as da
+
 logger = get_logger(__name__)
+
+
+def _is_tensorstore(arr) -> bool:
+    return hasattr(arr, "read") and hasattr(arr, "spec")
+
+
+def _numpy_dtype(dtype) -> np.dtype:
+    """A numpy dtype, also from a TensorStore dtype (``.numpy_dtype``)."""
+    return np.dtype(getattr(dtype, "numpy_dtype", dtype))
+
+
+#: bytes read at a time by the streaming statistics
+_STATS_BLOCK_BYTES = 64 << 20
+#: integer value ranges up to this many values are counted exactly
+_EXACT_COUNT_VALUES = 1 << 22
+#: bins of the histogram for floats / wide integer ranges
+_HISTOGRAM_BINS = 1 << 16
+
+
+def _blocks(arr):
+    """*arr* (any lazy array) as numpy blocks along its first axis, each of
+    at most ``_STATS_BLOCK_BYTES``."""
+    if arr.ndim == 0:
+        yield np.asarray(arr)
+        return
+    row = max(1, int(np.prod(arr.shape[1:])) * _numpy_dtype(arr.dtype).itemsize)
+    step = max(1, _STATS_BLOCK_BYTES // row)
+    for i in range(0, arr.shape[0], step):
+        yield np.asarray(arr[i:i + step])
+
+
+def _channel_stats(arr, percentiles=None):
+    """(min, max, [percentile values]) of one channel, streamed block by block
+    in bounded memory.  Percentiles interpolate linearly between order
+    statistics, as ``np.percentile`` does: exact for integer data whose value
+    range is at most ``_EXACT_COUNT_VALUES`` (every 8- / 16-bit image), from a
+    ``_HISTOGRAM_BINS``-bin histogram otherwise (like dask's percentile, an
+    approximation)."""
+    lo = hi = None
+    for block in _blocks(arr):
+        if block.size:
+            bmin, bmax = block.min(), block.max()
+            lo = bmin if lo is None else min(lo, bmin)
+            hi = bmax if hi is None else max(hi, bmax)
+    if lo is None:
+        raise ValueError("cannot compute statistics of an empty channel")
+    if not percentiles:
+        return float(lo), float(hi), []
+    dtype = _numpy_dtype(arr.dtype)
+    exact = (dtype.kind in "biu") and int(hi) - int(lo) + 1 <= _EXACT_COUNT_VALUES
+    if exact:
+        counts = np.zeros(int(hi) - int(lo) + 1, np.int64)
+        for block in _blocks(arr):
+            counts += np.bincount((block.ravel().astype(np.int64) - int(lo)),
+                                  minlength=counts.size)
+        values = np.arange(int(lo), int(hi) + 1, dtype=np.float64)
+    else:
+        edges = np.linspace(float(lo), float(hi), _HISTOGRAM_BINS + 1)
+        counts = np.zeros(_HISTOGRAM_BINS, np.int64)
+        for block in _blocks(arr):
+            counts += np.histogram(block.ravel(), bins=edges)[0]
+        values = (edges[:-1] + edges[1:]) / 2
+        values[0], values[-1] = float(lo), float(hi)
+    cum = np.cumsum(counts)
+    n = int(cum[-1])
+    out = []
+    for p in percentiles:
+        rank = p / 100.0 * (n - 1)
+        k0, k1 = int(np.floor(rank)), int(np.ceil(rank))
+        v0 = values[np.searchsorted(cum, k0, side="right")]
+        v1 = values[np.searchsorted(cum, k1, side="right")]
+        out.append(float(v0 + (v1 - v0) * (rank - k0)))
+    return float(lo), float(hi), out
 
 
 def cast_to_dict(value: Any) -> Dict[str, Any]:
@@ -989,7 +1068,7 @@ class Pyramid:
           different codec.
         - Otherwise, `compressor` is used if given, else defaults to blosc.
         """
-        if isinstance(arrays, (np.ndarray, da.Array, zarr.Array)):
+        if isinstance(arrays, (np.ndarray, zarr.Array)) or is_dask_array(arrays):
             arrays = [arrays]
 
         base_array = arrays[0]
@@ -1121,10 +1200,24 @@ class Pyramid:
     @property
     def base_array(self) -> Union[da.Array, zarr.Array]:
         """Get the base (highest resolution) array."""
-        arr = self.layers['0']
-        if isinstance(arr, zarr.Array):
-            return da.from_zarr(arr)
-        return arr
+        return self._arrays()['0']
+
+    def _has_dask_layer(self) -> bool:
+        """Whether any level is a dask array (then dask is installed)."""
+        return self.meta is not None and any(
+            is_dask_array(self.layers[p]) for p in self.meta.resolution_paths)
+
+    def _arrays(self) -> Dict[str, Any]:
+        """Every level as a lazy array, DynamicArray-first: zarr, numpy and
+        TensorStore levels as dyna_zarr DynamicArrays (no dask needed), a
+        dask-backed pyramid's levels as they are (``dask_arrays``).  What the
+        pyramid's own operations (indexing, level selection, operators,
+        statistics) work on."""
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        if self._has_dask_layer():
+            return self.dask_arrays
+        return self.dynamic_arrays
 
     @property
     def dask_arrays(self) -> Dict[str, da.Array]:
@@ -1144,6 +1237,7 @@ class Pyramid:
         """
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
+        da = require("dask.array", "Pyramid.dask_arrays")
         result = {}
         for path in self.meta.resolution_paths:
             arr = self.layers[path]
@@ -1192,8 +1286,8 @@ class Pyramid:
         callers offering ``backend="auto"`` can probe it per call rather than guarding a
         heavy property with try/except.
 
-        Distinct from ``io._is_dyna_pyramid``, which asks whether the layers ALREADY are
-        DynamicArrays (to pick the write path). This asks whether they COULD be.
+        The write engine uses the same rule: ``write_pyramid(backend='auto')`` streams
+        through dyna whenever no level is dask.
         """
         if self.meta is None:
             return False
@@ -1206,7 +1300,8 @@ class Pyramid:
         except Exception:
             return False
         return bool(layers) and all(
-            isinstance(arr, (DynamicArray, zarr.Array, np.ndarray)) for arr in layers
+            isinstance(arr, (DynamicArray, zarr.Array, np.ndarray)) or _is_tensorstore(arr)
+            for arr in layers
         )
 
     @property
@@ -1233,9 +1328,10 @@ class Pyramid:
             arr = self.layers[path]
             if isinstance(arr, DynamicArray):
                 result[str(path)] = arr
-            elif isinstance(arr, (zarr.Array, np.ndarray)):
+            elif isinstance(arr, (zarr.Array, np.ndarray)) or _is_tensorstore(arr):
                 # numpy is wrappable, but note it is already resident: the pull model gives
-                # laziness and op fusion here, not memory-boundedness.
+                # laziness and op fusion here, not memory-boundedness. A TensorStore layer
+                # (a `downscale(defer=False)` level) is read lazily like zarr.
                 result[str(path)] = DynamicArray(arr)
             else:
                 raise TypeError(
@@ -1476,6 +1572,12 @@ class Pyramid:
             ``defaults.scale_factor_map``). See ``derive_downscale_plan``.
         downscale_method : str
             'simple' (nearest/stride - correct for LABELS), 'mean', or 'median'.
+            'simple' levels are written as a cascade (each from the stored level above;
+            bit-identical to striding level 0). 'mean' and 'median' derive every level
+            from level 0, since cascading them is not equivalent (rounding twice, edge
+            blocks reweighted, median of medians). 'median' over an even-sized block
+            takes the LOWER of the two middle values (TensorStore's median), so median
+            levels carry a small downward bias.
         defer : bool
             Record a plan and build nothing (default True), or eagerly build all
             levels now (False).
@@ -1609,6 +1711,16 @@ class Pyramid:
         full._downscale_plan = recipe
         full._downscale_plan_active = True
         sc = getattr(self, '_storage_chunks', None)
+        if sc is None:
+            # nothing recorded (an in-memory source, not read from disk): the expanded
+            # levels may be views without a storage grid (an in-memory TensorStore), so
+            # record level 0's own chunks now, or the writer falls back to a default grid
+            from ome_zarr_pyramid.utils.array_utils import get_array_chunks
+            try:
+                own = get_array_chunks(self.layers[self.meta.resolution_paths[0]])
+            except Exception:
+                own = None
+            sc = tuple(int(c) for c in own) if own is not None else None
         if sc is not None:
             full._storage_chunks = sc
         return full
@@ -1684,11 +1796,17 @@ class Pyramid:
 
         new_arrays = []
         base_chunk = None
+        level_chunks = {}
+        level_arrays = self._arrays()
         for lvl, p in enumerate(paths):
-            a = self.dask_arrays[p]
-            spec = self._resolve_level_chunks(chunk_shape, chunk_size_mb, lvl, a.shape, axes, a.dtype)
+            a = level_arrays[p]
+            spec = self._resolve_level_chunks(chunk_shape, chunk_size_mb, lvl, a.shape, axes,
+                                              _numpy_dtype(a.dtype))
             if base_chunk is None:
                 base_chunk = spec
+            level_chunks[str(p)] = tuple(int(c) for c in spec)
+            # dask: rechunk the graph; a DynamicArray reads any region regardless of
+            # chunking (its rechunk is a no-op), so the chunks are recorded for the writer
             new_arrays.append(a.rechunk(spec))
 
         compressor = None if isinstance(new_arrays[0], zarr.Array) else self.compressor
@@ -1707,6 +1825,7 @@ class Pyramid:
             new_pyr.meta.metadata = copy.deepcopy(self.meta.metadata)
             new_pyr.meta._pending_changes = True
         new_pyr._storage_chunks = tuple(base_chunk) if base_chunk is not None else None
+        new_pyr._level_chunks = level_chunks
         return new_pyr
 
     def _read_ct(self, path):
@@ -1774,7 +1893,8 @@ class Pyramid:
                 raise ValueError(f"isel: axis '{a}' not present in pyramid axes '{axstr}'")
         paths = self.meta.resolution_paths
         base_scale, _ = self._read_ct(paths[0])
-        base_shape = self.dask_arrays[paths[0]].shape
+        arrays = self._arrays()
+        base_shape = arrays[paths[0]].shape
 
         resolved = {}
         for a, idx in indexers.items():
@@ -1829,7 +1949,7 @@ class Pyramid:
 
         new_arrays, new_scales, new_translations = [], [], []
         for p in paths:
-            arr = self.dask_arrays[p]
+            arr = arrays[p]
             lvl_scale, lvl_trans = self._read_ct(p)
             if lvl_trans is None:
                 lvl_trans = [0.0] * ndim
@@ -1867,7 +1987,12 @@ class Pyramid:
             drop = {j for j, rr in resolved.items() if rr[0] == "int"}
             for i, lis in list_takes:
                 pos = sum(1 for j in range(i) if j not in drop)  # axis position after drops
-                out = out[(slice(None),) * pos + (np.asarray(lis, dtype=int),)]
+                if is_dask_array(out):
+                    out = out[(slice(None),) * pos + (np.asarray(lis, dtype=int),)]
+                else:                       # DynamicArray: gather by stacking the picks
+                    from dyna_zarr import operations as dops
+                    out = dops.stack([out[(slice(None),) * pos + (int(k),)] for k in lis],
+                                     axis=pos)
             new_arrays.append(out)
             new_scales.append([sc[i] for i in keep])
             new_translations.append([tr[i] for i in keep])
@@ -1987,7 +2112,8 @@ class Pyramid:
         """Build a new pyramid from the given (sorted, unique) level indices, taking
         each level's array + coordinate metadata; the first becomes level 0."""
         paths = self.meta.resolution_paths
-        arrays = [self.dask_arrays[paths[k]] for k in sel]
+        level_arrays = self._arrays()
+        arrays = [level_arrays[paths[k]] for k in sel]
         scales = [self.meta.get_scale(paths[k]) for k in sel]
         new = Pyramid().from_arrays(
             arrays, axis_order=self.meta.axis_order, unit_list=self.meta.unit_list,  # type: ignore
@@ -2362,9 +2488,9 @@ class Pyramid:
         channels = omero.get("channels", [])
         if not channels:
             axstr = new.meta.axis_order
-            base = new.dask_arrays[new.meta.resolution_paths[0]]
+            base = new.layers[new.meta.resolution_paths[0]]
             nch = base.shape[axstr.index("c")] if "c" in axstr else 1
-            new.meta.autocompute_omerometa(nch, base.dtype)
+            new.meta.autocompute_omerometa(nch, _numpy_dtype(base.dtype))
             omero = new.meta.metadata["omero"]
             channels = omero["channels"]
 
@@ -2415,13 +2541,14 @@ class Pyramid:
             raise ValueError(f"set_display_range: method must be 'minmax' or 'percentile', got {method!r}")
 
         paths = self.meta.resolution_paths
+        level_arrays = self._arrays()
         if stats_level is None:
             sidx = 0
         elif stats_level == "auto":
             sidx = len(paths) - 1
             for i, p in enumerate(paths):
-                a = self.dask_arrays[p]
-                if int(np.prod(a.shape)) * a.dtype.itemsize <= auto_max_bytes:
+                a = level_arrays[p]
+                if int(np.prod(a.shape)) * _numpy_dtype(a.dtype).itemsize <= auto_max_bytes:
                     sidx = i
                     break
         elif isinstance(stats_level, int):
@@ -2431,7 +2558,7 @@ class Pyramid:
         if not (0 <= sidx < len(paths)):
             raise IndexError(f"set_display_range: stats_level {sidx} out of range")
 
-        arr = self.dask_arrays[paths[sidx]]
+        arr = level_arrays[paths[sidx]]
         axstr = self.meta.axis_order
         ndim = arr.ndim
         if "c" in axstr:
@@ -2444,14 +2571,26 @@ class Pyramid:
         else:
             chans = [arr]
 
-        mins = [float(v) for v in da.compute(*[c.min() for c in chans])]
-        maxs = [float(v) for v in da.compute(*[c.max() for c in chans])]
-        if method == "percentile":
-            pcs = da.compute(*[da.percentile(c.reshape(-1), [p_low, p_high]) for c in chans])
-            lows = [float(p[0]) for p in pcs]
-            highs = [float(p[1]) for p in pcs]
-        else:
-            lows, highs = mins, maxs
+        if is_dask_array(arr):
+            da = require("dask.array", "Pyramid.set_display_range on a dask-backed pyramid")
+            mins = [float(v) for v in da.compute(*[c.min() for c in chans])]
+            maxs = [float(v) for v in da.compute(*[c.max() for c in chans])]
+            if method == "percentile":
+                pcs = da.compute(*[da.percentile(c.reshape(-1), [p_low, p_high]) for c in chans])
+                lows = [float(p[0]) for p in pcs]
+                highs = [float(p[1]) for p in pcs]
+            else:
+                lows, highs = mins, maxs
+        else:                               # streamed in bounded memory (no dask)
+            stats = [_channel_stats(c, [p_low, p_high] if method == "percentile" else None)
+                     for c in chans]
+            mins = [s[0] for s in stats]
+            maxs = [s[1] for s in stats]
+            if method == "percentile":
+                lows = [s[2][0] for s in stats]
+                highs = [s[2][1] for s in stats]
+            else:
+                lows, highs = mins, maxs
 
         # clone (share arrays, deep-copy metadata), then rewrite the omero windows
         new = self._clone_metadata_only()
@@ -2478,7 +2617,7 @@ class Pyramid:
     # a boolean pyramid, not a plain bool); identity hashing is preserved.
     # ------------------------------------------------------------------
 
-    def _clone_with_arrays(self, arrays: List[da.Array]) -> 'Pyramid':
+    def _clone_with_arrays(self, arrays: List[Any]) -> 'Pyramid':
         """A new pyramid with `arrays` (one per level) in place of the current
         layers, carrying over all metadata (shape-preserving)."""
         if self.meta is None:
@@ -2508,7 +2647,11 @@ class Pyramid:
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
         paths = self.meta.resolution_paths
-        out: List[da.Array] = []
+        out: List[Any] = []
+        # dask only when an operand is dask-backed (dyna does not consume dask graphs)
+        use_dask = (self._has_dask_layer() or is_dask_array(other)
+                    or (isinstance(other, Pyramid) and other._has_dask_layer()))
+        mine = self.dask_arrays if use_dask else self._arrays()
         if isinstance(other, Pyramid):
             if other.meta is None:
                 raise RuntimeError("operand Pyramid not initialized")
@@ -2519,21 +2662,23 @@ class Pyramid:
             if len(opaths) != len(paths):
                 raise ValueError(
                     f"pyramids have different numbers of levels ({len(paths)} vs {len(opaths)})")
+            theirs = other.dask_arrays if use_dask else other._arrays()
             for p, q in zip(paths, opaths):
-                a, b = self.dask_arrays[p], other.dask_arrays[q]
+                a, b = mine[p], theirs[q]
                 if a.shape != b.shape:
                     raise ValueError(f"pyramids differ in shape at level {p}: {a.shape} vs {b.shape}")
                 out.append(func(b, a) if reflected else func(a, b))
         else:  # scalar / ndarray / dask array -> broadcast against each level
             for p in paths:
-                a = self.dask_arrays[p]
+                a = mine[p]
                 out.append(func(other, a) if reflected else func(a, other))
         return self._clone_with_arrays(out)
 
     def _unary_op(self, func) -> 'Pyramid':
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
-        return self._clone_with_arrays([func(self.dask_arrays[p]) for p in self.meta.resolution_paths])
+        arrays = self._arrays()
+        return self._clone_with_arrays([func(arrays[p]) for p in self.meta.resolution_paths])
 
     # arithmetic
     def __add__(self, o): return self._binary_op(o, operator.add)

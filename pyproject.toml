@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.0.8"
+version = "0.0.9"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 # 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
@@ -40,25 +40,37 @@ classifiers = [
 # `import`.
 dependencies = [
     "zarr",
-    "dask",
     "tensorstore",
     "numpy",
     "numcodecs",          # utils/compressor_config.py, core/pyramid.py (codec configs)
     "pydantic>=2",        # utils/compressor_config.py (ConfigDict/field_validator = v2)
+    # the arrays a Pyramid works on without dask: zarr / numpy / TensorStore levels
+    # wrapped as DynamicArray (indexing, operators, statistics, the dyna write path).
+    # 0.0.7: numpy + TensorStore wrapping, ufuncs, stack, tuple-axis reductions.
+    # 0.0.9: the write engine - io.write(dimension_names=), io.create_sink (the dask
+    # pump), TensorStore sources keeping their chunks / codecs / shards.
+    "dyna-zarr>=0.0.9",
 ]
 
 [project.optional-dependencies]
+# Object stores (s3://, gs://, az://) through the dyna engine: obstore opens the NGFF
+# group with the same storage_options names dyna uses for the arrays.
+remote = ["obstore>=0.11"]
+# The LEGACY https://<endpoint>/<bucket>/<key> form (s3fs options, 'sync' engine).
 s3 = ["s3fs"]
-# The dyna backend: `Pyramid.dynamic_arrays` and the memory-bounded write path in
-# `IO.write_pyramid(backend="dyna")`. Imported lazily at each call site, so a plain
-# install stays light. Pinned >=0.0.5 because 0.0.4 is YANKED (its wheel omitted the
-# dyna_zarr.operations subpackage and could not be imported at all).
-dyna = ["dyna-zarr>=0.0.6"]
+# dask is optional: dask-backed pyramids (`Pyramid.from_array(dask_array)`), their
+# `dask_arrays` views, and dask-graph rechunking. Everything else runs without it
+# (DynamicArray / TensorStore); imported only where used (utils/optional_deps.py).
+dask = ["dask"]
+# Kept for compatibility: dyna-zarr is a required dependency now.
+dyna = []
 dev = [
     "pytest>=7.0",
-    # The suite exercises the dyna paths (Pyramid.dynamic_arrays, supports_dyna,
-    # backend="dyna" writes); without this they would silently skip.
-    "dyna-zarr>=0.0.6",
+    # The suite exercises the dask paths too; CI also runs it WITHOUT dask installed.
+    "dask",
+    # tests/test_write_remote.py: an in-process S3 emulator + the remote extra
+    "moto[server]>=5",
+    "obstore>=0.11",
 ]
 
 [project.urls]

@@ -48,6 +48,6 @@ def test_deferred_downscale_expands_on_write(make_pyramid, zarr_path):
     IO().write_pyramid(planned, zarr_path, overwrite=True)
     back = IO().read_pyramid(zarr_path)
     assert back.nlayers == 3
-    shapes = [back.dask_arrays[p].shape for p in back.meta.resolution_paths]
+    shapes = [back.layers[p].shape for p in back.meta.resolution_paths]
     assert shapes[0] == (2, 64, 64)
     assert shapes[1][-1] < shapes[0][-1]                # coarser levels shrink
