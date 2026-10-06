@@ -185,6 +185,17 @@ image_pyr = Pyramid().from_arrays(       # -> Pyramid
 IO().write_pyramid(image_pyr.downscale(n_layers=3), "my_image.ome.zarr", overwrite=True)
 ```
 
+A level can be any array-like object: NumPy, zarr, dask, TensorStore, a
+`micro_reader.Image`, or your own reader with `shape`, `dtype` and `__getitem__`. It is
+read region by region when you write, so a large file never has to fit in memory:
+
+```python
+import micro_reader
+
+image = micro_reader.open("image.czi").images[0].as_axes("canonical", samples="channels")
+image_pyr = Pyramid().from_arrays([image], axis_order="tczyx", version="0.5")
+```
+
 ## Write options
 
 Every write goes through [dyna-zarr](https://pypi.org/project/dyna-zarr/) by default

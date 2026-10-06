@@ -36,6 +36,19 @@ def _is_tensorstore(arr) -> bool:
     return hasattr(arr, "read") and hasattr(arr, "spec")
 
 
+def _as_level(arr):
+    """A pyramid level as stored: numpy, zarr, dask, TensorStore and dyna arrays as they
+    are; any other array-like source (a micro_reader.Image, a reader's region source)
+    wrapped lazily by dyna_zarr.from_array, so every level is something the pyramid's
+    operations and writers understand."""
+    if isinstance(arr, (np.ndarray, zarr.Array)) or is_dask_array(arr) or _is_tensorstore(arr):
+        return arr
+    from dyna_zarr import DynamicArray, from_array
+    if isinstance(arr, DynamicArray):
+        return arr
+    return from_array(arr)
+
+
 def _numpy_dtype(dtype) -> np.dtype:
     """A numpy dtype, also from a TensorStore dtype (``.numpy_dtype``)."""
     return np.dtype(getattr(dtype, "numpy_dtype", dtype))
@@ -1067,9 +1080,15 @@ class Pyramid:
           place. Pass `compressor=` to `write_pyramid` to write with a
           different codec.
         - Otherwise, `compressor` is used if given, else defaults to blosc.
+
+        A level may also be any array-like source dyna-zarr can wrap - a
+        ``micro_reader.Image``, a reader's own region source (``shape``, ``dtype``,
+        ``__getitem__``) - which is wrapped lazily with ``dyna_zarr.from_array``.
         """
-        if isinstance(arrays, (np.ndarray, zarr.Array)) or is_dask_array(arrays):
+        if isinstance(arrays, (np.ndarray, zarr.Array)) or is_dask_array(arrays) or (
+                not isinstance(arrays, (list, tuple)) and hasattr(arrays, 'shape')):
             arrays = [arrays]
+        arrays = [_as_level(a) for a in arrays]
 
         base_array = arrays[0]
         ndim = base_array.ndim
@@ -1088,6 +1107,12 @@ class Pyramid:
             self._compressor = compressor if compressor is not None else CompressorConfig(name='blosc')
 
         axes = axis_order if axis_order is not None else defaults.axis_order[:ndim]
+        mismatched = [i for i, a in enumerate(arrays) if len(a.shape) != len(axes)]
+        if mismatched:
+            raise ValueError(
+                f"axis_order {axes!r} names {len(axes)} axes, but level(s) {mismatched} have "
+                f"{[len(arrays[i].shape) for i in mismatched]} dimensions. Every level needs one "
+                f"axis letter per dimension.")
         units_list: List[str] = unit_list if unit_list is not None else [defaults.unit_map[ax] for ax in axes]
         units_list = units_list[:ndim]
 

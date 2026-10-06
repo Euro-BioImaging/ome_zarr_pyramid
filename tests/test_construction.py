@@ -1,6 +1,9 @@
 """Pyramid construction via `from_arrays`: axes, shape, dtype, layers, scales."""
 
 import numpy as np
+import pytest
+
+from ome_zarr_pyramid.core.pyramid import Pyramid
 
 
 def test_from_arrays_basic(pyr3d):
@@ -78,3 +81,34 @@ def test_dask_arrays_refuses_dyna_layers(tmp_path):
     assert type(dyna_pyr.layers["0"]).__name__ == "DynamicArray"
     with pytest.raises(TypeError, match="DynamicArray"):
         dyna_pyr.dask_arrays
+
+
+class _ReaderSource:
+    """A reader's region source: shape, dtype, __getitem__ - no zarr, no dask."""
+
+    def __init__(self, data, read_unit=None):
+        self._data, self.shape, self.dtype = data, data.shape, data.dtype
+        self.read_unit = read_unit
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+
+def test_from_arrays_wraps_any_array_like_source(zarr_path):
+    from dyna_zarr import DynamicArray
+    from ome_zarr_pyramid.core.io import IO
+    data = np.random.default_rng(0).integers(0, 999, (2, 16, 64, 48), dtype="uint16")
+    pyr = Pyramid().from_arrays([_ReaderSource(data, read_unit=(1, 8, 32, 48))],
+                                axis_order="czyx", version="0.5")
+    assert isinstance(pyr.layers["0"], DynamicArray)
+    assert pyr.layers["0"].chunks == (1, 8, 32, 48)          # the reader's own unit
+    IO().write_pyramid(pyr.downscale(n_layers=2, defer=True), zarr_path, overwrite=True)
+    back = IO().read_pyramid(zarr_path)
+    np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)
+    single = Pyramid().from_arrays(_ReaderSource(data), axis_order="czyx")   # no list
+    assert single.nlayers == 1 and single.shape == data.shape
+
+
+def test_from_arrays_refuses_an_axis_order_of_the_wrong_rank():
+    with pytest.raises(ValueError, match="one axis letter per dimension"):
+        Pyramid().from_arrays([np.zeros((2, 3, 4, 5))], axis_order="zyx")
