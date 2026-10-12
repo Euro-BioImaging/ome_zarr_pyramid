@@ -9,11 +9,16 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import zarr
 
-try:
-    import cupy as cp
-    cupy_available = True
-except ImportError:
-    cupy_available = False
+
+
+def _cupy():
+    """cupy, or None. Imported on first use, not when ozp is imported: importing cupy is
+    slow and, without a CUDA toolkit, warns on every ozp import."""
+    try:
+        import cupy
+    except ImportError:
+        return None
+    return cupy
 
 from ome_zarr_pyramid.utils.logging_config import get_logger
 from ome_zarr_pyramid.utils.optional_deps import is_dask_array, require
@@ -64,12 +69,9 @@ def as_dask_array(
         ValueError: If cupy backend requested but not available
     """
     da = require("dask.array", "as_dask_array")
-    if cupy_available:
-        assert isinstance(array, (da.Array, zarr.Array, np.ndarray, cp.ndarray)), \
-            f"The given array type {type(array)} cannot be parsed."
-    else:
-        assert isinstance(array, (da.Array, zarr.Array, np.ndarray)), \
-            f"The given array type {type(array)} cannot be parsed."
+    cp = _cupy() if backend == 'cupy' or type(array).__module__.startswith('cupy') else None
+    kinds = (da.Array, zarr.Array, np.ndarray) + ((cp.ndarray,) if cp is not None else ())
+    assert isinstance(array, kinds), f"The given array type {type(array)} cannot be parsed."
     assert backend in ('numpy', 'cupy'), \
         f"Currently, the only supported backends are 'numpy' or 'cupy'."
 
@@ -79,7 +81,7 @@ def as_dask_array(
         out = array
 
     if backend == 'cupy':
-        if cupy_available:
+        if cp is not None:
             out = out.map_blocks(cp.asarray)
         else:
             raise ValueError("cupy is not available!")

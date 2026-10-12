@@ -12,15 +12,11 @@ large-scale volumes with the same code.
   writer streams region by region; the whole volume is never held in RAM.
 - **NGFF-native.** Reads/writes multiscales v0.4 and v0.5 (with `dimension_names`),
   sharded or not, local or on object storage (`s3://`, `gs://`, `az://`).
-- **Deferred, progressive downscaling.** `downscale()` records a plan and builds
-  nothing; the writer streams the base to disk **once** and derives each coarser level
-  from the stored level above it. An expensive base (e.g. a segmentation) is computed
-  a single time, not once per level.
+- **Deferred downscaling.** `downscale()` records a plan and builds nothing. The
+  writer reads the base **once** and writes every level from that read, so an expensive
+  base (e.g. a segmentation) is computed a single time, not once per level.
 - **Elementwise algebra.** `Pyramid` objects support arithmetic, comparison and
   bitwise operators across every level at once (`img > 128`, `a * b`, `~mask`).
-
-> Image **processing** (filters, segmentation, features, morphology, clustering, …)
-> lives in the sibling package **`ome_zarr_pro`**, which builds on this one.
 
 ## Install
 
@@ -33,13 +29,13 @@ pip install "ome_zarr_pyramid[remote]"    # + obstore: s3://, gs://, az:// store
 ## Quickstart
 
 ```python
-from ome_zarr_pyramid import Pyramid, IO
+from ome_zarr_pyramid import Pyramid, io
 
-pyr = IO().read_pyramid("image.ome.zarr")           # -> Pyramid (lazy, nothing loaded)
+pyr = io.read_pyramid("image.ome.zarr")             # -> Pyramid (lazy, nothing loaded)
 print(pyr.axes, pyr.nlayers)                        # 'tczyx', 5
 print(pyr.base_array.shape, pyr.base_array.dtype)   # full-resolution level 0
 
-IO().write_pyramid(pyr, "copy.ome.zarr", overwrite=True)
+io.write_pyramid(pyr, "copy.ome.zarr", overwrite=True)
 ```
 
 ### Everything is a `Pyramid`
@@ -47,19 +43,21 @@ IO().write_pyramid(pyr, "copy.ome.zarr", overwrite=True)
 **Every operation returns a new `Pyramid`.** Selecting (`isel`, `select_levels`), the
 elementwise operators (`+ - * / > == & ~ …`), `downscale` and `rechunk` all produce a
 fresh, lazy `Pyramid`, with **all resolution levels and metadata preserved**, so they
-compose and chain naturally. Nothing is materialised until you `.compute()` an array or write
-the pyramid. Throughout this README, `pyr` and any variable ending in `_pyr` are
-`Pyramid` objects.
+compose and chain naturally. The lazy `Pyramid` object can be materialised in memory or 
+streamed to disc with simple methods. 
+
+Throughout this README, `pyr` and any variable ending in `_pyr` are
+`Pyramid` objects, and `io` is `from ome_zarr_pyramid import io`. 
 
 ```python
-mask_pyr = (IO().read_pyramid("image.ome.zarr").isel(c=0) > 128)   # Pyramid -> Pyramid -> Pyramid
-IO().write_pyramid(mask_pyr.downscale(n_layers=4), "mask.ome.zarr", overwrite=True)
+mask_pyr = (io.read_pyramid("image.ome.zarr").isel(c=0) > 128)   # Pyramid -> Pyramid -> Pyramid
+io.write_pyramid(mask_pyr.downscale(n_layers=4), "mask.ome.zarr", overwrite=True)
 ```
 
 ## Inspect the pyramid & its metadata
 
 ```python
-pyr = IO().read_pyramid("image.ome.zarr")
+pyr = io.read_pyramid("image.ome.zarr")
 
 pyr.axes                       # 'tczyx' (axis order)
 pyr.meta.resolution_paths      # ['0', '1', '2', '3']
@@ -74,7 +72,7 @@ import numpy as np
 level0 = np.asarray(pyr.base_array)                 # materialise level 0 to numpy
 ```
 
-## Select regions, channels and levels
+## Slicing and level selection
 
 Each of these returns a **new `Pyramid`** (a sub-pyramid), not a bare array:
 
@@ -88,8 +86,20 @@ skip_pyr     = pyr.select_levels(0, 2, 4)    # -> Pyramid: an arbitrary (non-con
 ```
 
 `isel` is xarray-style: an **int** selects one position and drops that axis, a
-**slice** keeps a strided sub-range, applied across every resolution level, with the
+**slice** keeps a strided sub-range, **applied across every resolution level**, with the
 coordinate metadata (scale, translation, dropped axes, omero channels) updated to match.
+
+`Pyramid` also supports NumPy-style indexing. It does the same as `isel`, but via positional
+indexing:
+
+```python
+zrange_pyr = pyr[:, :, 10:40]                # 'tczyx': same as pyr.isel(z=slice(10, 40))
+frame_pyr  = pyr[0, 1]                       # same as pyr.isel(t=0, c=1)
+tail_pyr   = pyr[..., 100:200]               # ... fills the axes in between
+```
+
+The output of isel or numpy-style indexing is also a `Pyramid`. The indices passed are applied
+to the level-0 directly and `adapted to each lower resolution level based on the pyramid's scale factors`.
 
 ## Elementwise algebra (all levels, lazy)
 
@@ -103,7 +113,7 @@ diff_pyr   = a_pyr - b_pyr               # -> Pyramid: combine two aligned pyram
 band_pyr   = (pyr > 50) & (pyr < 200)    # -> Pyramid: bitwise combine of two mask pyramids
 inv_pyr    = ~mask_pyr                    # -> Pyramid: unary ops (~, -, abs())
 
-IO().write_pyramid(mask_pyr, "mask.ome.zarr", overwrite=True)
+io.write_pyramid(mask_pyr, "mask.ome.zarr", overwrite=True)
 ```
 
 Supported: `+ - * / // % **`, `< <= > >= == !=`, `& | ^`, and unary `- + abs() ~`.
@@ -112,46 +122,87 @@ Operands may be scalars or other `Pyramid` objects; the result is always a `Pyra
 ## Downscale and write (memory-bound, base computed once)
 
 ```python
-pyr = IO().read_pyramid("image.ome.zarr")
+pyr = io.read_pyramid("image.ome.zarr")
 
 # downscale() is DEFERRED and returns a Pyramid: it records a plan, builds nothing.
 full_pyr = pyr.downscale(n_layers=4)                 # -> Pyramid (exactly 4 levels)
-full_pyr = pyr.downscale(min_dimension_size=128)     # -> Pyramid (until largest axis < 128)
+full_pyr = pyr.downscale(min_dimension_size=128)     # -> Pyramid (largest axis stays >= 128)
 
-# The write streams level 0 once, then builds the coarser levels from what it stored.
-IO().write_pyramid(full_pyr, "out.ome.zarr", overwrite=True)
+# The write reads level 0 once and writes the coarser levels from the same reads.
+io.write_pyramid(full_pyr, "out.ome.zarr", overwrite=True)
 ```
 
-Downsampling defaults to **stride** (nearest-neighbour, `downscale_method="simple"`)
-at an **isotropic 2x on the spatial axes** (`z`/`y`/`x`; `t`/`c` stay 1). On a pyramid
-that already has levels, the per-axis factors are instead **derived from those levels**
-so an anisotropic or irregular source round-trips unchanged — pass `scale_factor=`
-explicitly to override, and see `Pyramid.derive_downscale_plan()`.
+The write works in **one pass**. It reads level 0 block by block, and from each block it
+computes and writes level 0 and every coarser level at once. So each block is read only
+once, and an expensive lazy level 0 (e.g. a segmentation) is computed a single time, not
+once per level. The threads (`max_threads`) work on different blocks in parallel. If the
+smallest levels do not fit in the memory budget in the same pass, they are built afterwards
+from what was already written to disk, with the same pixels.
 
-With stride, each level is built from the stored level above it, so level 0 is read
-back only once. `downscale_method="mean"` and `"median"` build every level from level 0
-instead, because averaging twice is not the same as averaging once.
+`downscale()` **rebuilds the pyramid from level 0**. If `downscale()` is run on
+a source pyramid that already has levels, the existing coarse levels are replaced by 
+the newer ones produced by `downscale()`. In this scenario, the scale factors `downscale` uses by default 
+are derived from **the shape ratios between the source levels** and used for recreating the new
+coarse levels from the level-0. This ensures that the input and output pyramids have consistent scale 
+factors. To override this behaviour and enforce a specific scale factor, pass `scale_factor=` explicitly. 
+See `Pyramid.derive_downscale_plan()`.
 
-This matters when level 0 is an expensive lazy graph: the base is computed a **single**
-time (during its own write) instead of being recomputed for every pyramid level.
+In the scenario that the source has no coarse levels, `downscale()` will default to an **isotropic 2x on the 
+spatial axes** (`t` and `c` remain 1). 
+
+Downscaling uses window method defaulting to **stride** (nearest-neighbour, `downscale_method="simple"`).
+
+```python
+mask_pyr = pyr.isel(c=0) > 128
+io.write_pyramid(mask_pyr, "a.ome.zarr")               # each level: its own level, thresholded
+io.write_pyramid(mask_pyr.downscale(), "b.ome.zarr")   # each level: level 0's mask, downscaled
+```
+
+Operating on existing resolution levels is fine for arithmetics such as `pyr * 2`. For masks, labels and 
+most other operations, it is recommended to use `downscale()`: otherwise the coarser levels may not match level 0. 
+
+Methods:
+
+* `"simple"`: stride. Works with both raw data and labels.
+* `"mean"`: works (and recommended) with raw data. Does **not** work with labels.
+* `"mode"`: also works with labels.
+* `"median"`, `"min"`, `"max"`: supported but generally not recommended.
+
+They give the same pixels as TensorStore's `downsample`.
+
+`downscale_backend` chooses where the window methods run. Both produce the same pixels:
+
+```python
+pyr.downscale(downscale_method="mean")                            # TensorStore (default)
+pyr.downscale(downscale_method="mean", downscale_backend="dyna")  # dyna's coarsen
+```
 
 ## Control storage chunking (independent of processing)
 
-Storage chunk shape is decoupled from whatever chunking an upstream operation imposed.
-Pass a chunk **shape** (used as is) or a target chunk **size in MB** (approximate:
-dyna-zarr picks a dtype-aware chunk that fits the size and lines up with the source's
-chunks):
+If no chunk parameter is supplied, operation chains will carry the source pyramid's **original** 
+on-disk chunking, and `write_pyramid(input_pyr, path.zarr)` will simply create the output store
+with `input_pyr`'s chunk shape. Supplying explicit output chunk parameters override this behaviour. 
+
+Different options are:
+
+1. Pass a chunk **shape**. This is a tuple representing chunk shape or a dict of tuples representing chunk
+shape per level. These are used as **exact** values the output chunks will have, and therefore, the user
+is responsible for any misalignment between input and output chunks.
+
+2. Alternatively, pass a target chunk **size in MB** or a sequence of chunk sizes per level. dyna-zarr picks 
+a dtype-aware chunk that *approximately* fits the size and will handle the alignment between this chunk and 
+the source's chunks.
 
 ```python
 full_pyr = pyr.downscale(n_layers=3)                 # 'tczyx', 3 levels
 
 # target MB per chunk: one value for all levels, or one per level
-IO().write_pyramid(full_pyr, "out.ome.zarr", overwrite=True, chunk_size_mb=1.0)
-IO().write_pyramid(full_pyr, "out.ome.zarr", overwrite=True, chunk_size_mb=(4, 1, 0.5))
+io.write_pyramid(full_pyr, "out.ome.zarr", overwrite=True, chunk_size_mb=1.0)
+io.write_pyramid(full_pyr, "out.ome.zarr", overwrite=True, chunk_size_mb=(4, 1, 0.5))
 
 # exact chunk shape, one entry per axis: one shape for all levels, or one per level
-IO().write_pyramid(full_pyr, "out.ome.zarr", overwrite=True, chunk_shape=(1, 1, 32, 256, 256))
-IO().write_pyramid(full_pyr, "out.ome.zarr", overwrite=True,
+io.write_pyramid(full_pyr, "out.ome.zarr", overwrite=True, chunk_shape=(1, 1, 32, 256, 256))
+io.write_pyramid(full_pyr, "out.ome.zarr", overwrite=True,
                    chunk_shape={0: (1, 1, 32, 256, 256),
                                 1: (1, 1, 32, 128, 128),
                                 2: (1, 1, 16, 64, 64)})
@@ -162,14 +213,11 @@ rechunked_pyr = pyr.rechunk(chunk_size_mb=2.0)       # -> Pyramid
 
 A per-level dict or sequence needs an entry for every level.
 
-When neither is given, a pyramid read from disk is written back with its **original**
-on-disk chunking.
-
 ## Build a pyramid from your own arrays
 
 ```python
 import dask.array as da
-from ome_zarr_pyramid import Pyramid, IO
+from ome_zarr_pyramid import Pyramid, io
 
 lvl0 = da.zeros((2, 512, 512), chunks=(1, 256, 256), dtype="uint16")  # (c, y, x)
 
@@ -182,39 +230,49 @@ image_pyr = Pyramid().from_arrays(       # -> Pyramid
     name="my_image",
 )
 
-IO().write_pyramid(image_pyr.downscale(n_layers=3), "my_image.ome.zarr", overwrite=True)
+io.write_pyramid(image_pyr.downscale(n_layers=3), "my_image.ome.zarr", overwrite=True)
 ```
 
 A level can be any array-like object: NumPy, zarr, dask, TensorStore, a
-`micro_reader.Image`, or your own reader with `shape`, `dtype` and `__getitem__`. It is
-read region by region when you write, so a large file never has to fit in memory:
+`micro_reader.Image` (see micro-reader), or your own reader with `shape`, `dtype` and `__getitem__`. 
+Executing a write command (such as `io.write_pyramid()`) on a lazy level object will read the level 
+region by region from its source and stream it to the output store on disc, enabling memory-bounded
+IO operations. 
 
 ```python
 import micro_reader
 
 image = micro_reader.open("image.czi").images[0].as_axes("canonical", samples="channels")
+# Here, image is a lazy micro_reader.Image object. It can be read region by region.
 image_pyr = Pyramid().from_arrays([image], axis_order="tczyx", version="0.5")
+# Pyramid was constructed with a single lazy object, which can be streamed to disc.
 ```
 
 ## Write options
 
-Every write goes through [dyna-zarr](https://pypi.org/project/dyna-zarr/) by default
-(`backend="auto"`). Lazy levels are streamed region by region. Levels built from dask
-arrays are pushed by dask into the same writer.
+Every write goes through [dyna-zarr](https://pypi.org/project/dyna-zarr/). Lazy levels
+are streamed region by region.
 
 ```python
-IO().write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
+io.write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
                    compressor="zstd",                  # codec (default: the input's own)
                    shard_coefficients=(1, 1, 1, 4, 4), # shards of 4x4 chunks in y/x (OME-Zarr 0.5)
-                   max_workers=8,                      # regions in flight
+                   max_threads=8,                      # regions at once, one per thread
                    region_size_mb=16)                  # size of one region
 ```
 
 - A sharded input stays sharded, on every level.
+- `memory_budget_mb=1024` keeps the write within that much memory, on top of what your
+  process already holds. Shards can be much larger than that: **shards are also written chunk
+  by chunk**. For example, a 17.6 GB stack of 2347 planes, written as a 6-level pyramid
+  with 960³ shards, stayed under 1 GB with a 1.5 GB budget.
 - `io_backend="zarrista"` writes the bytes with the optional zarrista backend of
   dyna-zarr instead of TensorStore.
-- `use_multiprocessing=True` writes each level in its own process. It is rarely
-  faster: level 0 holds most of the data.
+- `max_threads` was called `max_workers` before 0.1.0. The old names still work, with a `FutureWarning`.
+- `window_from_data=True` sets each channel's display window (`start`/`end` in the omero metadata) 
+  to the min/max of level 0 as written, measured during the write itself, so the output is
+  not read again. The window's `min`/`max` stay as they are. For percentiles or
+  another level, use `Pyramid.set_display_range()` before writing.
 
 ### Object storage
 
@@ -224,18 +282,13 @@ Use an `s3://`, `gs://` or `az://` URL and pass the store settings as
 
 ```python
 opts = {"endpoint": "https://s3.example.com", "region": "eu-west-1"}
-IO().write_pyramid(pyr, "s3://bucket/out.ome.zarr", overwrite=True, storage_options=opts)
-back = IO().read_pyramid("s3://bucket/out.ome.zarr", storage_options=opts)
+io.write_pyramid(pyr, "s3://bucket/out.ome.zarr", overwrite=True, storage_options=opts)
+back = io.read_pyramid("s3://bucket/out.ome.zarr", storage_options=opts)
 ```
 
-The older `https://host/bucket/key` form still works for writing, with s3fs-style
-options (`pip install "ome_zarr_pyramid[s3]"`).
+The older `https://host/bucket/key` form still works for writing: it is written as
+`s3://bucket/key` with `https://host` as the endpoint.
 
-### Other writers
-
-`backend="sync"` (a threaded zarr-python writer) and `backend="tensorstore"` are kept
-for compatibility. They are slower, local or `https://` only, and do not write
-shards. Options they cannot honour raise an error rather than being ignored.
 
 ## License
 

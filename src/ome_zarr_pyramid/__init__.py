@@ -1,15 +1,25 @@
 """ome_zarr_pyramid: read, write and downscale OME-Zarr (NGFF) pyramids.
 
-The lazy, dask-backed :class:`~ome_zarr_pyramid.core.pyramid.Pyramid` plus
-:class:`~ome_zarr_pyramid.core.io.IO` (NGFF read/write, memory-bound region writer,
-deferred progressive downscaling) are the public surface. Image PROCESSING operations
-(filters, segmentation, features, ...) live in the sibling ``pyrops`` package.
+The lazy :class:`~ome_zarr_pyramid.core.pyramid.Pyramid` (dyna-zarr arrays; dask when
+built from dask) plus ``io`` (NGFF read/write, memory-bound writer, deferred
+downscaling) are the public surface::
+
+    from ome_zarr_pyramid import io
+    pyr = io.read_pyramid("image.ome.zarr")
+    io.write_pyramid(pyr.downscale(n_layers=4), "out.ome.zarr")
+
+``io`` is one shared :class:`~ome_zarr_pyramid.core.io.IO`; ``IO()`` still works.
 """
 
-__version__ = "0.0.9"
+__version__ = "0.1.0"
 __author__ = "Bugra Oezdemir"
 
 from ome_zarr_pyramid.core.io import IO
 from ome_zarr_pyramid.core.pyramid import Pyramid
 
-__all__ = ["Pyramid", "IO"]
+#: The package's reader/writer, shared by everyone in this process. It holds no state:
+#: settings go in the call (or in your own ``IO(...)``), never on this object, since
+#: anything stored here would apply to every thread and library in the process.
+io = IO()
+
+__all__ = ["Pyramid", "IO", "io"]

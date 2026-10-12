@@ -26,6 +26,23 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 SPATIAL_AXES = {'z', 'y', 'x'}
+
+#: Downscale methods. 'simple' takes every n-th element (nearest; the one for LABELS);
+#: the others reduce each window, exactly as ``tensorstore.downsample`` does.
+DOWNSCALE_METHODS = ('simple', 'mean', 'median', 'min', 'max', 'mode')
+#: Where window-reducing methods run: TensorStore's ``downsample`` (default), or dyna's
+#: ``coarsen`` (the same pixels; lower memory, any lazy chain, either read backend).
+DOWNSCALE_BACKENDS = ('tensorstore', 'dyna')
+
+
+def check_downscale_args(downscale_method: str, downscale_backend: str = 'tensorstore') -> None:
+    """Refuse an unknown method or backend before anything is built."""
+    if downscale_method not in DOWNSCALE_METHODS:
+        raise ValueError(f"downscale_method must be one of {DOWNSCALE_METHODS}, "
+                         f"got {downscale_method!r}")
+    if downscale_backend not in DOWNSCALE_BACKENDS:
+        raise ValueError(f"downscale_backend must be one of {DOWNSCALE_BACKENDS}, "
+                         f"got {downscale_backend!r}")
 _SMART_DEFAULT_MAX_FACTOR = 16
 _SMART_DEFAULT_TOLERANCE = 0.10
 
@@ -195,72 +212,53 @@ def simple_downscale(
     return downscaled_arr
 
 
-def mean_downscale(
-    arr: da.Array,
-    scale_factor: Optional[Union[tuple, list, np.ndarray]] = None
-) -> da.Array:
-    """Downscale a Dask array using mean coarsening.
-    
-    Parameters
-    ----------
-    arr : dask.array.Array
-        Input Dask array to downscale.
-    scale_factor : Union[tuple, list, np.ndarray]
-        Downsampling factors for each dimension.
-        
-    Returns
-    -------
-    dask.array.Array
-        Downscaled Dask array with mean aggregation.
-        
-    Raises
-    ------
-    ValueError
-        If scale_factor length doesn't match array dimensions.
-    """
-    if scale_factor is None:
-        raise ValueError("scale_factor cannot be None")
-    if len(scale_factor) != arr.ndim:  # type: ignore
-        raise ValueError("scale_factors must have the same length as the array's number of dimensions")
-    axes = dict({idx: factor for idx, factor in enumerate(scale_factor)})  # type: ignore
-    da = require("dask.array", "mean downscaling of a dask array")
-    downscaled_arr = da.coarsen(da.mean, arr,
-                                axes=axes, trim_excess=True).astype(arr.dtype)
-    return downscaled_arr
+def dask_downscale(arr: 'da.Array', scale_factor, downscale_method: str = 'simple') -> 'da.Array':
+    """Downscale a dask array, staying dask. 'simple' strides; every other method runs
+    dyna's ``coarsen_block`` on window-aligned blocks, so the pixels are exactly those of
+    ``tensorstore.downsample`` (ceil-sized levels, the same rounding and tie rules) -
+    whichever downscale backend was chosen."""
+    factors = tuple(int(f) for f in scale_factor)
+    if len(factors) != arr.ndim:
+        raise ValueError("scale_factors must have the same length as the array's number "
+                         "of dimensions")
+    if downscale_method == 'simple':
+        return simple_downscale(arr, scale_factor=factors)
+    from dyna_zarr.operations import coarsen_block
+    # blocks must start on window boundaries: chunk sizes are rounded to whole windows
+    x = arr.rechunk(tuple(max(f, int(round(c / f)) * f) for c, f in zip(arr.chunksize, factors)))
+    out_chunks = tuple(tuple(-(-c // f) for c in cs) for cs, f in zip(x.chunks, factors))
+    return x.map_blocks(coarsen_block, factors, downscale_method, chunks=out_chunks,
+                        dtype=x.dtype)
 
 
-def median_downscale(
-    arr: da.Array,
-    scale_factor: Optional[Union[tuple, list, np.ndarray]] = None
-) -> da.Array:
-    """Downscale a Dask array using median coarsening.
-    
-    Parameters
-    ----------
-    arr : dask.array.Array
-        Input Dask array to downscale.
-    scale_factor : Union[tuple, list, np.ndarray]
-        Downsampling factors for each dimension.
-        
-    Returns
-    -------
-    dask.array.Array
-        Downscaled Dask array with median aggregation.
-        
-    Raises
-    ------
-    ValueError
-        If scale_factor length doesn't match array dimensions.
+def downscale_level(arr, scale_factor, downscale_method: str = 'simple',
+                    downscale_backend: str = 'tensorstore'):
+    """One coarser level of ``arr`` (lazy), by integer ``scale_factor`` per axis.
+
+    - dask: stays dask (``dask_downscale``), whichever backend;
+    - 'simple': strided slicing (a DynamicArray stays one; TensorStore strides);
+    - backend 'tensorstore': a ``tensorstore.downsample`` view (a TensorStore);
+    - backend 'dyna': ``dyna_zarr.operations.coarsen`` (a DynamicArray).
+
+    Every level is ceil-sized: a partial window at the far edge is reduced over the
+    elements it has. The two backends give identical pixels (dyna's coarsen is verified
+    bit for bit against TensorStore; one documented exception: NaN in a float window
+    under median/mode, where TensorStore's result depends on element order).
     """
-    if scale_factor is None:
-        raise ValueError("scale_factor cannot be None")
-    if len(scale_factor) != arr.ndim:  # type: ignore
-        raise ValueError("scale_factors must have the same length as the array's number of dimensions")
-    axes = dict({idx: factor for idx, factor in enumerate(scale_factor)})  # type: ignore
-    da = require("dask.array", "median downscaling of a dask array")
-    downscaled_arr = da.coarsen(da.median, arr,
-                                axes=axes, trim_excess=True).astype(arr.dtype)
-    return downscaled_arr
+    check_downscale_args(downscale_method, downscale_backend)
+    factors = [int(f) for f in scale_factor]
+    if is_dask_array(arr):
+        return dask_downscale(arr, factors, downscale_method)
+    if downscale_method == 'simple':
+        if _is_tensorstore(arr):
+            return ts.downsample(arr, factors, method='stride')
+        return simple_downscale(arr, scale_factor=factors)
+    if downscale_backend == 'tensorstore':
+        return ts.downsample(as_tensorstore(arr), factors, method=downscale_method)
+    import dyna_zarr
+    from dyna_zarr import DynamicArray, operations as dyna_ops
+    src = arr if isinstance(arr, DynamicArray) else dyna_zarr.from_array(arr)
+    return dyna_ops.coarsen(src, factors, downscale_method)
 
 
 async def ts_downscale(
@@ -353,11 +351,11 @@ def as_tensorstore(arr) -> ts.TensorStore:
                               loop=_views_event_loop(), **kwargs)
 
 
-def crop_to_level(arr, base_shape, factors, downscale_method: str):
-    """Cut a TensorStore downsample (ceil-sized) to the level size
-    ``_level_size`` defines -- floor for mean / median, as ``da.coarsen``
-    gives -- so a level is the same with or without dask."""
-    want = tuple(_level_size(int(b), int(f), downscale_method) for b, f in zip(base_shape, factors))
+def crop_to_level(arr, target_shape):
+    """Cut a (ceil-sized) level to ``target_shape``: a plan reproducing an EXISTING
+    pyramid whose levels were floor-sized (ozp <= 0.0.9 wrote mean / median levels that
+    way, dropping a partial edge window) keeps those shapes."""
+    want = tuple(int(t) for t in target_shape)
     if tuple(arr.shape) == want:
         return arr
     return arr[tuple(slice(0, w) for w in want)]
@@ -461,6 +459,7 @@ class Downscaler:
     output_chunks: Optional[Union[list, tuple]] = None
     backend: str = 'numpy'
     downscale_method: str = 'simple'
+    downscale_backend: str = 'tensorstore'
     smart_scale_factor: Optional[Union[list, tuple]] = None  # isotropic first-level factors
     # Assigned in __post_init__
     base_array_root: Optional[str] = dataclasses.field(default=None, init=False, repr=False)
@@ -586,36 +585,13 @@ class Downscaler:
         )
 
     def get_method(self) -> Callable:
-        """Get the appropriate downscaling method.
-        
-        Returns
-        -------
-        callable
-            Downscaling function (either sync or async)
-        
-        Raises
-        ------
-        NotImplementedError
-            If an unsupported downscaling method is requested.
-        """
-        if hasattr(self.array, "_with_transform"):      # a dyna DynamicArray
-            if self.downscale_method == 'simple':
-                return simple_downscale                  # lazy slicing, no TensorStore
-            self.array = as_tensorstore(self.array)
-            self._in_memory_ts = True
-            return ts_downscale
-        if self.base_array_root is None and not self._in_memory_ts:  # array is dask array
-            if self.downscale_method == 'simple':
-                method: Callable = simple_downscale
-            elif self.downscale_method == "mean":
-                method = mean_downscale
-            elif self.downscale_method == "median":
-                method = median_downscale
-            else:
-                raise NotImplementedError(f"Currently, only 'simple', 'mean' and 'median' methods are implemented.")
-        else:
-            # TensorStore case
-            method = ts_downscale
+        """The level builder: ``downscale_level`` with this downscaler's method and
+        backend (every array type; see ``downscale_level``)."""
+        check_downscale_args(self.downscale_method, self.downscale_backend)
+
+        def method(array, scale_factor):
+            return downscale_level(array, scale_factor, self.downscale_method,
+                                   self.downscale_backend)
         return method
 
     async def run(self) -> 'Downscaler':
@@ -635,10 +611,7 @@ class Downscaler:
                 pass
             else:
                 factor = tuple(int(np.round(x)) for x in scale_factor)
-                if self.method is ts_downscale:
-                    coro_kwargs: Dict[str, Any] = dict(scale_factor=factor, downscale_method=self.downscale_method)
-                else:
-                    coro_kwargs = dict(scale_factor=factor)
+                coro_kwargs: Dict[str, Any] = dict(scale_factor=factor)
                 if asyncio.iscoroutinefunction(self.method):
                     res = asyncio.create_task(
                         self.method(self.array, **coro_kwargs),
@@ -657,10 +630,6 @@ class Downscaler:
         else:
             results = []
         
-        if self._in_memory_ts:              # the level sizes dask's coarsen gives
-            factors = [tuple(int(np.round(x)) for x in f) for f in self.dm.scale_factors]
-            results = [crop_to_level(r, self.array.shape, factors[i + 1], self.downscale_method)
-                       for i, r in enumerate(results)]
         self._downscaled_arrays = [self.array]
         for idx in range(len(results)):
             self._downscaled_arrays.append(results[idx])
@@ -705,20 +674,27 @@ class Downscaler:
 #     base=101 f=2  ->  stride/ts: 51 (ceil)   coarsen(mean/median): 50 (floor)
 
 def _level_size(base: int, factor: int, downscale_method: str = 'simple') -> int:
-    """Size `downscale_method` yields for one axis. Mirrors the executors exactly."""
+    """Size a level gets along one axis: ``ceil(base / factor)`` for EVERY method (a
+    partial window at the edge is reduced over the elements it has, as TensorStore and
+    stride slicing do). ``downscale_method`` is kept for callers; it no longer matters."""
     if factor <= 1:
         return base
-    if downscale_method in ('mean', 'median'):
-        return max(1, base // factor)          # da.coarsen(trim_excess=True) -> floor
-    return max(1, -(-base // factor))          # stride / ts.downsample       -> ceil
+    return max(1, -(-base // factor))
+
+
+def _fits(base: int, factor: int, target: int) -> bool:
+    """``target`` is what ``factor`` gives (ceil) - or the floor size, which ozp <= 0.0.9
+    wrote for mean / median levels; such a level is reproduced by cropping."""
+    if factor <= 1:
+        return target == base
+    return target in (max(1, -(-base // factor)), max(1, base // factor))
 
 
 def _solve_axis_factor(base: int, target: int, downscale_method: str = 'simple') -> Optional[int]:
-    """Smallest integer factor with `_level_size(base, f) == target`, else None.
+    """Smallest integer factor that gives ``target`` (see ``_fits``), else None.
 
-    Searched rather than derived: `ceil(base/f)` is not invertible from a rounded ratio
-    (base=101 target=50 has NO ceil solution, while target=51 has one), so the rounded
-    ratio is only a starting guess and every candidate must be verified.
+    Searched rather than derived: ``ceil(base/f)`` is not invertible from a rounded ratio,
+    so the rounded ratio is only a starting guess and every candidate must be verified.
     """
     if target <= 0 or target > base:
         return None
@@ -726,7 +702,7 @@ def _solve_axis_factor(base: int, target: int, downscale_method: str = 'simple')
         return 1
     guess = max(1, int(round(base / target)))
     for f in range(max(1, guess - 2), guess + 3):     # solutions are contiguous & tight
-        if _level_size(base, f, downscale_method) == target:
+        if _fits(base, f, target):
             return f
     return None
 
@@ -756,8 +732,7 @@ def derive_scale_factors(shapes: Sequence[Sequence[int]],
         if any(f is None for f in solved):
             return None
         factor = tuple(int(f) for f in solved)  # type: ignore[arg-type]
-        if tuple(_level_size(b, f, downscale_method)
-                 for b, f in zip(base, factor)) != level:
+        if not all(_fits(b, f, t) for b, f, t in zip(base, factor, level)):
             return None                          # verification: must round-trip
         factors.append(factor)
     return factors

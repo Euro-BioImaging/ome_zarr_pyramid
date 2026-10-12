@@ -36,12 +36,14 @@ def test_stride_rounds_up(base, factor, expected):
     assert _level_size(base, factor, 'simple') == expected
 
 
+@pytest.mark.parametrize("method", ["mean", "median", "min", "max", "mode"])
 @pytest.mark.parametrize("base,factor,expected", [
-    (101, 2, 50), (255, 2, 127), (7, 2, 3), (100, 2, 50),
+    (101, 2, 51), (255, 2, 128), (7, 2, 4), (100, 2, 50),
 ])
-def test_coarsen_rounds_down(base, factor, expected):
-    """da.coarsen(trim_excess=True) rounds FLOOR - the opposite of stride."""
-    assert _level_size(base, factor, 'mean') == expected
+def test_window_methods_round_up_too(method, base, factor, expected):
+    """Every method is ceil-sized, as ts.downsample: a partial edge window is reduced
+    over what it has (it used to be dropped for mean/median - floor - unlike eubi)."""
+    assert _level_size(base, factor, method) == expected
 
 
 # --- solving one axis -------------------------------------------------------------------
@@ -57,12 +59,13 @@ def test_refuses_unreachable_axis():
     assert _solve_axis_factor(10, 7, 'simple') is None
 
 
-def test_rounding_decides_reachability():
-    """101 -> 50 is floor-only; 101 -> 51 is ceil-only. Each method sees just one."""
-    assert _solve_axis_factor(101, 51, 'simple') == 2
-    assert _solve_axis_factor(101, 50, 'simple') is None
-    assert _solve_axis_factor(101, 50, 'mean') == 2
-    assert _solve_axis_factor(101, 51, 'mean') is None
+def test_floor_sized_levels_stay_reachable():
+    """101 -> 51 is what every method writes now; 101 -> 50 is a floor-sized level ozp
+    <= 0.0.9 wrote for mean/median, still reachable (it is reproduced by cropping)."""
+    for method in ("simple", "mean"):
+        assert _solve_axis_factor(101, 51, method) == 2
+        assert _solve_axis_factor(101, 50, method) == 2
+    assert _solve_axis_factor(10, 7, 'mean') is None
 
 
 # --- deriving whole progressions --------------------------------------------------------
@@ -87,10 +90,9 @@ def test_refuses_unreachable_level():
     assert derive_scale_factors([(10, 10), (7, 7)], 'simple') is None
 
 
-def test_refuses_floor_source_under_ceil_method():
-    """A floor-rounded odd level is unreachable by a ceil method - refuse, not shift."""
-    assert derive_scale_factors([(101, 101), (50, 50)], 'simple') is None
-    assert derive_scale_factors([(101, 101), (50, 50)], 'mean') is not None
+def test_floor_sized_source_is_derived():
+    assert derive_scale_factors([(101, 101), (50, 50)], 'simple') == [(1, 1), (2, 2)]
+    assert derive_scale_factors([(101, 101), (51, 51)], 'mean') == [(1, 1), (2, 2)]
 
 
 def test_derived_factors_round_trip():
@@ -142,6 +144,20 @@ def test_write_reproduces_source_shapes_exactly(tmp_path, shapes):
     back = IO().read_pyramid(str(out))
     got = [tuple(back.layers[p].shape) for p in back.meta.resolution_paths]
     assert got == [tuple(s) for s in shapes]
+
+
+@pytest.mark.parametrize("downscale_backend", ["tensorstore", "dyna"])
+def test_floor_sized_source_is_reproduced_exactly(tmp_path, downscale_backend):
+    """An old floor-sized mean pyramid (101 -> 50) is rewritten with ITS shapes, the
+    levels cropped from the ceil-sized result - not resized by a voxel."""
+    shapes = [(1, 1, 101, 101, 101), (1, 1, 50, 50, 50)]
+    src = _pyr(shapes)
+    out = tmp_path / "floor.zarr"
+    IO().write_pyramid(src.downscale(downscale_method="mean",
+                                     downscale_backend=downscale_backend),
+                       str(out), overwrite=True)
+    back = IO().read_pyramid(str(out))
+    assert [tuple(back.layers[p].shape) for p in back.meta.resolution_paths] == shapes
 
 
 def test_explicit_scale_factor_is_not_overridden(tmp_path):

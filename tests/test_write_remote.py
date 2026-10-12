@@ -6,8 +6,9 @@ credentials come from the standard AWS environment variables. The level arrays g
 through dyna, the group / NGFF metadata through zarr's obstore-backed ObjectStore.
 
 Before, `s3://` crashed (`os.makedirs('s3:')`) and only the legacy
-`https://host/bucket/key` form (s3fs options, 'sync' engine) was writable; a deferred
-downscale could not be written remotely at all.
+`https://host/bucket/key` form (s3fs options, the 'sync' engine removed in 0.1.0) was
+writable; a deferred downscale could not be written remotely at all. That form is now
+translated to `s3://bucket/key` with the host as the endpoint.
 
 Runs against OZP_TEST_S3_ENDPOINT if set, else an in-process moto server, else skips.
 """
@@ -117,13 +118,27 @@ def test_s3_overwrite_rule_and_shards(bucket, data):
     assert back.layers["0"].shards is None          # the overwrite really replaced it
 
 
-def test_remote_routing_is_explicit(bucket, data):
+def test_a_removed_engine_is_refused_remotely_too(bucket, data):
     name, opts = bucket
-    with pytest.raises(ValueError, match="legacy"):
+    with pytest.raises(ValueError, match="removed in ome_zarr_pyramid 0.1.0"):
         IO().write_pyramid(_pyr(data), f"s3://{name}/x.zarr", backend="sync",
                            storage_options=opts)
-    with pytest.raises(ValueError, match="s3://"):
-        IO().write_pyramid(_pyr(data), "https://example.org/b/x.zarr", backend="dyna")
+
+
+def test_the_legacy_https_form_still_writes(bucket, s3_endpoint, data):
+    # https://host/bucket/key with the old writer's s3fs option names; the emulator is
+    # plain http, so the endpoint comes from client_kwargs (as s3fs allowed). Credentials
+    # from the environment: dyna's TensorStore backend refuses explicit ones (key/secret
+    # map to obstore names, which io_backend='zarrista' takes)
+    name, opts = bucket
+    s3fs_opts = {"client_kwargs": {"endpoint_url": s3_endpoint, "region_name": "us-east-1"},
+                 "client_options": {"allow_http": True}}
+    IO().write_pyramid(_pyr(data).downscale(n_layers=2, defer=True),
+                       f"https://s3.example.org/{name}/legacy.zarr", overwrite=True,
+                       storage_options=s3fs_opts)
+    back = IO().read_pyramid(f"s3://{name}/legacy.zarr", storage_options=opts)
+    assert back.nlayers == 2
+    np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)
 
 
 def test_s3_attached_labels(bucket, data):
@@ -142,6 +157,9 @@ def test_s3_attached_labels(bucket, data):
     from zarr.storage import ObjectStore
     grp = zarr.open_group(ObjectStore(obstore.store.from_url(f"{url}/labels", **opts)), mode="r")
     assert "seg" in dict(grp.attrs)["ome"]["labels"]
+    # read_labels takes the URL too (it built the path with Path, mangling s3://)
+    by_name = IO().read_labels(url, name="seg", storage_options=opts)
+    np.testing.assert_array_equal(np.asarray(by_name.layers["0"][...]), lab)
 
 
 def test_s3_dask_pyramid_is_pumped(bucket, data):

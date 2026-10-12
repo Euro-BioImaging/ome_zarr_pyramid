@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.0.9"
+version = "0.1.0"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 # 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
@@ -39,9 +39,11 @@ classifiers = [
 # `pip install ome_zarr_pyramid` produced something that raised ModuleNotFoundError on
 # `import`.
 dependencies = [
-    "zarr",
-    "tensorstore",
-    "numpy",
+    # the same floors and exclusions as dyna-zarr (stated here too, so they hold for ozp
+    # itself): tensorstore 0.1.77-0.1.84 crash at process exit after any S3 access
+    "zarr>=3.1.5",
+    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84",
+    "numpy>=1.26",
     "numcodecs",          # utils/compressor_config.py, core/pyramid.py (codec configs)
     "pydantic>=2",        # utils/compressor_config.py (ConfigDict/field_validator = v2)
     # the arrays a Pyramid works on without dask: zarr / numpy / TensorStore levels
@@ -49,15 +51,16 @@ dependencies = [
     # 0.0.7: numpy + TensorStore wrapping, ufuncs, stack, tuple-axis reductions.
     # 0.0.9: the write engine - io.write(dimension_names=), io.create_sink (the dask
     # pump), TensorStore sources keeping their chunks / codecs / shards.
-    "dyna-zarr>=0.0.9",
+    "dyna-zarr>=0.1.0",
 ]
 
 [project.optional-dependencies]
 # Object stores (s3://, gs://, az://) through the dyna engine: obstore opens the NGFF
 # group with the same storage_options names dyna uses for the arrays.
 remote = ["obstore>=0.11"]
-# The LEGACY https://<endpoint>/<bucket>/<key> form (s3fs options, 'sync' engine).
-s3 = ["s3fs"]
+# Kept for compatibility: the legacy https://<endpoint>/<bucket>/<key> form is written
+# as s3:// through obstore now (it was s3fs and the 'sync' engine, removed in 0.1.0).
+s3 = ["obstore>=0.11"]
 # dask is optional: dask-backed pyramids (`Pyramid.from_array(dask_array)`), their
 # `dask_arrays` views, and dask-graph rechunking. Everything else runs without it
 # (DynamicArray / TensorStore); imported only where used (utils/optional_deps.py).

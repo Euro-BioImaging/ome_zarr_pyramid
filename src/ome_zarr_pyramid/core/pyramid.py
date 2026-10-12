@@ -32,6 +32,19 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _run_coroutine(coro):
+    """Run ``coro`` to completion from synchronous code - also when the caller is inside a
+    running event loop (a Jupyter cell, eubi-bridge's async conversion), where
+    ``asyncio.run`` refuses to nest: there it runs on its own loop in a worker thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
 def _is_tensorstore(arr) -> bool:
     return hasattr(arr, "read") and hasattr(arr, "spec")
 
@@ -476,19 +489,11 @@ class NGFFMetadataHandler:
                         'model': 'greyscale',
                         'defaultZ': 0
                     }
-                },
-                '_creator': {
-                    'name': 'NGFFMetadataHandler',
-                    'version': '1.0'
                 }
             }
         else:  # version == "0.4"
             multiscale_metadata['version'] = version
             self.metadata = {
-                '_creator': {
-                    'name': 'NGFFMetadataHandler',
-                    'version': '1.0'
-                },
                 'multiscales': [multiscale_metadata],
                 'omero': {
                     'channels': [],
@@ -549,9 +554,56 @@ class NGFFMetadataHandler:
         # it already lives inside the `ome` metadata read above)
         if 'image-label' in self.zarr_group.attrs and self.metadata is not None:
             self.metadata['image-label'] = self.zarr_group.attrs['image-label']  # type: ignore
+        if 'ome' not in self.zarr_group.attrs and self.metadata is not None:
+            # 0.4 keeps everything at the top level: carry the attributes NGFF does not
+            # define (an application's namespaced block, e.g. 'eubi_bridge') as well, so
+            # a read-modify-write does not drop them.
+            for key, value in self.zarr_group.attrs.items():
+                self.metadata.setdefault(key, value)  # type: ignore
+        self._fold_multiscale_transforms()
         self.zarr_format = 3 if self.version == "0.5" else 2
         self._pending_changes = False
         return self
+
+    def _fold_multiscale_transforms(self) -> None:
+        """Apply a multiscale-level ``coordinateTransformations`` (NGFF 0.4 / 0.5: it
+        applies to every dataset, after the dataset's own) to each dataset's scale and
+        translation, and drop it. Every reader of a level's scale or translation then
+        sees the true values, and a write stores them per dataset, which is equally
+        valid. Composition: ``s = s_ms * s_ds``, ``t = s_ms * t_ds + t_ms``. Transforms
+        stored in a separate array (``path``) are left as they are, with a warning."""
+        meta = cast_to_dict(self.metadata) if self.metadata is not None else {}
+        for ms in meta.get('multiscales') or []:
+            cts = ms.get('coordinateTransformations')
+            if not cts:
+                continue
+            if any('path' in t for t in cts):
+                warnings.warn("multiscale coordinateTransformations stored by 'path' are not "
+                              "applied: the levels' scale/translation may be incomplete",
+                              stacklevel=3)
+                continue
+            n = len(ms.get('axes') or [])
+            s_ms, t_ms = [1.0] * n, [0.0] * n
+            for t in cts:                         # in order: scale, then translation
+                if t.get('type') == 'scale':
+                    s_ms = [a * float(b) for a, b in zip(s_ms, t['scale'])]
+                    t_ms = [a * float(b) for a, b in zip(t_ms, t['scale'])]
+                elif t.get('type') == 'translation':
+                    t_ms = [a + float(b) for a, b in zip(t_ms, t['translation'])]
+            for ds in ms.get('datasets') or []:
+                own = ds.get('coordinateTransformations') or []
+                s_ds = next((list(map(float, t['scale'])) for t in own
+                             if t.get('type') == 'scale'), [1.0] * n)
+                t_ds = next((list(map(float, t['translation'])) for t in own
+                             if t.get('type') == 'translation'), None)
+                scale = [a * b for a, b in zip(s_ms, s_ds)]
+                new = [{'type': 'scale', 'scale': scale}]
+                if t_ds is not None or any(t_ms):
+                    base = t_ds if t_ds is not None else [0.0] * n
+                    new.append({'type': 'translation',
+                                'translation': [a * b + c for a, b, c in zip(s_ms, base, t_ms)]})
+                ds['coordinateTransformations'] = new
+            del ms['coordinateTransformations']
 
     def save_changes(self) -> None:
         """Save current metadata to connected zarr group."""
@@ -568,13 +620,13 @@ class NGFFMetadataHandler:
         else:
             metadata = make_json_safe(self.metadata)
             metadata_dict = cast_to_dict(metadata)
+            # 0.4 keeps everything at the top level: multiscales, omero, image-label and
+            # any attribute NGFF does not define (an application's namespaced block, e.g.
+            # 'eubi_bridge'). Only those were written before, so custom blocks were lost.
             self.zarr_group.attrs['multiscales'] = metadata_dict.get('multiscales')
-            if 'omero' in metadata_dict:
-                self.zarr_group.attrs['omero'] = metadata_dict['omero']
-            if 'image-label' in metadata_dict:
-                self.zarr_group.attrs['image-label'] = metadata_dict['image-label']
-            if '_creator' in metadata_dict:
-                self.zarr_group.attrs['_creator'] = metadata_dict['_creator']
+            for key, value in metadata_dict.items():
+                if key not in ('multiscales', 'version'):
+                    self.zarr_group.attrs[key] = value
 
         self._pending_changes = False
 
@@ -1225,7 +1277,7 @@ class Pyramid:
     @property
     def base_array(self) -> Union[da.Array, zarr.Array]:
         """Get the base (highest resolution) array."""
-        return self._arrays()['0']
+        return self._arrays()[self.meta.resolution_paths[0]]
 
     def _has_dask_layer(self) -> bool:
         """Whether any level is a dask array (then dask is installed)."""
@@ -1387,6 +1439,7 @@ class Pyramid:
                                 downscale_method='simple',
                                 backend='numpy',
                                 smart_scale_factor=None,
+                                downscale_backend='tensorstore',
                                 **kwargs) -> 'Pyramid':
         """Update downscaler for creating pyramid layers."""
         if self.meta is None:
@@ -1394,7 +1447,7 @@ class Pyramid:
 
         min_dimension_size = kwargs.get('min_dimension_size', 64)
 
-        darr = self.layers['0']
+        darr = self.layers[self.meta.resolution_paths[0]]
         shape = darr.shape
 
         if scale_factor is None:
@@ -1415,6 +1468,7 @@ class Pyramid:
             downscale_method=downscale_method,
             backend=backend,
             smart_scale_factor=smart_scale_factor,
+            downscale_backend=downscale_backend,
         )
         await self.downscaler.update()
         return self
@@ -1425,7 +1479,7 @@ class Pyramid:
         automatically: keep adding levels until the largest downscaled spatial
         dimension would drop below `min_dimension_size` (64), matching `downscale()`."""
         if not hasattr(self, 'downscaler'):
-            asyncio.run(self.update_downscaler(n_layers=None))
+            _run_coroutine(self.update_downscaler(n_layers=None))
         
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
@@ -1472,13 +1526,15 @@ class Pyramid:
             for k, v in src_ms.items():
                 if k not in ('datasets', 'axes'):
                     new_ms[k] = copy.deepcopy(v)
-            # preserve the base level's translation on the new level 0
+            # the base level's translation (the physical origin) on every level, as the
+            # deferred write path and eubi-bridge write it
             base_ct = src_ms['datasets'][0].get('coordinateTransformations', [])
             trans = [t for t in base_ct if t.get('type') == 'translation']
             if trans:
-                new_ms['datasets'][0].setdefault('coordinateTransformations', []).extend(
-                    copy.deepcopy(trans)
-                )
+                for ds in new_ms['datasets']:
+                    cts = [t for t in ds.setdefault('coordinateTransformations', [])
+                           if t.get('type') != 'translation']
+                    ds['coordinateTransformations'] = cts + copy.deepcopy(trans)
             new_pyr.meta._pending_changes = True
         return new_pyr
 
@@ -1500,7 +1556,7 @@ class Pyramid:
             # the recipe alone would leave those levels behind and drop nothing. Narrow
             # back to the base, which is what "write only what this pyramid really has"
             # means for a pyramid whose levels came from a plan.
-            base = new.select_levels(new.meta.resolution_paths[0])
+            base = new.select_levels(0)
             base.__dict__.pop('_downscale_plan', None)
             base.__dict__.pop('_downscale_plan_active', None)
             return base
@@ -1545,13 +1601,14 @@ class Pyramid:
                   backend: str = 'numpy',
                   smart_scale_factor=None,
                   defer: bool = True,
+                  downscale_backend: str = 'tensorstore',
                   **kwargs) -> 'Pyramid':
         """Plan (or build) a full multi-resolution pyramid from level 0.
 
         Typical terminal step after chaining shape-preserving ops on a single
         level::
 
-            full = pyr_rl.downscale()                       # until largest dim < 64
+            full = pyr_rl.downscale()                       # largest dim stays >= 64
             full = pyr_rl.downscale(min_dimension_size=128)  # coarser stop
             full = pyr_rl.downscale(n_layers=5)             # exactly 5 levels
             io.write_pyramid(full, out_path, overwrite=True)
@@ -1559,10 +1616,9 @@ class Pyramid:
         DEFERRED BY DEFAULT (``defer=True``). ``downscale`` then only RECORDS a
         plan (`_downscale_plan`) on the returned single-level pyramid and builds
         NOTHING - no lower-level arrays, no computation. The lower levels are
-        realised only at write time, PROGRESSIVELY FROM DISK: the writer streams
-        level 0 to the store once, re-reads it, and derives each coarser level
-        from the on-disk parent. This is what makes downscaling an EXPENSIVE lazy
-        base (e.g. a cellpose segmentation) cost the base ONE compute instead of
+        realised only at write time, from ONE read of level 0 (see
+        `IO.write_pyramid`). This is what makes downscaling an EXPENSIVE lazy base
+        (e.g. a cellpose segmentation) cost the base ONE compute instead of
         recomputing it once per output level.
 
         ``defer=False`` restores the old eager behaviour: build every level now as
@@ -1582,8 +1638,8 @@ class Pyramid:
             Hard-coded number of resolution levels. ``None`` (default) derives
             the count from ``min_dimension_size``.
         min_dimension_size : int
-            Stop downscaling once the largest dimension reaches this size (used
-            only when ``n_layers is None``). Default 64.
+            Stop before the largest spatial dimension would drop below this size
+            (used only when ``n_layers is None``). Default 64.
         scale_factor : sequence, optional
             Per-axis stride between levels. When omitted on a pyramid that ALREADY
             has levels, it is DERIVED from those levels (per level and per axis) so
@@ -1596,13 +1652,25 @@ class Pyramid:
             pyramid it defaults to 2 on z/y/x and 1 on t/c (from
             ``defaults.scale_factor_map``). See ``derive_downscale_plan``.
         downscale_method : str
-            'simple' (nearest/stride - correct for LABELS), 'mean', or 'median'.
-            'simple' levels are written as a cascade (each from the stored level above;
-            bit-identical to striding level 0). 'mean' and 'median' derive every level
-            from level 0, since cascading them is not equivalent (rounding twice, edge
-            blocks reweighted, median of medians). 'median' over an even-sized block
-            takes the LOWER of the two middle values (TensorStore's median), so median
-            levels carry a small downward bias.
+            'simple' (nearest/stride - correct for LABELS), 'mean', 'median', 'min',
+            'max' or 'mode' (the most frequent value; for labels too). The window
+            methods follow ``tensorstore.downsample`` exactly: integer means round half
+            to even, 'median' over an even-sized window takes the LOWER middle value (a
+            small downward bias), 'mode' ties go to the smallest value, min/max ignore
+            NaN. Every level is ceil-sized: a partial window at the far edge is reduced
+            over the elements it has (101 voxels, factor 2 -> 51). Every level has the
+            pixels it would have if computed from level 0: levels left over from the
+            one-pass write come from the last stored level for 'simple', 'min' and 'max'
+            (they compose) and from level 0 for 'mean', 'median' and 'mode' (cascading
+            them is not equivalent: rounding twice, edge windows reweighted, median of
+            medians).
+        downscale_backend : str
+            Where the window methods run: 'tensorstore' (default, ``ts.downsample``) or
+            'dyna' (``dyna_zarr.operations.coarsen``). The two give the same pixels
+            (one documented exception: NaN in a float window under median/mode). 'dyna'
+            holds ~2-3x less memory, works on any lazy chain and with either dyna read
+            backend; 'tensorstore' is faster for mean/min/max/mode on local disk
+            (1.3-1.6x), 'dyna' for median. Dask levels always stay dask.
         defer : bool
             Record a plan and build nothing (default True), or eagerly build all
             levels now (False).
@@ -1610,8 +1678,10 @@ class Pyramid:
             Passed through to ``update_downscaler`` when ``defer=False``; stored in
             the plan when deferred.
         """
+        from ome_zarr_pyramid.utils.scale import check_downscale_args
+        check_downscale_args(downscale_method, downscale_backend)
         if defer:
-            # Record the recipe; the writer expands it progressively from disk.
+            # Record the recipe; the writer builds the levels when it writes.
             # MERGE with any plan already carried rather than replacing it: ops propagate
             # a plan across a pipeline precisely so the intent survives, so the method
             # named `downscale` must not be the one that silently discards it. Explicitly
@@ -1627,6 +1697,7 @@ class Pyramid:
                 'downscale_method': downscale_method,
                 'backend': backend,
                 'smart_scale_factor': smart_scale_factor,
+                'downscale_backend': downscale_backend,
             }
             carried = getattr(self, '_downscale_plan', None)
             if carried is not None and n_layers is None and carried.get('n_layers'):
@@ -1637,7 +1708,8 @@ class Pyramid:
             if carried is not None:
                 defaults = {'n_layers': None, 'min_dimension_size': 64,
                             'scale_factor': None, 'downscale_method': 'simple',
-                            'backend': 'numpy', 'smart_scale_factor': None}
+                            'backend': 'numpy', 'smart_scale_factor': None,
+                            'downscale_backend': 'tensorstore'}
                 recipe = {k: (v if v != defaults[k] else carried.get(k, v))
                           for k, v in recipe.items()}
                 # The derived per-level keys are not part of `recipe`'s own six fields,
@@ -1671,7 +1743,7 @@ class Pyramid:
                 # base and then expands from disk, so it must be handed a single level -
                 # and `write_pyramid` would fall back to writing the existing levels,
                 # silently ignoring the new recipe.
-                base = self.select_levels(self.meta.resolution_paths[0])
+                base = self.select_levels(0)
                 return base._materialize_plan(recipe)
             # ACTIVATION. A dormant plan inherited from the source records what the
             # source's levels were but commits to nothing; `downscale()` is what turns
@@ -1679,13 +1751,14 @@ class Pyramid:
             # what was derived (the source's own level count and per-axis factors) -
             # explicit arguments override, having already been merged into `recipe`.
             return self._materialize_plan(recipe)
-        asyncio.run(self.update_downscaler(
+        _run_coroutine(self.update_downscaler(
             scale_factor=scale_factor,
             n_layers=n_layers,
             downscale_method=downscale_method,
             backend=backend,
             smart_scale_factor=smart_scale_factor,
             min_dimension_size=min_dimension_size,
+            downscale_backend=downscale_backend,
             **kwargs,
         ))
         return self.get_downscaled_pyramid()
@@ -1700,9 +1773,9 @@ class Pyramid:
 
         Resolving the recipe into a full lazy pyramid costs ~3 ms and computes NOTHING
         (measured on a 5-level 1200x1200 source), so the levels can simply be visible.
-        The coarser levels are lazy arrays derived from level 0 - dask `simple/mean/
-        median_downscale`, or a TensorStore `downsample` view for a zarr-backed base -
-        so reading a slice of one is a normal lazy read.
+        The coarser levels are lazy arrays derived from level 0 (`downscale_level`: a
+        TensorStore `downsample` view or a dyna `coarsen`, per `downscale_backend`; dask
+        for a dask base), so reading a slice of one is a normal lazy read.
 
         `_downscale_plan` is still carried, and the WRITER still uses it: writing streams
         level 0 to the store once and derives the coarser levels from the ON-DISK base,
@@ -1711,8 +1784,10 @@ class Pyramid:
         why the plan, not these arrays, drives the write.
         """
         keys = ('n_layers', 'min_dimension_size', 'scale_factor',
-                'downscale_method', 'backend', 'smart_scale_factor')
+                'downscale_method', 'backend', 'smart_scale_factor', 'downscale_backend')
         dk = {k: recipe.get(k) for k in keys}
+        if dk.get('downscale_backend') is None:
+            dk['downscale_backend'] = 'tensorstore'
         if dk.get('min_dimension_size') is None:
             dk['min_dimension_size'] = 64
         saved = self.__dict__.pop('_downscale_plan', None)
@@ -1733,6 +1808,8 @@ class Pyramid:
                 RuntimeWarning, stacklevel=3,
             )
             return self
+        if saved is not None:           # the caller's pyramid keeps the plan it carried
+            self._downscale_plan = saved
         full._downscale_plan = recipe
         full._downscale_plan_active = True
         sc = getattr(self, '_storage_chunks', None)
@@ -2144,6 +2221,8 @@ class Pyramid:
             arrays, axis_order=self.meta.axis_order, unit_list=self.meta.unit_list,  # type: ignore
             scales=scales, version=self.meta.version, name=self.meta.tag,  # type: ignore
         )
+        # the levels keep their codec: from_arrays over lazy arrays would default to blosc
+        new._compressor = self._compressor
         if self.meta.metadata and new.meta and new.meta.metadata:
             new_md = copy.deepcopy(self.meta.metadata)
             ms = new_md["multiscales"][0]
@@ -2168,6 +2247,7 @@ class Pyramid:
         keys = ('n_layers', 'min_dimension_size', 'scale_factor',
                 'downscale_method', 'backend', 'smart_scale_factor')
         dk = {k: plan[k] for k in keys}
+        dk['downscale_backend'] = plan.get('downscale_backend', 'tensorstore')
         # resolve the plan into a full lazy pyramid WITHOUT disturbing self's plan
         saved = self.__dict__.pop('_downscale_plan', None)
         try:
@@ -2626,6 +2706,44 @@ class Pyramid:
                     channels[k]["window"] = {
                         "min": mins[k], "max": maxs[k], "start": lows[k], "end": highs[k],
                     }
+            new.meta._pending_changes = True
+        return new
+
+    def saturate_cast(self, dtype) -> 'Pyramid':
+        """Lazily cast every level to ``dtype``, saturating instead of wrapping
+        (``dyna_zarr.operations.saturate_cast``): to an integer dtype, floats are rounded
+        to nearest and NaN becomes 0, then values are clipped to the target range
+        (uint16 4000 -> uint8 255). Widening casts and float targets are plain casts.
+
+        The omero windows (``min``/``max``/``start``/``end``) go through the same mapping
+        as the pixels, so they stay consistent with the cast data. To rescale the
+        intensities instead of clipping them, rescale first. All other metadata, a
+        deferred downscale plan, the recorded storage chunks and the attached label
+        images (uncast) are carried over.
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        from dyna_zarr.operations import saturate_cast
+        dtype = _numpy_dtype(dtype)
+
+        def cast(a):
+            if _numpy_dtype(a.dtype) == dtype:
+                return a
+            if is_dask_array(a):
+                return a.map_blocks(saturate_cast, dtype, dtype=dtype)
+            return saturate_cast(a, dtype)
+
+        new = self._unary_op(cast)
+        new._labels = dict(self._labels)      # attached label images keep their own dtype
+        if new.meta is not None and new.meta.metadata is not None:
+            for ch in new.meta.metadata.get("omero", {}).get("channels", []):  # type: ignore
+                window = ch.get("window")
+                if not isinstance(window, dict):
+                    continue
+                for key in ("min", "max", "start", "end"):
+                    if isinstance(window.get(key), (int, float)):
+                        v = saturate_cast(np.array([window[key]], dtype=np.float64), dtype)[0]
+                        window[key] = v.item()
             new.meta._pending_changes = True
         return new
 
