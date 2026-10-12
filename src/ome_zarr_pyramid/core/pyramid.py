@@ -2331,31 +2331,12 @@ class Pyramid:
         labeling pass. Returns that object unchanged (duck-typed; typically a
         `pyrametric.ObjectFeatures` with `.table`, `.to_frame()`, `.filter_by_size()`).
 
-        On a pyramid read back from a store there is no in-memory handle, so this
-        RECONSTRUCTS one from the NGFF `image-label.properties` block (via
-        `pyrametric.object_features.features_from_pyramid`) and caches it - far cheaper
-        than re-measuring the volume, and exact for what this package wrote. Returns
-        None when there is neither a handle nor such metadata, or when pyrametric is not
-        installed; use `pyrametric.extract_features` to measure features that were never
-        written.
+        None when nothing was attached - also on a pyramid read back from a store, whose
+        features live in the NGFF ``image-label.properties`` block: rebuild them with
+        ``pyrametric.ObjectFeatures.from_pyramid(pyr)``. (ozp used to do that itself by
+        importing pyrametric, which depends on ozp: removed in 0.1.0.)
         """
-        of = getattr(self, '_object_features', None)
-        if of is not None:
-            return of
-        md = (self.meta.metadata if self.meta is not None else None) or {}
-        if not (md.get('image-label') or {}).get('properties'):
-            return None
-        try:
-            # Optional dependency, imported lazily: ozp does not depend on the labels
-            # package (`set_image_label(object_features=...)` is duck-typed for the same
-            # reason). Without it, the metadata is still there to read directly.
-            from pyrametric.object_features import features_from_pyramid
-        except ImportError:
-            return None
-        of = features_from_pyramid(self)
-        if of is not None:
-            self._object_features = of
-        return of
+        return getattr(self, '_object_features', None)
 
     def _resolve_label_name(self, image_label: 'Pyramid', name: Optional[str]) -> str:
         if name is not None:
