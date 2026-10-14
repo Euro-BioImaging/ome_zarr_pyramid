@@ -324,6 +324,13 @@ class NGFFMetadataHandler:
 
     SUPPORTED_VERSIONS: ClassVar[List[str]] = ["0.4", "0.5"]
 
+    #: the keys NGFF defines. Any other key of ``metadata`` is an application's custom
+    #: block (e.g. 'eubi_bridge'), stored BESIDE the ``ome`` attribute in 0.5 (the spec
+    #: reserves ``ome`` for NGFF) and at the top level in 0.4, like everything else there.
+    NGFF_KEYS: ClassVar[frozenset] = frozenset({
+        'version', 'multiscales', 'omero', 'image-label', 'labels', 'plate', 'well',
+        'bioformats2raw.layout'})
+
     def __init__(self) -> None:
         """Initialize an empty metadata handler."""
         self.zarr_group: Optional[zarr.Group] = None
@@ -331,6 +338,7 @@ class NGFFMetadataHandler:
         self._pending_changes: bool = False
         self.version: Optional[str] = None
         self.zarr_format: Optional[int] = None
+        self._removed_custom: set = set()
 
     def __enter__(self) -> 'NGFFMetadataHandler':
         return self
@@ -560,6 +568,13 @@ class NGFFMetadataHandler:
             # a read-modify-write does not drop them.
             for key, value in self.zarr_group.attrs.items():
                 self.metadata.setdefault(key, value)  # type: ignore
+        elif self.metadata is not None:
+            # 0.5: custom blocks sit beside `ome`. One found inside `ome` (written there
+            # by older tools, e.g. eubi-bridge <= 0.1.5) is read as well; the block
+            # beside `ome` wins, and the next save moves it out of `ome`.
+            for key, value in self.zarr_group.attrs.items():
+                if key != 'ome' and key not in self.NGFF_KEYS:
+                    self.metadata[key] = value  # type: ignore
         self._fold_multiscale_transforms()
         self.zarr_format = 3 if self.version == "0.5" else 2
         self._pending_changes = False
@@ -605,6 +620,34 @@ class NGFFMetadataHandler:
                 ds['coordinateTransformations'] = new
             del ms['coordinateTransformations']
 
+    def mark_changed(self) -> None:
+        """Mark the metadata as edited, so the next `save_changes` writes it: for edits
+        made directly to ``metadata`` (rather than through a method that marks them)."""
+        self._pending_changes = True
+
+    @property
+    def custom_blocks(self) -> Dict[str, Any]:
+        """The custom metadata blocks: every key of ``metadata`` NGFF does not define,
+        ``{name: block}``. A view for reading; change them with `set_custom`."""
+        return {k: v for k, v in (self.metadata or {}).items() if k not in self.NGFF_KEYS}
+
+    def set_custom(self, name: str, block: Any) -> 'NGFFMetadataHandler':
+        """Set the custom metadata block `name` to `block` (any JSON value), in place;
+        ``None`` removes it. Saved beside ``ome`` (0.5) or at the top level (0.4)."""
+        if not isinstance(name, str) or not name or name == 'ome' or name in self.NGFF_KEYS:
+            raise ValueError(f"set_custom: {name!r} is not a custom block name (the NGFF "
+                             f"keys and 'ome' are reserved)")
+        if self.metadata is None:
+            raise RuntimeError("No metadata loaded or created")
+        if block is None:
+            if self.metadata.pop(name, None) is not None:
+                self._removed_custom.add(name)
+        else:
+            self.metadata[name] = copy.deepcopy(block)
+            self._removed_custom.discard(name)
+        self._pending_changes = True
+        return self
+
     def save_changes(self) -> None:
         """Save current metadata to connected zarr group."""
         if not self._pending_changes:
@@ -615,8 +658,18 @@ class NGFFMetadataHandler:
             raise RuntimeError("No metadata to save")
 
         meta_dict = cast_to_dict(self.metadata)
+        attrs = self.zarr_group.attrs
+        for name in self._removed_custom:
+            if name in attrs:
+                del attrs[name]
+        self._removed_custom = set()
         if meta_dict.get('version', '') == '0.5':
-            self.zarr_group.attrs['ome'] = make_json_safe(self.metadata)
+            metadata_dict = cast_to_dict(make_json_safe(self.metadata))
+            # the NGFF keys under `ome`, custom blocks beside it (the spec's placement)
+            attrs['ome'] = {k: v for k, v in metadata_dict.items() if k in self.NGFF_KEYS}
+            for key, value in metadata_dict.items():
+                if key not in self.NGFF_KEYS:
+                    attrs[key] = value
         else:
             metadata = make_json_safe(self.metadata)
             metadata_dict = cast_to_dict(metadata)
@@ -675,7 +728,9 @@ class NGFFMetadataHandler:
                 'type': {'t': 'time', 'c': 'channel', 'z': 'space',
                          'y': 'space', 'x': 'space'}.get(ax_name, 'custom')
             }
-            if unit is not None:
+            # NGFF gives units to space and time axes; a channel axis has none (a
+            # 'micrometer' or 'Channel' there came from defaults or old writers)
+            if unit is not None and axis_data['type'] != 'channel':
                 axis_data['unit'] = unit
             new_axes.append(axis_data)
 
@@ -1098,6 +1153,25 @@ class Pyramid:
         self.meta.parse_axes(axes, units_list)  # type: ignore
         self.meta.add_dataset(path='0', scale=scale_list)
         return self
+
+    @classmethod
+    def from_image(cls, image, *, version: str = "0.5", name: Optional[str] = None,
+                   acquisition_block: Optional[str] = None) -> 'Pyramid':
+        """A pyramid over one microscopy image: a ``micro_reader.Image``, or anything shaped
+        like one (axes, shape, dtype, region reads, optional ``resolutions`` and
+        ``metadata``; see :mod:`ome_zarr_pyramid.core.collection`). Its stored resolution
+        levels, pixel sizes and units, stage position and channels become the multiscale;
+        the levels are lazy dyna-zarr arrays over the image. What NGFF has no field for
+        (channel wavelengths, values along other indices) is ``pyr.acquisition``; name an
+        `acquisition_block` to store it in that custom metadata block as well. For every
+        image of a file, use :meth:`PyramidCollection.from_file`::
+
+            image = micro_reader.open("x.czi", samples="channels").images[0]
+            pyr = Pyramid.from_image(image, acquisition_block="my_app")
+        """
+        from ome_zarr_pyramid.core.collection import pyramid_from_image
+        return pyramid_from_image(image, version=version, name=name,
+                                  acquisition_block=acquisition_block)
 
     def from_arrays(self,
                     arrays: List[Union[np.ndarray, da.Array, zarr.Array]],
@@ -1945,6 +2019,64 @@ class Pyramid:
             scale = [1.0] * len(self.axes)
         return scale, trans
 
+    def squeeze(self, axes: Optional[str] = None) -> 'Pyramid':
+        """Drop size-1 axes on every level (or only those of `axes`, e.g. ``"tz"``),
+        keeping the metadata of the axes that stay: scales, translations, channels.
+        Returns a new `Pyramid`, or this one when there is nothing to drop. ``y`` and
+        ``x`` are never dropped: an OME-Zarr image needs them.
+
+        ::
+
+            pyr.squeeze()        # (1, 3, 1, 512, 512) tczyx -> (3, 512, 512) cyx
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        shape = dict(zip(self.meta.axis_order, self.base_array.shape))
+        wanted = self.meta.axis_order if axes is None else str(axes)
+        unknown = [ax for ax in wanted if ax not in shape]
+        if unknown:
+            raise ValueError(f"squeeze: no axis {unknown} in {self.meta.axis_order!r}")
+        if axes is not None:
+            not_one = [ax for ax in wanted if shape[ax] != 1]
+            if not_one:
+                raise ValueError(f"squeeze: axes {not_one} are not size 1 ({shape})")
+            if set(wanted) & set("yx"):
+                raise ValueError("squeeze: y and x stay (an OME-Zarr image needs them)")
+        drop = [ax for ax in wanted if shape[ax] == 1 and ax not in "yx"]
+        return self.isel(**{ax: 0 for ax in drop}) if drop else self
+
+    def update_scales(self, **axes: float) -> 'Pyramid':
+        """Set the level-0 pixel size of the named axes (``update_scales(z=2.0,
+        x=0.5)``) and rescale every coarser level by its existing factor, in place
+        (metadata only). Returns this pyramid."""
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        order = self.meta.axis_order
+        unknown = [ax for ax in axes if ax not in order]
+        if unknown:
+            raise ValueError(f"update_scales: no axis {unknown} in {order!r}")
+        paths = self.meta.resolution_paths
+        base = [float(v) for v in self.meta.get_scale(paths[0])]
+        factors = {p: [float(s) / b if b else 1.0 for s, b in zip(self.meta.get_scale(p), base)]
+                   for p in paths}
+        new_base = [float(axes.get(ax, b)) for ax, b in zip(order, base)]
+        self.meta.update_scales(reference_scale=new_base, scale_factors=factors)
+        return self
+
+    def update_units(self, **axes: str) -> 'Pyramid':
+        """Set the unit of the named axes (``update_units(z="micrometer",
+        t="second")``), in place (metadata only). Returns this pyramid."""
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        order = self.meta.axis_order
+        unknown = [ax for ax in axes if ax not in order]
+        if unknown:
+            raise ValueError(f"update_units: no axis {unknown} in {order!r}")
+        current = dict(zip(order, self.meta.unit_list))
+        current.update(axes)
+        self.meta.update_unitlist([current[ax] for ax in order])
+        return self
+
     def isel(self, **indexers) -> 'Pyramid':
         """Integer/positional selection along named axes (xarray-style), across
         ALL levels, returning a new sub-`Pyramid`.
@@ -2509,6 +2641,32 @@ class Pyramid:
             new.meta.metadata['image-label'] = il
             new.meta._pending_changes = True
         return new.validate()   # declaring a label: enforce integer dtype / no omero
+
+    @property
+    def custom_metadata(self) -> Dict[str, Any]:
+        """The custom metadata blocks, ``{name: block}``: what an application stores
+        next to the NGFF metadata (e.g. eubi-bridge's ``eubi_bridge``). Set them with
+        `set_custom_metadata`."""
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        return copy.deepcopy(self.meta.custom_blocks)
+
+    def set_custom_metadata(self, name: str, block: Any) -> 'Pyramid':
+        """Return a NEW `Pyramid` with the custom metadata block `name` set to `block`
+        (any JSON value; ``None`` removes it). Pixel data and the NGFF metadata are
+        unchanged. OME-Zarr 0.5 stores the block beside the ``ome`` attribute, 0.4 at
+        the top level of the group attributes.
+
+        ::
+
+            pyr = pyr.set_custom_metadata("my_app", {"version": "1.2", "run": 7})
+            pyr.custom_metadata["my_app"]["run"]       # 7
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        new = self._clone_metadata_only()
+        new.meta.set_custom(name, block)   # type: ignore[union-attr]
+        return new
 
     def rename(self, name: str) -> 'Pyramid':
         """Return a NEW `Pyramid` with its multiscales ``name`` set to `name` (pixel
