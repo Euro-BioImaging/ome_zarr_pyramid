@@ -101,6 +101,49 @@ def test_an_image_without_metadata_gets_ozp_defaults():
     assert pyr.acquisition == {}
 
 
+# eubi-bridge's defaults (roadmap B2-B4), so its outputs stay the same ------------------
+
+def test_a_missing_z_or_y_pixel_size_takes_x():
+    meta = SimpleNamespace(pixel_sizes={"x": Q(250.0, "nanometer")}, channels=[], position={})
+    pyr = Pyramid.from_image(FakeImage(np.zeros((1, 4, 8, 8), "u2"), "tzyx", meta))
+    assert pyr.meta.get_scale("0") == [1.0, 250.0, 250.0, 250.0]
+    assert pyr.meta.unit_list == ["second", "nanometer", "nanometer", "nanometer"]
+    meta.pixel_sizes["z"] = Q(2.0, "micrometer")                 # a z of its own is kept
+    pyr = Pyramid.from_image(FakeImage(np.zeros((1, 4, 8, 8), "u2"), "tzyx", meta))
+    assert pyr.meta.get_scale("0")[1:] == [2.0, 250.0, 250.0]
+    assert pyr.meta.unit_list[1:] == ["micrometer", "nanometer", "nanometer"]
+
+
+def test_described_channels_without_a_name_or_colour():
+    unknown = SimpleNamespace(name=None, color=None, emission_wavelength=None,
+                              excitation_wavelength=None)
+    named = SimpleNamespace(name="DAPI", color=None, emission_wavelength=None,
+                            excitation_wavelength=None)
+    meta = SimpleNamespace(pixel_sizes={}, position={}, channels=[named, unknown, unknown])
+    pyr = Pyramid.from_image(FakeImage(np.zeros((3, 8, 8), "u2"), "cyx", meta))
+    chans = pyr.meta.metadata["omero"]["channels"]
+    # by position, counted from 0; no colour of their own: white (OME's default)
+    assert [(c["label"], c["color"]) for c in chans] == [
+        ("DAPI", "FFFFFF"), ("Channel 1", "FFFFFF"), ("Channel 2", "FFFFFF")]
+    # one channel without a c axis, as a single-channel file
+    meta.channels = [unknown]
+    pyr = Pyramid.from_image(FakeImage(np.zeros((8, 8), "u2"), "yx", meta))
+    assert [(c["label"], c["color"]) for c in pyr.meta.metadata["omero"]["channels"]] == [
+        ("Channel 0", "FFFFFF")]
+
+
+def test_channels_the_image_says_nothing_about_get_distinct_colours():
+    from ome_zarr_pyramid.core.pyramid import auto_channel_color
+    pyr = Pyramid.from_image(FakeImage(np.zeros((20, 4, 4), "u1"), "cyx"))
+    pyr = pyr.set_channels({})                       # the defaults, as a write fills them in
+    colours = [c["color"] for c in pyr.meta.metadata["omero"]["channels"]]
+    assert colours[:7] == ["FF0000", "00FF00", "0000FF", "FF00FF", "00FFFF", "FFFF00", "FFFFFF"]
+    assert len(set(colours)) == 20                               # generated, not cycled
+    assert colours == [auto_channel_color(i) for i in range(20)]
+    # eubi-bridge's 8th to 12th colours (eubi_bridge.utils.metadata_utils.auto_channel_color)
+    assert colours[7:12] == ["265CFF", "B8FF66", "BF1CA4", "66FFEB", "FFA426"]
+
+
 def test_rgb_samples_are_refused_with_the_way_out():
     img = FakeImage(np.zeros((8, 8, 3), "uint8"), "yxs")
     with pytest.raises(ValueError, match="samples='channels'"):

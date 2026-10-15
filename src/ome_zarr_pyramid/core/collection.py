@@ -62,16 +62,25 @@ def _hex(color) -> Optional[str]:
     return text.upper() if len(text) in (3, 6) else None
 
 
+#: which of an image's stored resolution levels ``from_image`` takes
+RESOLUTION_POLICIES = ("all", "base")
+
+
 def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = None,
-                       acquisition_block: Optional[str] = None):
+                       acquisition_block: Optional[str] = None, resolutions: str = "all"):
     """The ``Pyramid`` for one image (see the module docstring for what an image is).
 
-    - Levels: the image's stored resolutions (finest first), each a lazy dyna-zarr array.
-      A coarser level's scale is the base scale times the size ratio per axis.
-    - Scale and units: from ``metadata.pixel_sizes``; an axis without one keeps
-      ome_zarr_pyramid's default (1.0, micrometer / second; none for ``c``).
+    - Levels: the image's stored resolutions (finest first), each a lazy dyna-zarr array;
+      ``resolutions="base"`` takes only the full-resolution image (to downscale it
+      afresh). A coarser level's scale is the base scale times the size ratio per axis.
+    - Scale and units: from ``metadata.pixel_sizes``. A missing z or y size takes x's
+      value and unit; any other axis without one keeps ome_zarr_pyramid's default
+      (1.0, micrometer / second; none for ``c``).
     - Translation: ``metadata.position`` in each axis's own scale unit, on every level.
-    - Channels: name and colour into omero.
+    - Channels: name and colour into omero. A channel the image describes without a
+      name is ``Channel {i}`` (counted from 0), without a colour white (OME's default
+      colour); colours are generated only when the image says nothing about its
+      channels. These are eubi-bridge's defaults, so its outputs stay the same.
     - What NGFF has no field for (channel wavelengths, values along other image indices)
       is ``pyramid.acquisition``. With `acquisition_block` it is also stored, as
       ``{"acquisition": ...}``, in that custom metadata block (see
@@ -92,14 +101,18 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     if set(axes) - set(_AXES) or len(set(axes)) != len(axes):
         raise ValueError(f"image axes {axes!r}: expected distinct letters from {_AXES!r}")
 
+    if resolutions not in RESOLUTION_POLICIES:
+        raise ValueError(f"resolutions={resolutions!r}: one of {RESOLUTION_POLICIES}")
     levels = list(getattr(image, "resolutions", None) or [image])
     if tuple(levels[0].shape) != tuple(image.shape):
         levels = [image] + levels
+    if resolutions == "base":
+        levels = levels[:1]
     base_shape = tuple(int(n) for n in image.shape)
 
     meta = getattr(image, "metadata", None)
     pixel_sizes = dict(getattr(meta, "pixel_sizes", None) or {})
-    base_scale, units = [], []
+    base_scale, units, given = [], [], set()
     for ax in axes:
         # a channel axis has no unit in NGFF (ozp's default table says "Channel")
         default_unit = None if ax == "c" else defaults.unit_map.get(ax)
@@ -110,6 +123,13 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
         else:
             base_scale.append(q[0])
             units.append(q[1])
+            given.add(ax)
+    if "x" in given:
+        # a missing z or y pixel size takes x's (eubi-bridge's rule)
+        x = axes.index("x")
+        for ax in "zy":
+            if ax in axes and ax not in given:
+                base_scale[axes.index(ax)], units[axes.index(ax)] = base_scale[x], units[x]
     scales = []
     for level in levels:
         ratio = [b / max(1, int(n)) for b, n in zip(base_shape, level.shape)]
@@ -132,18 +152,16 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
                 pyr.meta.update_translation(path, translation)
 
     channels = list(getattr(meta, "channels", None) or [])
-    if channels and "c" in axes and len(channels) == base_shape[axes.index("c")]:
+    n_channels = base_shape[axes.index("c")] if "c" in axes else 1
+    if channels and len(channels) == n_channels:
         overrides = {}
         for i, ch in enumerate(channels):
-            fields = {}
+            # unnamed: the default label "Channel {i}" stays; no colour: white
+            fields = {"color": _hex(getattr(ch, "color", None)) or "FFFFFF"}
             if getattr(ch, "name", None):
                 fields["label"] = str(ch.name)
-            if _hex(getattr(ch, "color", None)):
-                fields["color"] = _hex(ch.color)
-            if fields:
-                overrides[i] = fields
-        if overrides:
-            pyr = pyr.set_channels(overrides)
+            overrides[i] = fields
+        pyr = pyr.set_channels(overrides)
 
     acquisition: Dict[str, Any] = {}
     waves = []
@@ -231,6 +249,49 @@ class PyramidCollection(Mapping):
         keep = {k: p for k, p in self._pyramids.items()
                 if all(dict(k).get(name) == value for name, value in index.items())}
         return type(self)(keep, name=self.name)
+
+    def concatenate(self, index, axis: str = "c") -> "PyramidCollection":
+        """Fold one or more image indices into an axis: ``concatenate("view")`` joins
+        every entry that differs only in its view along ``c`` (one image per illumination,
+        say, with all views as channels); ``concatenate(("view", "illumination"))`` folds
+        both. Returns a new collection keyed by the remaining indices.
+
+        Each group is joined with :func:`ome_zarr_pyramid.concatenate` (lazily, and
+        refused when the entries do not agree in pixel size, position, shape or type), in
+        the order of the folded indices' values: the first index outermost. Each joined
+        pyramid has ``joined_index``: for every position along *axis* (every channel, for
+        ``c``), the folded indices' values it came from, e.g. ``[{"view": 0}, {"view": 0},
+        {"view": 1}, ...]``, to name its channels."""
+        from ome_zarr_pyramid.core.concatenate import concatenate
+
+        names = (index,) if isinstance(index, str) else tuple(index)
+        if not names:
+            raise ValueError("concatenate: no index to fold")
+        having = [all(name in dict(key) for name in names) for key in self._pyramids]
+        if not any(having):
+            raise ValueError(f"concatenate: no entry is indexed by {list(names)} "
+                             f"(the indices are {sorted({k for key in self._pyramids for k, _ in key})})")
+        if not all(having):
+            raise ValueError(f"concatenate: some entries are not indexed by {list(names)}")
+        groups: Dict[Tuple, list] = {}
+        for key in self._pyramids:
+            rest = tuple((k, v) for k, v in key if k not in names)
+            groups.setdefault(rest, []).append(key)
+        out = {}
+        for rest, keys in groups.items():
+            keys.sort(key=lambda key: tuple(dict(key)[name] for name in names))
+            parts = [self._pyramids[key] for key in keys]
+            joined = concatenate(parts, axis=axis)
+            positions = []
+            for key, part in zip(keys, parts):
+                values = {name: dict(key)[name] for name in names}
+                along = part.meta.axis_order.index(str(axis).lower())
+                size = part.layers[part.meta.resolution_paths[0]].shape[along]
+                positions += [dict(values) for _ in range(size)]
+            joined.joined_index = positions
+            joined.source_index = dict(rest)
+            out[rest] = joined
+        return type(self)(out, name=self.name)
 
     @property
     def varying(self) -> Tuple[str, ...]:

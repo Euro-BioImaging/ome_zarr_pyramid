@@ -17,10 +17,11 @@ __author__ = "Bugra Oezdemir"
 from ome_zarr_pyramid.core.io import IO
 from ome_zarr_pyramid.core.pyramid import Pyramid
 from ome_zarr_pyramid.core.collection import PyramidCollection
+from ome_zarr_pyramid.core.concatenate import concatenate
 
 #: The package's reader/writer, shared by everyone in this process. It holds no state:
 #: settings go in the call (or in your own ``IO(...)``), never on this object, since
 #: anything stored here would apply to every thread and library in the process.
 io = IO()
 
-__all__ = ["Pyramid", "PyramidCollection", "IO", "io"]
+__all__ = ["Pyramid", "PyramidCollection", "concatenate", "IO", "io"]

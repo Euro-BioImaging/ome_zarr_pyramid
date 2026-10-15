@@ -247,6 +247,31 @@ def normalize_color(value: Union[str, Tuple, List]) -> str:
     )
 
 
+#: the first channels' colours: red, green, blue, magenta, cyan, yellow, white
+DEFAULT_CHANNEL_COLORS = ("FF0000", "00FF00", "0000FF", "FF00FF", "00FFFF", "FFFF00", "FFFFFF")
+# Beyond them, golden-angle hue steps keep successive hues far apart however many
+# channels there are; alternating saturation / value separates hues that come close.
+# The same colours as eubi-bridge's (eubi_bridge.utils.metadata_utils).
+_HUE_OFFSET = 0.625
+_GOLDEN_RATIO_CONJUGATE = 0.618033988749895
+_SATURATIONS = (0.85, 0.60)
+_VALUES = (1.0, 1.0, 0.75)
+
+
+def auto_channel_color(index: int) -> str:
+    """A distinct ``RRGGBB`` colour for channel *index*: ``DEFAULT_CHANNEL_COLORS``
+    first, then generated (not cycled), so a 20-channel image still has separable
+    channels."""
+    if index < len(DEFAULT_CHANNEL_COLORS):
+        return DEFAULT_CHANNEL_COLORS[index]
+    import colorsys
+    n = index - len(DEFAULT_CHANNEL_COLORS)
+    hue = (_HUE_OFFSET + n * _GOLDEN_RATIO_CONJUGATE) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, _SATURATIONS[n % len(_SATURATIONS)],
+                                  _VALUES[n % len(_VALUES)])
+    return f"{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}"
+
+
 def generate_channel_metadata(
     num_channels: int,
     dtype: type = np.uint16
@@ -265,16 +290,6 @@ def generate_channel_metadata(
     dict
         Dictionary with 'omero' key containing channel metadata
     """
-    default_colors = [
-        "FF0000",  # Red
-        "00FF00",  # Green
-        "0000FF",  # Blue
-        "FF00FF",  # Magenta
-        "00FFFF",  # Cyan
-        "FFFF00",  # Yellow
-        "FFFFFF",  # White
-    ]
-
     channels = []
     
     if dtype is not None and np.issubdtype(dtype, np.integer):
@@ -285,10 +300,8 @@ def generate_channel_metadata(
         raise ValueError(f"Unsupported dtype {dtype}")
 
     for i in range(num_channels):
-        color = default_colors[i] if i < len(
-            default_colors) else f"{i * 40 % 256:02X}{i * 85 % 256:02X}{i * 130 % 256:02X}"
         channel = {
-            "color": color,
+            "color": auto_channel_color(i),
             "coefficient": 1,
             "active": True,
             "label": f"Channel {i}",
@@ -1086,6 +1099,12 @@ class Pyramid:
         self._array_layers = {}  # In-memory array storage
         self._compressor: Optional[CompressorConfig] = None
         self._labels: Dict[str, 'Pyramid'] = {}  # NGFF labels/ collection (name -> label Pyramid)
+        # Set by `from_image` / `PyramidCollection.concatenate` on the pyramid they return
+        # (not carried by edits): what NGFF has no field for, where the image sits in its
+        # file, and which index values each position along a joined axis came from.
+        self.acquisition: Dict[str, Any] = {}
+        self.source_index: Dict[str, int] = {}
+        self.joined_index: Optional[List[Dict[str, int]]] = None
         if gr is not None:
             self.from_ngff(gr)
 
@@ -1156,22 +1175,24 @@ class Pyramid:
 
     @classmethod
     def from_image(cls, image, *, version: str = "0.5", name: Optional[str] = None,
-                   acquisition_block: Optional[str] = None) -> 'Pyramid':
+                   acquisition_block: Optional[str] = None,
+                   resolutions: str = "all") -> 'Pyramid':
         """A pyramid over one microscopy image: a ``micro_reader.Image``, or anything shaped
         like one (axes, shape, dtype, region reads, optional ``resolutions`` and
         ``metadata``; see :mod:`ome_zarr_pyramid.core.collection`). Its stored resolution
         levels, pixel sizes and units, stage position and channels become the multiscale;
         the levels are lazy dyna-zarr arrays over the image. What NGFF has no field for
         (channel wavelengths, values along other indices) is ``pyr.acquisition``; name an
-        `acquisition_block` to store it in that custom metadata block as well. For every
-        image of a file, use :meth:`PyramidCollection.from_file`::
+        `acquisition_block` to store it in that custom metadata block as well.
+        ``resolutions="base"`` takes only the full-resolution level (``"all"``: every stored
+        level). For every image of a file, use :meth:`PyramidCollection.from_file`::
 
             image = micro_reader.open("x.czi", samples="channels").images[0]
             pyr = Pyramid.from_image(image, acquisition_block="my_app")
         """
         from ome_zarr_pyramid.core.collection import pyramid_from_image
         return pyramid_from_image(image, version=version, name=name,
-                                  acquisition_block=acquisition_block)
+                                  acquisition_block=acquisition_block, resolutions=resolutions)
 
     def from_arrays(self,
                     arrays: List[Union[np.ndarray, da.Array, zarr.Array]],
@@ -2185,6 +2206,7 @@ class Pyramid:
         for p in paths:
             arr = arrays[p]
             lvl_scale, lvl_trans = self._read_ct(p)
+            had_translation = lvl_trans is not None
             if lvl_trans is None:
                 lvl_trans = [0.0] * ndim
             slices = [slice(None)] * ndim
@@ -2215,6 +2237,9 @@ class Pyramid:
                         sc[i] = lvl_scale[i] * lstep
                     # non-uniform: leave scale as-is (best-effort; data still gathered)
                     tr[i] = lvl_trans[i] + lis[0] * lvl_scale[i]
+                if axstr[i] == "c":
+                    # a channel axis has no extent: choosing channels moves nothing
+                    sc[i], tr[i] = lvl_scale[i], lvl_trans[i]
             out = arr[tuple(slices)]
             # apply fancy selections one axis at a time: a single advanced index per
             # getitem gives orthogonal selection (a shared tuple would cross-product).
@@ -2229,7 +2254,10 @@ class Pyramid:
                                      axis=pos)
             new_arrays.append(out)
             new_scales.append([sc[i] for i in keep])
-            new_translations.append([tr[i] for i in keep])
+            kept = [tr[i] for i in keep]
+            # a level without a translation keeps none when the selection starts at 0
+            # (squeeze, crops from the origin): an all-zero one says nothing new
+            new_translations.append(kept if had_translation or any(kept) else None)
 
         return self._build_indexed(new_arrays, out_axes, new_scales, new_translations, channel_indices)
 
@@ -2430,6 +2458,11 @@ class Pyramid:
         plan = getattr(self, '_downscale_plan', None)
         if plan is not None:
             new._downscale_plan = dict(plan)
+            # an ACTIVE plan (asked for with `downscale()`) stays active: without the
+            # flag the write took the plan for an inherited one, skipped the one-pass
+            # writer and wrote every level from the source separately
+            if getattr(self, '_downscale_plan_active', False):
+                new._downscale_plan_active = True
         sc = getattr(self, '_storage_chunks', None)
         if sc is not None:
             new._storage_chunks = sc
@@ -2709,6 +2742,8 @@ class Pyramid:
             * ``"window"`` - a dict MERGED into the existing window, so you may pass
               only ``{"start": .., "end": ..}`` and keep ``min``/``max``. For a
               DATA-DRIVEN window (computed from the pixels) use `set_display_range`.
+        - a field set to ``None`` is removed: ``{"window": None}`` leaves the channel
+          without a display window, so viewers choose one themselves.
 
         ::
 
@@ -2753,7 +2788,9 @@ class Pyramid:
             if not isinstance(fields, dict):
                 raise TypeError(f"set_channels: value for channel {key!r} must be a dict of fields")
             for field, value in fields.items():
-                if field == "color":
+                if value is None:
+                    channels[idx].pop(field, None)    # None removes the field
+                elif field == "color":
                     channels[idx]["color"] = normalize_color(value)   # name/hex/rgb -> 'RRGGBB'
                 elif field == "window" and isinstance(value, dict):
                     channels[idx].setdefault("window", {}).update(value)   # merge, keep min/max

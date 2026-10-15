@@ -257,3 +257,33 @@ def test_drop_downscale_plan_keeps_real_levels(tmp_path):
     out = tmp_path / "dropped.zarr"
     IO().write_pyramid(dropped, str(out), overwrite=True)
     assert len(IO().read_pyramid(str(out)).meta.resolution_paths) == 3
+
+
+def test_write_chunk_size_is_dyna_with_a_deferred_downscale(tmp_path):
+    """write_pyramid(chunk_size_mb=) leaves the shape to dyna whether or not the pyramid
+    carries a deferred downscale (that route used to apply rechunk's isotropic rule)."""
+    import zarr
+    from ome_zarr_pyramid import IO, Pyramid
+    data = np.random.default_rng(0).integers(0, 255, (2, 40, 300, 300), dtype=np.uint8)
+    pyr = Pyramid().from_arrays([data], axis_order="czyx", version="0.5")
+    IO().write_pyramid(pyr.downscale(n_layers=2, defer=True), str(tmp_path / "plan"),
+                       chunk_size_mb=0.25)
+    chunks = zarr.open_group(str(tmp_path / "plan"), mode="r")["0"].chunks
+    assert chunks != pyr.rechunk(chunk_size_mb=0.25)._storage_chunks   # (1, 40, 80, 80)
+    assert np.prod(chunks) <= 0.25 * 2**20
+
+
+def test_metadata_edits_keep_a_requested_downscale_active(tmp_path, caplog):
+    """set_channels / set_custom_metadata after downscale() keep the plan ACTIVE, so the
+    write still writes every level from one read of the source (one pass)."""
+    import logging
+    from ome_zarr_pyramid import IO, Pyramid
+    data = np.random.default_rng(0).integers(0, 255, (8, 256, 256), dtype=np.uint8)
+    pyr = Pyramid().from_arrays([data], axis_order="zyx").downscale(n_layers=3)
+    edited = pyr.set_channels({0: {"label": "x"}}).set_custom_metadata("app", {"a": 1})
+    assert getattr(edited, "_downscale_plan_active", False)
+    io = IO()
+    io.verbose = True
+    with caplog.at_level(logging.INFO, logger="ome_zarr_pyramid.core.io"):
+        io.write_pyramid(edited, str(tmp_path / "out"), windows="dtype")
+    assert "one pass" in caplog.text
