@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from ome_zarr_pyramid import PyramidCollection
-from tests.test_collection import FakeImage, Q
+from test_collection import FakeImage, Q
 
 
 def _images(views=2, illuminations=2, scenes=1, channels=2, *, shift_view=None):

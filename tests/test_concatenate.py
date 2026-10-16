@@ -153,7 +153,7 @@ def test_a_joined_pyramid_writes_and_reads_back(tmp_path):
 # -- B5 and C7 ------------------------------------------------------------------------------
 
 def test_from_image_can_take_only_the_full_resolution_level():
-    from tests.test_collection import _image
+    from test_collection import _image
     img = _image()                                           # two stored levels
     assert Pyramid.from_image(img).meta.resolution_paths == ["0", "1"]
     assert Pyramid.from_image(img, resolutions="base").meta.resolution_paths == ["0"]
