@@ -146,3 +146,42 @@ def test_error_empty_list(pyr3d):
     pyr, _ = pyr3d
     with pytest.raises(ValueError):
         pyr.isel(c=[])
+
+
+# --- crops as eubi-bridge makes them (roadmap C2) ---
+
+def test_a_channel_crop_keeps_the_channels_in_step_and_moves_nothing():
+    from ome_zarr_pyramid import Pyramid
+    a = np.arange(4 * 6 * 16 * 16, dtype="u2").reshape(4, 6, 16, 16)
+    pyr = Pyramid().from_arrays([a, a[:, ::2, ::2, ::2]], axis_order="czyx",
+                                scales=[[1, 2.0, 0.5, 0.5], [1, 4.0, 1.0, 1.0]], version="0.5")
+    for p in pyr.meta.resolution_paths:
+        pyr.meta.update_translation(p, [0.0, 10.0, 100.0, 200.0])
+    pyr = pyr.set_channels({i: {"label": f"ch{i}"} for i in range(4)})
+    for sel, labels in ((slice(1, 3), ["ch1", "ch2"]), (slice(0, 4, 2), ["ch0", "ch2"]),
+                        ([2, 0], ["ch2", "ch0"]), (1, ["ch1"])):
+        out = pyr.isel(c=sel)
+        assert [c["label"] for c in out.meta.metadata["omero"]["channels"]] == labels
+        for p in out.meta.resolution_paths:                 # every level
+            assert out.meta.get_translation(p)[-3:] == [10.0, 100.0, 200.0]
+            if "c" in out.axes:
+                assert out.meta.get_translation(p)[0] == 0.0       # a channel has no place
+                assert out.meta.get_scale(p)[0] == 1               # ... nor a step
+    # a spatial crop moves the position by start * pixel size, on every level
+    out = pyr.isel(z=slice(2, 6), y=slice(4, 12))
+    assert out.meta.get_translation("0") == [0.0, 14.0, 102.0, 200.0]
+    assert out.meta.get_translation("1") == [0.0, 14.0, 102.0, 200.0]
+
+
+def test_isel_adds_no_zero_translation():
+    """A level without a translation gets none from a selection starting at 0 (squeeze,
+    a crop from the origin); a crop elsewhere gets the shifted one."""
+    import numpy as np
+    from ome_zarr_pyramid import Pyramid
+    pyr = Pyramid().from_arrays([np.zeros((1, 1, 4, 32, 32), "u1")], axis_order="tczyx",
+                                scales=[[1, 1, 2, 0.5, 0.5]])
+    ct = lambda p: p.meta.multiscales["datasets"][0]["coordinateTransformations"]
+    assert [c["type"] for c in ct(pyr.squeeze())] == ["scale"]
+    assert [c["type"] for c in ct(pyr.isel(y=slice(0, 8)))] == ["scale"]
+    moved = pyr.isel(y=slice(4, 8))
+    assert ct(moved)[1] == {"type": "translation", "translation": [0.0, 0.0, 0.0, 2.0, 0.0]}

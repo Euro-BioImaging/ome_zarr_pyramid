@@ -171,3 +171,51 @@ def test_s3_dask_pyramid_is_pumped(bucket, data):
     IO().write_pyramid(pyr, url, overwrite=True, storage_options=opts)
     back = IO().read_pyramid(url, storage_options=opts)
     np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data + 1)
+
+
+def test_the_ome_xml_is_written_with_a_remote_pyramid(bucket, data):
+    name, opts = bucket
+    xml = '<?xml version="1.0" encoding="UTF-8"?><OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"/>'
+    pyr = Pyramid().from_arrays([data], axis_order=AXES, version="0.5")
+    IO().write_pyramid(pyr, f"s3://{name}/img.ome.zarr", overwrite=True, storage_options=opts,
+                       ome_xml=xml, ome_series=[3])
+    import json
+
+    import obstore
+    store = obstore.store.from_url(f"s3://{name}/img.ome.zarr", **opts)
+    assert bytes(obstore.get(store, "OME/METADATA.ome.xml").bytes()).decode() == xml
+    meta = json.loads(bytes(obstore.get(store, "OME/zarr.json").bytes()))
+    assert meta["attributes"]["ome"] == {"version": "0.5", "series": ["3"]}
+
+
+def test_auto_windows_read_the_remote_coarsest_level(bucket, data):
+    name, opts = bucket
+    url = f"s3://{name}/auto.zarr"
+    IO().write_pyramid(_pyr(data).downscale(n_layers=2, defer=True), url, overwrite=True,
+                       storage_options=opts, windows="auto")
+    back = IO().read_pyramid(url, storage_options=opts)
+    coarsest = np.asarray(back.layers["1"][...])
+    c = AXES.index("c")
+    for k, ch in enumerate(back.meta.metadata["omero"]["channels"]):
+        lo, hi = np.percentile(np.take(coarsest, k, axis=c), (0.1, 99.9))
+        assert (ch["window"]["start"], ch["window"]["end"]) == (int(np.floor(lo)),
+                                                                int(np.ceil(hi)))
+        assert (ch["window"]["min"], ch["window"]["max"]) == (0, 65535)
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_metadata_is_updated_in_place_remotely(bucket, data, version):
+    name, opts = bucket
+    url = f"s3://{name}/upd.zarr"
+    IO().write_pyramid(_pyr(data, version), url, overwrite=True, storage_options=opts,
+                       windows="dtype")
+    IO().update_metadata(url, scales={"x": 0.25}, channels={0: {"label": "DAPI"}},
+                         windows="data", storage_options=opts)
+    back = IO().read_pyramid(url, storage_options=opts)
+    assert back.meta.get_scale("0")[-1] == 0.25
+    channels = back.meta.metadata["omero"]["channels"]
+    assert channels[0]["label"] == "DAPI"
+    for k, ch in enumerate(channels):
+        assert (ch["window"]["start"], ch["window"]["end"]) == (int(data[k].min()),
+                                                                int(data[k].max()))
+    np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)

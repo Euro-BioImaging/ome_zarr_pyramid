@@ -21,6 +21,13 @@ def _attrs(path):
     return at.get("ome", at)
 
 
+def _custom(path, name):
+    """A custom block where the spec puts it: beside `ome` (0.5), top level (0.4)."""
+    at = dict(zarr.open_group(str(path), mode="r").attrs)
+    assert name not in at.get("ome", {})
+    return at[name]
+
+
 def _pyr(version, mode):
     pyr = Pyramid().from_arrays([A], axis_order="czyx", scales=[[1, 0.5, 0.1, 0.1]],
                                 version=version)
@@ -40,7 +47,7 @@ def test_custom_block_and_translation_survive(tmp_path, version, mode):
     out = tmp_path / "o.zarr"
     IO().write_pyramid(_pyr(version, mode), str(out), overwrite=True)
     at = _attrs(out)
-    assert at["my_app"] == {"version": "x", "nested": [1, 2]}
+    assert _custom(out, "my_app") == {"version": "x", "nested": [1, 2]}
     assert "_creator" not in at
     datasets = at["multiscales"][0]["datasets"]
     assert len(datasets) == (1 if mode == "single" else 3)
@@ -56,4 +63,4 @@ def test_read_modify_write_keeps_the_block(tmp_path):
     src, out = tmp_path / "s.zarr", tmp_path / "o.zarr"
     IO().write_pyramid(_pyr("0.4", "single"), str(src), overwrite=True)
     IO().write_pyramid(IO().read_pyramid(str(src)) + 1, str(out), overwrite=True)
-    assert _attrs(out)["my_app"]["version"] == "x"
+    assert _custom(out, "my_app")["version"] == "x"

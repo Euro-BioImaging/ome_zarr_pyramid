@@ -8,8 +8,9 @@ large-scale volumes with the same code.
   array ([dyna-zarr](https://pypi.org/project/dyna-zarr/) `DynamicArray`s; `dask`
   arrays if you build it from dask) plus the full NGFF metadata (axes, scales, units,
   omero, translations).
-- **Lazy & memory-bound.** Nothing is computed until you write or `.compute()`. The
-  writer streams region by region; the whole volume is never held in RAM.
+- **Lazy & memory-bound.** Nothing is computed until you write the pyramid or read a
+  level into memory (`np.asarray(pyr.base_array)`). The writer streams region by region;
+  the whole volume is never held in RAM.
 - **NGFF-native.** Reads/writes multiscales v0.4 and v0.5 (with `dimension_names`),
   sharded or not, local or on object storage (`s3://`, `gs://`, `az://`).
 - **Deferred downscaling.** `downscale()` records a plan and builds nothing. The
@@ -242,11 +243,15 @@ IO operations.
 ```python
 import micro_reader
 
-image = micro_reader.open("image.czi").images[0].as_axes("canonical", samples="channels")
+image = micro_reader.open("image.czi", samples="channels").images[0]
 # Here, image is a lazy micro_reader.Image object. It can be read region by region.
-image_pyr = Pyramid().from_arrays([image], axis_order="tczyx", version="0.5")
-# Pyramid was constructed with a single lazy object, which can be streamed to disc.
+image_pyr = Pyramid.from_image(image)
+# Its stored resolution levels, pixel sizes, stage position and channels become the
+# pyramid's levels and metadata; the levels stay lazy and can be streamed to disc.
 ```
+
+For every image of a file at once, `PyramidCollection.from_file(micro_reader.open(...))`
+gives one lazy pyramid per image.
 
 ## Write options
 
@@ -265,10 +270,13 @@ io.write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
 - `memory_budget_mb=1024` keeps the write within that much memory, on top of what your
   process already holds. Shards can be much larger than that: **shards are also written chunk
   by chunk**. For example, a 17.6 GB stack of 2347 planes, written as a 6-level pyramid
-  with 960³ shards, stayed under 1 GB with a 1.5 GB budget.
+  with 960³ shards, stayed under 1 GB with a 1.5 GB budget. It does not apply to levels
+  built from dask arrays (dask's own scheduler writes those), and raises there.
 - `io_backend="zarrista"` writes the bytes with the optional zarrista backend of
   dyna-zarr instead of TensorStore.
-- `max_threads` was called `max_workers` before 0.1.0. The old names still work, with a `FutureWarning`.
+- Renamed in 0.1.0: `max_workers` is now `max_threads`, and `use_multiprocessing` is now
+  `max_downscale_processes`. The old names still work, with a `FutureWarning`. The old
+  `backend="sync"` and `backend="tensorstore"` write engines are gone: asking for them raises.
 - `window_from_data=True` sets each channel's display window (`start`/`end` in the omero metadata) 
   to the min/max of level 0 as written, measured during the write itself, so the output is
   not read again. The window's `min`/`max` stay as they are. For percentiles or

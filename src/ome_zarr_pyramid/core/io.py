@@ -7,12 +7,13 @@ reference only.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import asyncio
 import gc
 import itertools
 import logging
+from types import SimpleNamespace
 import os
 import threading
 import time
@@ -428,6 +429,113 @@ def _store_join(path, *parts):
     return p
 
 
+#: write_pyramid(windows=...)
+_WINDOW_MODES = ("keep", "dtype", "data", "none", "auto")
+#: windows="auto": the percentiles of the coarsest level that set start / end ...
+AUTO_WINDOW_PERCENTILES = (0.1, 99.9)
+#: ... when that level is at most this size; a larger one keeps the dtype's range
+AUTO_WINDOW_MAX_MB = 64.0
+
+
+def _apply_windows(pyramid, mode: str):
+    """*pyramid* with every channel's omero window set from its dtype (``"dtype"``:
+    the full range as ``min``/``max`` and ``start``/``end``) or removed (``"none"``)."""
+    if not ((pyramid.meta.metadata or {}).get("omero") or {}).get("channels"):
+        pyramid = pyramid.set_channels({})                  # defaults (from_arrays has none)
+    n = len(pyramid.meta.metadata["omero"]["channels"])
+    if mode == "none":
+        return pyramid.set_channels({i: {"window": None} for i in range(n)})
+    dtype = pyramid.layers[pyramid.meta.resolution_paths[0]].dtype
+    dtype = np.dtype(getattr(dtype, "numpy_dtype", dtype))    # a TensorStore level too
+    if dtype == np.bool_:
+        lo, hi = 0, 1
+    elif np.issubdtype(dtype, np.integer):
+        lo, hi = int(np.iinfo(dtype).min), int(np.iinfo(dtype).max)
+    else:
+        lo, hi = float(np.finfo(dtype).min), float(np.finfo(dtype).max)
+    window = {"min": lo, "max": hi, "start": lo, "end": hi}
+    return pyramid.set_channels({i: {"window": dict(window)} for i in range(n)})
+
+
+def _auto_window_limits(level, axes, where) -> Optional[tuple]:
+    """``(starts, ends)`` per channel: the AUTO_WINDOW_PERCENTILES of `level` (the
+    coarsest level of a pyramid, axes `axes`), read one channel at a time; None when the
+    level is over AUTO_WINDOW_MAX_MB (the dtype's range stays, with a log line). A
+    channel without finite values gets None."""
+    dtype = np.dtype(getattr(level.dtype, "numpy_dtype", level.dtype))
+    size_mb = int(np.prod(level.shape)) * dtype.itemsize / 2**20
+    if size_mb > AUTO_WINDOW_MAX_MB:
+        logger.info(f"windows='auto': the coarsest level of {where} is {size_mb:.0f} MB "
+                    f"(over {AUTO_WINDOW_MAX_MB:.0f} MB): windows from the dtype")
+        return None
+    axes = list(axes)
+    c = axes.index('c') if 'c' in axes else None
+    n = level.shape[c] if c is not None else 1
+    integer = np.issubdtype(dtype, np.integer)
+    lows, highs = [], []
+    for k in range(n):                               # one channel in memory at a time
+        key = tuple(k if i == c else slice(None) for i in range(len(axes)))
+        data = np.asarray(level[key])
+        if data.dtype == np.bool_:
+            data = data.astype(np.uint8)
+        if not np.isfinite(data).any():
+            lows.append(None)
+            highs.append(None)
+            continue
+        lo, hi = np.nanpercentile(data, AUTO_WINDOW_PERCENTILES)
+        lows.append(int(np.floor(lo)) if integer else float(lo))
+        highs.append(int(np.ceil(hi)) if integer else float(hi))
+    return lows, highs
+
+
+def _data_window_limits(pyramid) -> tuple:
+    """``(starts, ends)`` per channel: the minimum and maximum of level 0, streamed in
+    bounded memory (``Pyramid.set_display_range``)."""
+    measured = pyramid.set_display_range("minmax")
+    base = pyramid.layers[pyramid.meta.resolution_paths[0]]
+    dtype = np.dtype(getattr(base.dtype, "numpy_dtype", base.dtype))
+    cast = int if np.issubdtype(dtype, np.integer) else float
+    windows = [ch.get("window") or {} for ch in measured.meta.metadata["omero"]["channels"]]
+    return ([cast(w["start"]) if w.get("start") is not None else None for w in windows],
+            [cast(w["end"]) if w.get("end") is not None else None for w in windows])
+
+
+#: update_metadata(windows=...)
+_UPDATE_WINDOW_MODES = ("keep", "dtype", "data", "auto", "none")
+
+
+def _write_ome_xml(path, xml: str, series, zarr_format: int,
+                   storage_options: Optional[dict] = None) -> None:
+    """``<path>/OME/METADATA.ome.xml`` and its ``OME`` group, as bioformats2raw lays
+    them out (and eubi-bridge wrote them): the group's attributes list *series*
+    (default ``["0"]``; 0.4: ``series``, 0.5: ``ome.series``). Written through the zarr
+    store of the output, so local and object-store outputs are written alike."""
+    from ome_zarr_pyramid.core.pyramid import _run_coroutine
+    from zarr.core.buffer import default_buffer_prototype
+    if not isinstance(xml, str) or not xml.strip():
+        raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
+    series = [str(s) for s in (series if series is not None else [0])]
+    root = _open_store_group(path, zarr_format, mode="a", storage_options=storage_options)
+    ome = root.require_group("OME")
+    if int(zarr_format) == 2:
+        ome.attrs["series"] = series
+    else:
+        ome.attrs["ome"] = {"version": "0.5", "series": series}
+    store_path = ome.store_path
+    key = f"{store_path.path}/METADATA.ome.xml" if store_path.path else "METADATA.ome.xml"
+    root = getattr(store_path.store, "root", None)
+    if root is not None:
+        # local disk: straight to the final name. zarr's own write goes through a
+        # temporary "METADATA.ome.<32 hex>.partial", 37 characters longer, which crossed
+        # Windows' 260-character path limit where the file itself fits.
+        target = Path(root) / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(xml.encode("utf-8"))      # as given (text mode adds CRs)
+        return
+    data = default_buffer_prototype().buffer.from_bytes(xml.encode("utf-8"))
+    _run_coroutine(store_path.store.set(key, data))
+
+
 def _open_store_group(path, zarr_format: int, mode: str = "a",
                       storage_options: Optional[dict] = None) -> zarr.Group:
     """Open/create a zarr group for attr read/write: local directly; an object-store URL
@@ -633,6 +741,9 @@ class PyramidIO:
                       dtype=None,
                       window_from_data: bool = False,
                       memory_budget_mb: Optional[float] = None,
+                      windows: str = "keep",
+                      ome_xml: Optional[str] = None,
+                      ome_series: Optional[Sequence] = None,
                       max_workers: Optional[int] = None,
                       use_multiprocessing: Optional[bool] = None,
                       **removed) -> None:
@@ -667,9 +778,10 @@ class PyramidIO:
         recursively into ``<path>/labels/<name>``.
 
         Storage chunking (decoupled from any PROCESSING tile size an op imposed):
-        pass ``chunk_shape`` (per-axis tuple, or a ``{level: tuple}`` dict) or
-        ``chunk_size_mb`` (scalar / per-level sequence / ``{level: mb}``) to set the
-        on-disk chunk shape - see :meth:`Pyramid.rechunk`. When neither is given, the
+        ``chunk_shape`` (a per-axis tuple, or a ``{level: tuple}`` dict) is used as
+        given, each side capped at the level's extent. ``chunk_size_mb`` (scalar /
+        per-level sequence / ``{level: mb}``) is a size that dyna turns into a shape
+        aligned with each level's own grid. When neither is given, the
         pyramid's recorded ``_storage_chunks`` (from read) is restored, so a
         read -> process -> write round-trip keeps the original chunking even if an op
         rechunked the dask arrays to its tile size.
@@ -721,17 +833,30 @@ class PyramidIO:
             processed in y/x tiles that keep the open output chunks within it, whatever
             the plane size (either ``io_backend``; zarrista needs zarrista-bounded).
             None: no cap.
+        windows : str, optional
+            The channels' omero display windows: ``"keep"`` (default) as the pyramid
+            has them; ``"dtype"`` the full range of the dtype as WRITTEN (after
+            ``dtype``: a uint16 -> uint8 write gets 0-255), as ``min``/``max`` and
+            ``start``/``end``; ``"data"`` ``start``/``end`` = the min/max of the level 0
+            data as written, measured while level 0 is written (no second read; not with
+            ``max_downscale_processes``); ``"auto"`` ``min``/``max`` from the dtype and
+            ``start``/``end`` = the 0.1 and 99.9 percentiles of the coarsest level as
+            written, read back after the write (a quick overview) - or, when that level is
+            over 64 MB (no downscaling, a deep stack kept in z), the dtype's range, as
+            ``"dtype"``; ``"none"`` no window (viewers choose). For other percentiles or
+            another level, use :meth:`Pyramid.set_display_range` before writing.
         window_from_data : bool, optional
-            Set each channel's omero window ``start``/``end`` to the min/max of the
-            level 0 data as written (after ``dtype``), measured while level 0 is
-            written - no second read of the output. ``min``/``max`` (the range a
-            viewer's slider spans) are kept. Not with ``max_downscale_processes``.
-            For percentiles or another level, use :meth:`Pyramid.set_display_range`
-            before writing.
+            The older spelling of ``windows="data"``.
         compressor, compressor_params : optional
             Override the pyramid's codec (see above). ``compressor=None`` (default)
             uses ``pyramid.compressor`` (the input's own codec, or blosc for
             non-zarr-backed pyramids).
+        ome_xml : str, optional
+            An OME-XML document written with the pyramid, as ``OME/METADATA.ome.xml``
+            in an ``OME`` group whose attributes list ``ome_series`` (default ``["0"]``),
+            as bioformats2raw lays it out: in the same write, local or remote, so the
+            output is not opened again afterwards. ozp writes it as given; building it is
+            the caller's.
 
         Notes
         -----
@@ -744,6 +869,18 @@ class PyramidIO:
         if pyramid.meta is None:
             raise ValueError("Pyramid not initialized")
         _refuse_removed_settings(removed)
+        if ome_xml is not None and (not isinstance(ome_xml, str) or not ome_xml.strip()):
+            raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
+        if windows not in _WINDOW_MODES:
+            raise ValueError(f"windows={windows!r}: one of {_WINDOW_MODES}")
+        if window_from_data:
+            if windows not in ("keep", "data"):
+                raise ValueError(f"window_from_data=True is windows='data'; it cannot be "
+                                 f"combined with windows={windows!r}")
+            windows = "data"
+        if windows != "keep" and layers is None and pyramid.meta.is_label:
+            raise ValueError(f"windows={windows!r} sets omero channel windows; a label "
+                             f"image has none.")
         max_threads = renamed(max_threads, max_workers, new="max_threads",
                               old="max_workers", where="write_pyramid", default=4)
         max_downscale_processes = downscale_processes(max_downscale_processes, use_multiprocessing,
@@ -756,7 +893,18 @@ class PyramidIO:
                 labels_group_path, _ = _legacy_https_target(labels_group_path,
                                                             storage_options)
             path, storage_options = _legacy_https_target(path, storage_options)
-        if window_from_data and layers is None:
+        if windows == "auto" and layers is None:
+            return self._write_auto_windows(
+                pyramid, path, overwrite=overwrite, max_threads=max_threads,
+                region_size_mb=region_size_mb,
+                max_downscale_processes=max_downscale_processes, backend=backend,
+                compressor=compressor, compressor_params=compressor_params,
+                chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb,
+                include_labels=include_labels, labels_group_path=labels_group_path,
+                label_name=label_name, storage_options=storage_options,
+                shard_coefficients=shard_coefficients, io_backend=io_backend, dtype=dtype,
+                memory_budget_mb=memory_budget_mb, ome_xml=ome_xml, ome_series=ome_series)
+        if windows == "data" and layers is None:
             return self._write_measuring_windows(
                 pyramid, path, overwrite=overwrite, max_threads=max_threads,
                 region_size_mb=region_size_mb,
@@ -766,9 +914,11 @@ class PyramidIO:
                 include_labels=include_labels, labels_group_path=labels_group_path,
                 label_name=label_name, storage_options=storage_options,
                 shard_coefficients=shard_coefficients, io_backend=io_backend, dtype=dtype,
-                memory_budget_mb=memory_budget_mb)
+                memory_budget_mb=memory_budget_mb, ome_xml=ome_xml, ome_series=ome_series)
         if dtype is not None:
             pyramid = pyramid.saturate_cast(dtype)
+        if windows in ("dtype", "none") and layers is None:
+            pyramid = _apply_windows(pyramid, windows)
 
         # an object-store URL stays a STRING (Path would mangle 's3://' -> 's3:\')
         if not _is_remote_store(path):
@@ -793,7 +943,8 @@ class PyramidIO:
         side = dict(label_block=label_block, label_version=label_version,
                     label_zarr_format=label_zarr_format, attached_labels=attached_labels,
                     overwrite=overwrite, backend=backend, compressor=compressor,
-                    compressor_params=compressor_params, storage_options=storage_options)
+                    compressor_params=compressor_params, storage_options=storage_options,
+                    ome_xml=ome_xml, ome_series=ome_series)
 
         # A DEFERRED-downscale pyramid (from `Pyramid.downscale(defer=True)`) carries
         # only level 0 plus a plan; the levels are written from ONE read of level 0
@@ -843,6 +994,97 @@ class PyramidIO:
         if layers is not None:
             return    # internal sub-write: the caller writes the side metadata
         self._write_side_metadata(path, **side)
+
+    def _write_auto_windows(self, pyramid, path, **kwargs) -> None:
+        """write_pyramid(windows="auto"): written with the dtype's windows, then each
+        channel's start / end set to the AUTO_WINDOW_PERCENTILES of the COARSEST written
+        level - read back from the output, so it is the data as written (after
+        ``dtype``) and the source is not read again. A coarsest level over
+        AUTO_WINDOW_MAX_MB (no downscaling, a deep stack kept in z) keeps the dtype's
+        windows, with a log line."""
+        self.write_pyramid(pyramid, path, windows="dtype", **kwargs)
+        storage_options = kwargs.get('storage_options')
+        zarr_format = int(pyramid.meta.zarr_format)
+        if _is_remote_store(path):
+            group = _object_store_group(str(path), zarr_format, "r", storage_options)
+        else:
+            group = zarr.open_group(str(path), mode="r", zarr_format=zarr_format)
+        attrs = group.attrs.asdict()
+        holder = attrs.get('ome') if isinstance(attrs.get('ome'), dict) else attrs
+        multiscale = holder['multiscales'][0]
+        axes = [a['name'] if isinstance(a, dict) else a for a in multiscale['axes']]
+        coarsest = group[multiscale['datasets'][-1]['path']]
+        found = _auto_window_limits(coarsest, axes, path)
+        if found is None:
+            return
+        lows, highs = found
+        self._set_written_windows(path, zarr_format, SimpleNamespace(min=lows, max=highs),
+                                  storage_options)
+
+    def update_metadata(self, path, *, scales: Optional[dict] = None,
+                        units: Optional[dict] = None,
+                        channels: Optional[dict] = None, windows: str = "keep",
+                        ome_xml=None, ome_series=None,
+                        storage_options: Optional[dict] = None) -> Pyramid:
+        """Edit the metadata of the OME-Zarr image at `path` in place; its pixels are
+        never touched (read, not rewritten). Returns the updated `Pyramid`.
+
+        - `scales` / `units`: ``{axis: value}`` for level 0 (``Pyramid.update_scales``:
+          every coarser level keeps its factor) and the axes' units.
+        - `channels`: ``Pyramid.set_channels`` overrides (``{index or label: {field:
+          value}}``).
+        - `windows`: the omero windows. ``"keep"`` leaves them; ``"dtype"`` sets the
+          dtype's full range; ``"data"`` sets start / end to each channel's minimum /
+          maximum of level 0 (read through, streamed; min / max the dtype's range);
+          ``"auto"`` sets start / end to the AUTO_WINDOW_PERCENTILES of the coarsest
+          level (the dtype's range when that is over AUTO_WINDOW_MAX_MB), as
+          ``write_pyramid(windows="auto")``; ``"none"`` removes them.
+        - `ome_xml`: an OME-XML document (a string, or a function of the updated
+          pyramid returning one) written to ``OME/METADATA.ome.xml``, as by
+          ``write_pyramid``; `ome_series` as there.
+
+        Local stores and object-store URLs (with `storage_options`)."""
+        if windows not in _UPDATE_WINDOW_MODES:
+            raise ValueError(f"update_metadata: windows={windows!r}: one of "
+                             f"{_UPDATE_WINDOW_MODES}")
+        pyramid = self.read_pyramid(path, include_labels=False,
+                                    storage_options=storage_options)
+        order = pyramid.meta.axis_order
+        if "c" in order and pyramid.meta.unit_list[order.index("c")]:
+            # NGFF gives a channel axis no unit, and some viewers (Neuroglancer) reject
+            # the whole image over one: an update repairs it
+            pyramid.meta.update_unitlist([None if ax == "c" else u
+                                          for ax, u in zip(order, pyramid.meta.unit_list)])
+        if scales:
+            pyramid.update_scales(**{ax: float(v) for ax, v in scales.items()})
+        if units:
+            pyramid.update_units(**units)
+        if channels:
+            pyramid = pyramid.set_channels(channels)
+        if windows in ("dtype", "none"):
+            pyramid = _apply_windows(pyramid, windows)
+        elif windows in ("data", "auto"):
+            pyramid = _apply_windows(pyramid, "dtype")
+            meta = pyramid.meta
+            found = (_data_window_limits(pyramid) if windows == "data" else
+                     _auto_window_limits(pyramid.layers[meta.resolution_paths[-1]],
+                                         meta.axis_order, path))
+            if found is not None:
+                pyramid = pyramid.set_channels({
+                    k: {"window": {"start": lo, "end": hi}}
+                    for k, (lo, hi) in enumerate(zip(*found)) if lo is not None})
+        zarr_format = int(pyramid.meta.zarr_format)
+        if _is_remote_store(path):
+            group = _object_store_group(str(path), zarr_format, "a", storage_options)
+        else:
+            group = zarr.open_group(str(path), mode="r+", zarr_format=zarr_format)
+        pyramid.meta.zarr_group = group
+        pyramid.meta._pending_changes = True
+        pyramid.meta.save_changes()
+        if ome_xml is not None:
+            xml = ome_xml(pyramid) if callable(ome_xml) else ome_xml
+            _write_ome_xml(path, xml, ome_series, zarr_format, storage_options)
+        return pyramid
 
     def _write_measuring_windows(self, pyramid, path, **kwargs) -> None:
         """write_pyramid(window_from_data=True): the write, with level 0 observed by
@@ -978,10 +1220,11 @@ class PyramidIO:
     def _write_side_metadata(self, path, *, label_block, label_version, label_zarr_format,
                              attached_labels: dict, overwrite: bool, backend: str = 'auto',
                              compressor=None, compressor_params=None,
-                             storage_options=None) -> None:
+                             storage_options=None, ome_xml=None, ome_series=None) -> None:
         """Post-array-write side metadata, shared by every write_pyramid exit:
         (1) if this is a LABEL image, attach its ``image-label`` block to the written
-        group; (2) write any attached image `labels` into ``<path>/labels/<name>``."""
+        group; (2) write any attached image `labels` into ``<path>/labels/<name>``;
+        (3) the OME-XML (``ome_xml``) into ``<path>/OME/METADATA.ome.xml``."""
         if label_block is not None:
             group = _open_store_group(path, label_zarr_format, mode="a",
                                       storage_options=storage_options)
@@ -991,6 +1234,8 @@ class PyramidIO:
                                         backend=backend, compressor=compressor,
                                         compressor_params=compressor_params,
                                         storage_options=storage_options)
+        if ome_xml is not None:
+            _write_ome_xml(path, ome_xml, ome_series, label_zarr_format, storage_options)
 
     def _write_attached_labels(self, labels: dict, path, *, overwrite: bool,
                                backend: str = 'auto', compressor=None,
@@ -1181,11 +1426,13 @@ class PyramidIO:
         and `write_labels` (labels downsample with 'simple' = nearest, which the plan
         records)."""
         base_path0 = pyramid.meta.resolution_paths[0]
+        # a chunk SIZE is dyna's to turn into a shape, as on the plain route
+        write_kwargs['chunk_size_mb'] = chunk_size_mb
 
         def _rechunked(p):
             """Apply the requested storage chunking (explicit, else restore recorded)."""
-            if chunk_shape is not None or chunk_size_mb is not None:
-                return p.rechunk(chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb)
+            if chunk_shape is not None:
+                return p.rechunk(chunk_shape=chunk_shape)
             if getattr(p, '_storage_chunks', None) is not None:
                 return p.rechunk()
             return p
@@ -1707,6 +1954,12 @@ class IO:
         :meth:`PyramidIO.read_pyramid`."""
         return PyramidIO().read_pyramid(path, include_labels=include_labels,
                                         storage_options=storage_options)
+
+    def update_metadata(self, path: Union[str, Path], **kwargs) -> Pyramid:
+        """Edit the metadata of the OME-Zarr image at `path` in place (scales, units,
+        channels, windows, OME-XML); the pixels are never rewritten. See
+        :meth:`PyramidIO.update_metadata`."""
+        return PyramidIO().update_metadata(path, **kwargs)
 
     def read_labels(self, path: Union[str, Path], name: Optional[str] = None,
                     storage_options: Optional[dict] = None) -> Pyramid:
