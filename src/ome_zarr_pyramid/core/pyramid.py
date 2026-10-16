@@ -485,11 +485,12 @@ class NGFFMetadataHandler:
             'axes': self._axis_names,
             'units': self._units,
             'n_datasets': len(self.multiscales['datasets']),
-            'name': self.multiscales['name']
+            'name': self.multiscales.get('name')
         }
 
-    def create_new(self, version: str = "0.5", name: str = "unnamed") -> 'NGFFMetadataHandler':
-        """Create a new metadata handler with empty metadata of specified version."""
+    def create_new(self, version: str = "0.5", name: Optional[str] = "unnamed") -> 'NGFFMetadataHandler':
+        """Create a new metadata handler with empty metadata of specified version.
+        ``name=None`` leaves the multiscales ``name`` out (it is optional in NGFF)."""
         self._validate_version_and_format(version, 3 if version == "0.5" else 2)
 
         multiscale_metadata = {
@@ -498,6 +499,8 @@ class NGFFMetadataHandler:
             'datasets': [],
             'metadata': {}
         }
+        if name is None:
+            del multiscale_metadata['name']
 
         if version == "0.5":
             self.metadata = {
@@ -809,9 +812,10 @@ class NGFFMetadataHandler:
         return [ds['path'] for ds in self.multiscales['datasets']]
 
     @property
-    def tag(self) -> str:
-        """Get the image series name/tag."""
-        return self.multiscales['name']
+    def tag(self) -> Optional[str]:
+        """The image series name (multiscales ``name``), or None when the metadata has
+        none (it is optional in NGFF)."""
+        return self.multiscales.get('name')
 
     @property
     def _axis_names(self) -> List[str]:
@@ -2455,6 +2459,9 @@ class Pyramid:
         if self.meta.metadata and new.meta and new.meta.metadata:
             new.meta.metadata = copy.deepcopy(self.meta.metadata)
             new.meta._pending_changes = True
+            # the copied metadata names the levels as the source does (any NGFF path,
+            # e.g. 's0', 's1'), so the levels are keyed by those paths, not 0..n-1
+            new._array_layers = {p: self.layers[p] for p in paths}
         plan = getattr(self, '_downscale_plan', None)
         if plan is not None:
             new._downscale_plan = dict(plan)
