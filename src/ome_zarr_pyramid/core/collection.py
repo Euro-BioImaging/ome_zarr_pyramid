@@ -16,6 +16,11 @@ Nothing here imports micro-reader. An "image" is anything shaped like one:
 ``shape``, ``dtype``      as an array
 ``__getitem__``           a region read returning a NumPy array (what dyna-zarr's
                           ``from_array`` wraps), plus optional ``read_unit``
+``array``                 optional: the image's own lazy array (a dyna-zarr
+                          ``DynamicArray``, a dask array, a zarr array), used as it
+                          is instead of region reads through ``__getitem__``: a dask
+                          graph is not recomputed once per region, and dask stays
+                          dask (written by dask's own scheduler)
 ``resolutions``           optional: the stored levels, finest first (the image itself
                           first); each level is image-like
 ``metadata``              optional, with any of: ``pixel_sizes`` {axis: quantity},
@@ -135,7 +140,10 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
         ratio = [b / max(1, int(n)) for b, n in zip(base_shape, level.shape)]
         scales.append([s * (r if ax in "zyx" else 1.0) for s, r, ax in zip(base_scale, ratio, axes)])
 
-    arrays = [from_array(level) for level in levels]
+    # a level's own lazy array when it offers one (an eubi-bridge LegacyImage over a
+    # dask or Bio-Formats reader), else its region reads wrapped by dyna-zarr
+    arrays = [getattr(level, "array", None) if getattr(level, "array", None) is not None
+              else from_array(level) for level in levels]
     label = name or getattr(image, "name", None) or "unnamed"
     pyr = Pyramid().from_arrays(arrays, axis_order=axes, unit_list=units, scales=scales,
                                 version=version, name=label)

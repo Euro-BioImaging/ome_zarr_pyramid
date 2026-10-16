@@ -188,3 +188,38 @@ def test_with_micro_reader_on_an_ome_tiff(tmp_path):
     IO().write_pyramid(pyr, out, overwrite=True)
     np.testing.assert_array_equal(np.asarray(IO().read_pyramid(out).layers["0"][...]),
                                   data[1] + 1)
+
+
+# -- an image's own lazy array (eubi-bridge's LegacyImage over its older readers) -------
+
+class _NoRegionReads(FakeImage):
+    """An image offering its own lazy array; reading it region by region is an error."""
+
+    def __init__(self, data, axes, array, metadata=None):
+        super().__init__(data, axes, metadata)
+        self.array = array
+        self.resolutions = [self]
+
+    def __getitem__(self, key):
+        raise AssertionError("region read: the image's own array should have been used")
+
+
+def test_from_image_uses_the_images_own_dask_array(tmp_path):
+    da = pytest.importorskip("dask.array")
+    data = np.arange(2 * 8 * 32 * 32, dtype="uint16").reshape(2, 8, 32, 32)
+    lazy = da.from_array(data, chunks=(1, 8, 16, 16))
+    pyr = Pyramid.from_image(_NoRegionReads(data, "czyx", lazy))
+    level = pyr.layers[pyr.meta.resolution_paths[0]]
+    assert level is lazy                                     # dask stays dask
+    out = str(tmp_path / "own.ome.zarr")
+    IO().write_pyramid(pyr.downscale(n_layers=2), out)
+    back = IO().read_pyramid(out)
+    np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)
+
+
+def test_from_image_uses_the_images_own_dyna_array():
+    from dyna_zarr import from_array
+    data = np.arange(2 * 8 * 32 * 32, dtype="uint16").reshape(2, 8, 32, 32)
+    own = from_array(data)
+    pyr = Pyramid.from_image(_NoRegionReads(data, "czyx", own))
+    assert pyr.layers[pyr.meta.resolution_paths[0]] is own

@@ -201,3 +201,21 @@ def test_auto_windows_read_the_remote_coarsest_level(bucket, data):
         assert (ch["window"]["start"], ch["window"]["end"]) == (int(np.floor(lo)),
                                                                 int(np.ceil(hi)))
         assert (ch["window"]["min"], ch["window"]["max"]) == (0, 65535)
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_metadata_is_updated_in_place_remotely(bucket, data, version):
+    name, opts = bucket
+    url = f"s3://{name}/upd.zarr"
+    IO().write_pyramid(_pyr(data, version), url, overwrite=True, storage_options=opts,
+                       windows="dtype")
+    IO().update_metadata(url, scales={"x": 0.25}, channels={0: {"label": "DAPI"}},
+                         windows="data", storage_options=opts)
+    back = IO().read_pyramid(url, storage_options=opts)
+    assert back.meta.get_scale("0")[-1] == 0.25
+    channels = back.meta.metadata["omero"]["channels"]
+    assert channels[0]["label"] == "DAPI"
+    for k, ch in enumerate(channels):
+        assert (ch["window"]["start"], ch["window"]["end"]) == (int(data[k].min()),
+                                                                int(data[k].max()))
+    np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)
