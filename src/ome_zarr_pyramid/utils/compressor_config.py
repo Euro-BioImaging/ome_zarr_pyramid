@@ -117,9 +117,18 @@ class CompressorConfig(BaseModel):
         the tensorstore-supported set) - callers should fall back to a
         default compressor in that case.
         """
-        compressors = getattr(arr, "compressors", None)
-        if not compressors:
-            compressor = getattr(arr, "compressor", None)
+        try:
+            compressors = getattr(arr, "compressors", None)
+        except Exception:                                   # noqa: BLE001
+            compressors = None
+        if compressors is None:
+            # an array without `compressors` (older APIs) may have `compressor`; a zarr
+            # v3 array has `compressors` (empty when uncompressed) and REFUSES
+            # `compressor`, so it is only asked when `compressors` is missing
+            try:
+                compressor = getattr(arr, "compressor", None)
+            except Exception:                               # noqa: BLE001
+                compressor = None
             compressors = (compressor,) if compressor is not None else ()
         if not compressors:
             return None

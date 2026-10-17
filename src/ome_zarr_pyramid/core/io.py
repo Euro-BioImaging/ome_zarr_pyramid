@@ -406,6 +406,64 @@ def _to_dyna_codecs(cfg):
                      f"(blosc, zstd, gzip, bz2 or none)")
 
 
+class CodecChangedWarning(UserWarning):
+    """A write uses another codec than its input's: the input's codec has no form in the
+    output's zarr format (bz2 and plain lz4 are zarr v2 only), or the writer does not
+    know it (zlib, lzma, zarr-python's numcodecs.* v3 codecs). The pixels are the same."""
+
+
+#: what a write uses when the input's codec cannot be written
+_FALLBACK_CODEC = ("blosc", 5, "lz4")
+
+
+def _codec_label(codecs) -> str:
+    name = getattr(codecs, "compressor", None)
+    return f"blosc-{codecs.cname}" if name == "blosc" else str(name)
+
+
+def _writable_codecs(codecs, source, zarr_format: int, explicit: bool):
+    """The codecs a write uses: `codecs` (from ``compressor=`` or the pyramid's own) or,
+    when None, the ones dyna would inherit from `source` (the base level). When those
+    cannot be written in `zarr_format`, or the input's codec is one the writer does not
+    know, the write uses blosc-lz4 and says so (`CodecChangedWarning`). A codec the
+    caller asked for (`explicit`) is never replaced: its write fails, naming it."""
+    import warnings
+
+    from dyna_zarr import Codecs
+
+    fallback = Codecs(_FALLBACK_CODEC[0], clevel=_FALLBACK_CODEC[1], cname=_FALLBACK_CODEC[2])
+    hint = "pass compressor= to choose another"
+    if codecs is None:
+        codecs = getattr(source, "codecs", None)
+        raw = getattr(source, "_compressors", None)
+        if codecs is None:
+            if raw:                                 # compressed, with a codec dyna lacks
+                first = raw[0]
+                try:
+                    label = first.to_dict().get("name")
+                except Exception:                   # noqa: BLE001
+                    label = getattr(first, "codec_id", type(first).__name__)
+                warnings.warn(f"the input's codec {label!r} cannot be written (the writer "
+                              f"knows blosc, zstd and gzip, plus bz2 and lz4 in zarr v2); "
+                              f"writing blosc-lz4 instead ({hint})", CodecChangedWarning,
+                              stacklevel=4)
+                return fallback
+            return None                             # nothing to inherit: dyna's default
+    try:
+        if zarr_format == 3:
+            codecs.to_v3_config("uint8")
+        else:
+            codecs.to_v2_config()
+    except ValueError:
+        if explicit:
+            raise
+        warnings.warn(f"the input's codec {_codec_label(codecs)} has no zarr v{zarr_format} "
+                      f"form; writing blosc-lz4 instead ({hint})", CodecChangedWarning,
+                      stacklevel=4)
+        return fallback
+    return codecs
+
+
 def _inherited_shard_coefficients(base):
     """The base level's sharding as per-axis coefficients (shard = coefficient x chunk),
     so every level of the pyramid is sharded alike; None when the base is unsharded."""
@@ -1162,7 +1220,9 @@ class PyramidIO:
             a = pyramid.layers[p]
             das[p] = a if (is_dask_array(a) or isinstance(a, DynamicArray)) else DynamicArray(a)
 
-        codecs = _to_dyna_codecs(_resolve_compressor(pyramid, compressor, compressor_params))
+        codecs = _writable_codecs(
+            _to_dyna_codecs(_resolve_compressor(pyramid, compressor, compressor_params)),
+            das[paths[0]], zf, explicit=compressor is not None)
         if shard_coefficients is None and zf == 3:
             shard_coefficients = _inherited_shard_coefficients(das[paths[0]])
         if shard_coefficients is not None and zf != 3:

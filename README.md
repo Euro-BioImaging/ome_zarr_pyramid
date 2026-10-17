@@ -18,6 +18,9 @@ large-scale volumes with the same code.
   base (e.g. a segmentation) is computed a single time, not once per level.
 - **Elementwise algebra.** `Pyramid` objects support arithmetic, comparison and
   bitwise operators across every level at once (`img > 128`, `a * b`, `~mask`).
+- **Collections.** Plates, wells, a file's series and other groups of images are one
+  `PyramidCollection`: read from OME-Zarr or from a microscopy file, written as an NGFF
+  plate, a bioformats2raw layout or an NGFF RFC 8 collection.
 
 ## Install
 
@@ -251,7 +254,77 @@ image_pyr = Pyramid.from_image(image)
 ```
 
 For every image of a file at once, `PyramidCollection.from_file(micro_reader.open(...))`
-gives one lazy pyramid per image.
+gives one lazy pyramid per image (see [Collections](#collections-plates-series-and-other-groups-of-images)).
+
+## Collections: plates, series and other groups of images
+
+A `PyramidCollection` holds many pyramids: the wells and fields of a plate, the series
+of a file, or any other group of images. Opening one reads its metadata only; each
+image is opened when you use it.
+
+```python
+from ome_zarr_pyramid import PyramidCollection
+
+plate_coll = PyramidCollection.from_zarr("plate.ome.zarr")   # an NGFF plate; no image read yet
+plate = plate_coll.plates[0]
+plate.rows, plate.columns                     # ('A', 'B', ...), ('1', '2', ...)
+well = plate.wells[plate.well_index("B3")]    # Well(row=1, column=2, name='B3')
+pyr = well.fields[0].image                    # -> Pyramid, opened now
+```
+
+Plates are navigated as in micro-reader: rows and columns count from 0,
+`plate.wells[w]` is the well with index `"well": w`, and `well.fields[f]` its f-th field.
+When a field has one image per acquisition, pick one first:
+`well.fields[0].select(acquisition=1).image`.
+
+Every image also has a flat key, the same one micro-reader gives a plate image:
+
+```python
+list(plate_coll)[0]          # (('plate', 0), ('acquisition', 0), ('well', 0), ('field', 0))
+pyr = plate_coll[{"plate": 0, "acquisition": 0, "well": 3, "field": 0}]
+second_run = plate_coll.select(acquisition=1)                # -> PyramidCollection
+```
+
+### Write a plate
+
+A plate opened with micro-reader (Harmony, MetaXpress, IN Cell, CellVoyager, ...) or
+read from OME-Zarr is written as an NGFF plate, one image after the other:
+
+```python
+import micro_reader
+
+plate_coll = PyramidCollection.from_file(micro_reader.open("Images/Index.idx.xml"))
+plate_coll.write_plate("plate.ome.zarr")                       # NGFF 0.5
+plate_coll.write_plate("plate_v04.ome.zarr", version="0.4")    # NGFF 0.4
+```
+
+The write options of `io.write_pyramid` (`max_threads`, `compressor`,
+`memory_budget_mb`, ...) apply to every image. The plate and well metadata are written
+last, so a plate that stops half way is not mistaken for a complete one.
+
+### Series (the bioformats2raw layout)
+
+```python
+series_coll = PyramidCollection.from_zarr("converted.ome.zarr")  # series 0, 1, ...
+pyr = series_coll[{"scene": 1}]
+series_coll.write_series("copy.ome.zarr")      # the same layout, with its OME-XML
+```
+
+Any collection can be written this way, for example all scenes of a file opened with
+micro-reader.
+
+### NGFF RFC 8 collections
+
+[RFC 8](https://ngff.openmicroscopy.org/rfc/8/index.html) describes plates, series and
+any other group of images as one tree of nodes. It is still a proposal; ozp reads it
+and writes it when you ask for `version="rfc8"`:
+
+```python
+plate_coll.write_plate("plate_rfc8.zarr", version="rfc8")            # a plate as RFC 8
+plate_coll.write_collection("out.zarr", document="collection.json")   # the tree in its own .json
+coll = PyramidCollection.from_zarr("collection.json")                 # a .json or a zarr group
+coll.tree                                                             # the nodes and their attributes
+```
 
 ## Write options
 
@@ -281,6 +354,20 @@ io.write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
   to the min/max of level 0 as written, measured during the write itself, so the output is
   not read again. The window's `min`/`max` stay as they are. For percentiles or
   another level, use `Pyramid.set_display_range()` before writing.
+
+### OME-Zarr 0.4 or 0.5
+
+A pyramid is written in its own version (the one it was read or built as).
+`to_version` gives the same pyramid in the other one:
+
+```python
+io.write_pyramid(pyr.to_version("0.4"), "out_v04.ome.zarr")    # 0.4, zarr v2
+```
+
+Going to 0.4, the levels are written without shards (zarr v2 has none). When the
+input's codec does not exist in the format written (bz2 or plain lz4 in 0.5), or is
+one the writer does not know (zlib, lzma), blosc-lz4 is written instead, with a
+warning; pass `compressor=` to choose another.
 
 ### Object storage
 

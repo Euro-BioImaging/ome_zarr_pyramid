@@ -2730,6 +2730,47 @@ class Pyramid:
                 new.meta._pending_changes = True
         return new
 
+    def to_version(self, version: str) -> 'Pyramid':
+        """Return a NEW `Pyramid` in OME-Zarr `version` (``"0.4"`` or ``"0.5"``): the same
+        pixels and metadata, laid out for that version, and written as zarr v2 (0.4) or
+        v3 (0.5). Attached label images are converted too.
+
+        Only the layout changes: where ``version`` is recorded, the zarr format, and the
+        labels' ``image-label`` version. Axes, scales, translations, omero and custom
+        blocks are kept. Going to 0.4, a sharded pyramid is written without shards
+        (zarr v2 has none); its chunks and codec are kept.
+
+        ::
+
+            pyr.meta.version                    # '0.5'
+            io.write_pyramid(pyr.to_version("0.4"), "out.ome.zarr")
+        """
+        if self.meta is None:
+            raise RuntimeError("Pyramid not initialized")
+        version = str(version)
+        if version not in NGFFMetadataHandler.SUPPORTED_VERSIONS:
+            raise ValueError(f"to_version: version {version!r} is not one of "
+                             f"{NGFFMetadataHandler.SUPPORTED_VERSIONS}")
+        new = self._clone_metadata_only()
+        meta = new.meta
+        md = meta.metadata                                      # type: ignore[union-attr]
+        if md is not None and self.meta.version != version:
+            md.pop('version', None)
+            for ms in md.get('multiscales') or []:
+                ms.pop('version', None)
+                if version == "0.4":
+                    ms['version'] = version
+            if version == "0.5":
+                meta.metadata = md = {'version': version, **md}   # type: ignore[union-attr]
+            label = md.get('image-label')
+            if isinstance(label, dict) and 'version' in label:
+                label['version'] = version
+        meta.version = version                                  # type: ignore[union-attr]
+        meta.zarr_format = 3 if version == "0.5" else 2         # type: ignore[union-attr]
+        meta._pending_changes = True                            # type: ignore[union-attr]
+        new._labels = {name: label.to_version(version) for name, label in self._labels.items()}
+        return new
+
     def set_channels(self, overrides: Dict[Union[int, str], Dict[str, Any]]) -> 'Pyramid':
         """Update per-channel omero display metadata, returning a NEW `Pyramid`
         (pixel data unchanged - only metadata). SPARSE and MERGING: only the named

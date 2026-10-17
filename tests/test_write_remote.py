@@ -219,3 +219,43 @@ def test_metadata_is_updated_in_place_remotely(bucket, data, version):
         assert (ch["window"]["start"], ch["window"]["end"]) == (int(data[k].min()),
                                                                 int(data[k].max()))
     np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_s3_plate_write_then_open(bucket, tmp_path, version):
+    """A plate written to an object store and opened from it: the wells' metadata comes
+    in one batch of requests, the images on first use."""
+    from ome_zarr_pyramid import PyramidCollection
+    from test_collection_zarr import _plate
+
+    name, opts = bucket
+    src, data = _plate(tmp_path, version)
+    url = f"s3://{name}/screen.zarr"
+    PyramidCollection.from_zarr(src).write_plate(url, storage_options=opts)
+    back = PyramidCollection.from_zarr(url, storage_options=opts)
+    assert [w.name for w in back.plates[0].wells] == ["A2", "B1"]
+    for (w, a), expected in data.items():
+        pyr = back[{"plate": 0, "acquisition": a, "well": w, "field": 0}]
+        np.testing.assert_array_equal(np.asarray(pyr.layers["0"][...]), expected)
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        PyramidCollection.from_zarr(src).write_plate(url, storage_options=opts)
+
+
+@pytest.mark.parametrize("version, ome_group", [("0.4", True), ("0.5", True), ("0.5", False)])
+def test_s3_series_layout_write_then_open(bucket, tmp_path, version, ome_group):
+    """A bioformats2raw layout written to an object store and opened from it: through the
+    OME group's series list, or (without one) by listing the root's integer groups."""
+    from ome_zarr_pyramid import PyramidCollection
+    from test_series import XML, _layout
+
+    name, opts = bucket
+    src, data = _layout(tmp_path, version, series=ome_group)
+    url = f"s3://{name}/file.ome.zarr"
+    PyramidCollection.from_zarr(src).write_series(url, storage_options=opts)
+    back = PyramidCollection.from_zarr(url, storage_options=opts)
+    assert list(back) == [(("scene", 0),), (("scene", 1),)]
+    for i, expected in enumerate(data):
+        np.testing.assert_array_equal(np.asarray(back[{"scene": i}].layers["0"][...]), expected)
+    if ome_group:
+        from ome_zarr_pyramid.core.ngff_series import _source_xml
+        assert _source_xml(back.tree) == XML

@@ -200,20 +200,129 @@ def _key(index: Dict[str, int]) -> Tuple[Tuple[str, int], ...]:
     return tuple((str(k), int(v)) for k, v in index.items() if k != _RESOLUTION)
 
 
+def _tree_entries(tree) -> Iterator[Tuple[Tuple[Tuple[str, int], ...], Any]]:
+    """(key, image node) for every image of a plate or well tree, keyed as micro-reader
+    keys plate images: ``(("plate", 0), ("acquisition", a), ("well", w), ("field", f))``.
+    ``w`` counts the plate's wells, ``a`` is the acquisition's position in the plate's
+    list (0 when an image names none), ``f`` counts the well's images of that
+    acquisition. An acquisition attribute on a sub-collection of the well (RFC 8's
+    "tall" form) applies to its images. Label and other derived images (a ``labels`` or
+    ``source`` attribute) are not fields and are left out. A well read on its own has no
+    plate: its keys are ``(("acquisition", id), ("field", f))``."""
+    from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode, is_plate
+
+    def images(well):
+        for child in well.nodes:
+            if isinstance(child, CollectionNode):
+                acq = child.attributes.get("acquisition")
+                for image in child.nodes:
+                    if isinstance(image, MultiscaleNode):
+                        yield image, image.attributes.get("acquisition", acq)
+            elif isinstance(child, MultiscaleNode):
+                yield child, child.attributes.get("acquisition")
+
+    def fields(well, acquisition_index, prefix):
+        counts: Dict[int, int] = {}
+        for image, acq in images(well):
+            if "labels" in image.attributes or "source" in image.attributes:
+                continue
+            a = acquisition_index(acq) if acq is not None else 0
+            f = counts.get(a, 0)
+            counts[a] = f + 1
+            yield prefix(a) + (("field", f),), image
+
+    from ome_zarr_pyramid.core.plates import plate_nodes
+
+    plates = plate_nodes(tree)
+    if plates:                                 # a plate, or a collection of plates
+        for p, node in enumerate(plates):
+            plate = node.attributes["plate"]
+            for w, well in enumerate(node.nodes):
+                yield from fields(well, lambda ref, plate=plate: plate.index_of("acquisitions", ref),
+                                  lambda a, p=p, w=w: (("plate", p), ("acquisition", a), ("well", w)))
+    else:
+        yield from fields(tree, lambda ref: int(ref.id) if ref.id.isdigit() else 0,
+                          lambda a: (("acquisition", a),))
+
+
 class PyramidCollection(Mapping):
     """Pyramids keyed by where each image sits in its source: ``(("scene", 0),
     ("view", 1))``. A read-only mapping (``len``, iteration over keys, ``items()``);
     ``coll[{"scene": 0, "view": 1}]`` and ``coll.select(view=1)`` look entries up by
     index; :meth:`write` writes every entry.
 
-    The home for the NGFF collections proposal once it is adopted: today each entry is
-    written as its own OME-Zarr image.
+    A collection read from OME-Zarr (:meth:`from_zarr`) keeps its node tree as
+    :attr:`tree` (see :mod:`ome_zarr_pyramid.core.nodes`), and opens each pyramid on
+    first access: listing, selecting and indexing keys open nothing.
     """
 
     def __init__(self, pyramids: Optional[Dict[Tuple[Tuple[str, int], ...], Any]] = None,
-                 name: Optional[str] = None):
+                 name: Optional[str] = None, tree=None):
+        # a value is a Pyramid, or a MultiscaleNode opened on first access
         self._pyramids = dict(pyramids or {})
         self.name = name
+        #: the node tree the collection was read from (a plate, a well, an image), or None
+        self.tree = tree
+
+    @classmethod
+    def from_zarr(cls, path, *, storage_options: Optional[dict] = None) -> "PyramidCollection":
+        """The collection stored at `path`: an NGFF 0.4/0.5 plate (keyed ``plate``,
+        ``acquisition``, ``well``, ``field``, as micro-reader keys plate images), a well
+        on its own (``acquisition``, ``field``), or a single image (the one key ``()``).
+        The plate and well metadata are read now; each image when it is first used.
+        `storage_options` as for ``io.read_pyramid`` (an object-store URL)."""
+        from ome_zarr_pyramid.core.io import _open_store_group
+        from ome_zarr_pyramid.core.ngff_plate import (
+            ImageOpener, _split, _stem, read_plate, read_well)
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode, NodePath
+
+        from ome_zarr_pyramid.core import rfc8
+
+        if str(path).lower().endswith(".json"):                # a standalone RFC 8 document
+            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
+        from zarr.errors import ContainsArrayError
+        try:
+            root = _open_store_group(str(path), None, mode="r", storage_options=storage_options)
+        except ContainsArrayError:            # an array: an RFC 8 singlescale image
+            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
+        attrs = root.attrs.asdict()
+        if rfc8.is_rfc8(attrs.get("ome")):
+            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
+        _, ngff, _ = _split(attrs)
+        if "plate" in ngff:
+            tree = read_plate(path, storage_options=storage_options, _group=root)
+        elif "well" in ngff:
+            tree = read_well(path, storage_options=storage_options, _group=root)
+        elif "multiscales" in ngff:
+            tree = MultiscaleNode(_stem(path) or "image", path=NodePath("zarr", "."),
+                                  loader=ImageOpener(path, storage_options))
+            return cls({(): tree}, name=tree.name, tree=tree)
+        elif "bioformats2raw.layout" in ngff:
+            from ome_zarr_pyramid.core.ngff_series import read_series
+            tree = read_series(path, storage_options=storage_options, _group=root)
+            # keyed as micro-reader keys a file's scenes (bioformats2raw's series)
+            return cls({(("scene", i),): node for i, node in enumerate(tree.nodes)},
+                       name=tree.name, tree=tree)
+        else:
+            raise ValueError(f"{path}: not an OME-Zarr image, well or plate (its metadata "
+                             f"has no 'multiscales', 'well' or 'plate')")
+        return cls(dict(_tree_entries(tree)), name=tree.name, tree=tree)
+
+    @classmethod
+    def _from_tree(cls, tree) -> "PyramidCollection":
+        """A collection over an RFC 8 tree: plates keyed as micro-reader keys plate
+        images, any other collection ``(("scene", i),)``, a single image ``()``."""
+        from ome_zarr_pyramid.core.plates import plate_nodes
+        from ome_zarr_pyramid.core.rfc8 import tree_entries
+
+        entries = (_tree_entries(tree) if plate_nodes(tree) else tree_entries(tree))
+        return cls(dict(entries), name=tree.name, tree=tree)
+
+    @staticmethod
+    def _open(value):
+        """A pyramid, opening a lazy image node."""
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+        return value.pyramid if isinstance(value, MultiscaleNode) else value
 
     @classmethod
     def from_file(cls, file, *, version: str = "0.5", **kwargs) -> "PyramidCollection":
@@ -231,7 +340,137 @@ class PyramidCollection(Mapping):
             if key in out:
                 raise ValueError(f"two images share the index {dict(key)}")
             out[key] = pyramid_from_image(image, version=version, **kwargs)
-        return cls(out, name=getattr(file, "path", None))
+        from ome_zarr_pyramid.core.ngff_plate import _stem
+        from ome_zarr_pyramid.core.plates import tree_from_file
+        path = getattr(file, "path", None)
+        tree = tree_from_file(file, out, name=_stem(str(path)) if path else None)
+        return cls(out, name=path, tree=tree)
+
+    def write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
+                    overwrite: bool = False, storage_options: Optional[dict] = None,
+                    writer: Optional[Callable] = None, document: Optional[str] = None,
+                    **write_kwargs) -> Dict[str, str]:
+        """Write plate `plate` of the collection as an NGFF plate: each image in turn
+        (``io.write_pyramid``, or `writer`, with `write_kwargs`), then the plate and
+        well metadata. Returns ``{"<well>/<image>": path}``. See
+        :func:`ome_zarr_pyramid.core.ngff_plate.write_plate` for `version` and
+        `overwrite`. ``version="rfc8"`` writes it as RFC 8 (see `write_collection`;
+        `document` puts the plate's RFC 8 document in a standalone ``.json``).
+
+        Images whose index has more than plate / acquisition / well / field (a tile, a
+        view, ...) are written as separate images of their well, with a warning: NGFF
+        0.4/0.5 wells cannot say which tile or view an image is."""
+        import warnings
+
+        from ome_zarr_pyramid.core.ngff_plate import write_plate
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+        from ome_zarr_pyramid.core.plates import plate_nodes
+
+        nodes = plate_nodes(self.tree)
+        if not nodes:
+            raise ValueError("the collection holds no plate (see .plates)")
+        if not 0 <= plate < len(nodes):
+            raise IndexError(f"plate {plate}: the collection holds {len(nodes)} plate(s)")
+        node = nodes[plate]
+        held = {id(v) for v in self._pyramids.values()}
+        mine = [k for k in self._pyramids if dict(k).get("plate", 0) == plate]
+        for well in node.nodes:
+            for image in well.walk():
+                if not isinstance(image, MultiscaleNode) or "labels" in image.attributes \
+                        or "source" in image.attributes:
+                    continue                   # label and derived images are not entries
+                if id(image) not in held and id(getattr(image, "_pyramid", None)) not in held:
+                    raise ValueError(
+                        "this collection is a selection of its plate; write the plate from "
+                        "the whole collection (a plate is written with all its images)")
+        if version == "rfc8":
+            from ome_zarr_pyramid.core.rfc8 import write_rfc8
+            return write_rfc8(node, path, document=document, overwrite=overwrite,
+                              storage_options=storage_options, writer=writer, **write_kwargs)
+        extra = sorted({name for k in mine for name, _ in k}
+                       - {"plate", "acquisition", "well", "field"})
+        if extra:
+            warnings.warn(f"plate {plate}: its images are also indexed by {extra}; they are "
+                          f"written as separate images of their well, which NGFF 0.4/0.5 "
+                          f"cannot label with {extra}", stacklevel=2)
+        return write_plate(node, path, version=version, overwrite=overwrite,
+                           storage_options=storage_options, writer=writer, **write_kwargs)
+
+    def write_series(self, path, *, version: Optional[str] = None, overwrite: bool = False,
+                     ome_xml: Optional[str] = None, storage_options: Optional[dict] = None,
+                     writer: Optional[Callable] = None, document: Optional[str] = None,
+                     **write_kwargs) -> Dict[str, str]:
+        """Write every entry as one series of a bioformats2raw layout (``<path>/0``,
+        ``<path>/1``, ..., in key order; a collection read from that layout keeps its
+        series paths), then the root metadata and the ``OME`` group. Returns
+        ``{series path: path}``. `ome_xml` is stored as ``OME/METADATA.ome.xml``
+        (default: the source layout's). See
+        :func:`ome_zarr_pyramid.core.ngff_series.write_series`.
+
+        ``version="rfc8"``: RFC 8 replaces the layout with a collection of the series
+        images, so that is written (see `write_collection`); `ome_xml` is not used."""
+        from ome_zarr_pyramid.core.ngff_series import LAYOUT_KEY, write_series
+        from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
+
+        tree = self.tree
+        if isinstance(tree, CollectionNode) and LAYOUT_KEY in tree.attributes \
+                and "plate" not in tree.attributes \
+                and {id(n) for n in tree.nodes} == {id(v) for v in self._pyramids.values()}:
+            node = tree                    # read from a series layout, all of it: as read
+        else:                              # any other collection: series 0, 1, ... in key order
+            node = CollectionNode("series")
+            for i, key in enumerate(sorted(self._pyramids)):
+                node.add(MultiscaleNode(str(i), self[key]))
+        if version == "rfc8":
+            from ome_zarr_pyramid.core.rfc8 import write_rfc8
+            return write_rfc8(node, path, document=document, overwrite=overwrite,
+                              storage_options=storage_options, writer=writer, **write_kwargs)
+        return write_series(node, path, version=version, overwrite=overwrite, ome_xml=ome_xml,
+                            storage_options=storage_options, writer=writer, **write_kwargs)
+
+    def write_collection(self, path, *, version: str = "rfc8", document: Optional[str] = None,
+                         overwrite: bool = False, storage_options: Optional[dict] = None,
+                         writer: Optional[Callable] = None, **write_kwargs) -> Dict[str, str]:
+        """Write the collection as NGFF RFC 8 (``version="rfc8"``, the only one: a 0.4 /
+        0.5 plate or series is `write_plate` / `write_series`): each image as an RFC 8
+        multiscale under `path`, then the collection document in `path`'s ``zarr.json``,
+        or in the standalone `document` (``.json``). The tree as read or built
+        (plates, wells, nested collections, attributes) is written as it is; a
+        collection without one is written as a flat collection of its images, in key
+        order. Returns ``{image path: written path}``. See
+        :func:`ome_zarr_pyramid.core.rfc8.write_rfc8`."""
+        from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
+        from ome_zarr_pyramid.core.rfc8 import write_rfc8, tree_entries
+
+        if version != "rfc8":
+            raise ValueError(f"write_collection writes version='rfc8'; NGFF {version} plates "
+                             f"and series are write_plate / write_series")
+        tree = self.tree
+        if isinstance(tree, MultiscaleNode):
+            node = CollectionNode(tree.name, [tree])
+        elif isinstance(tree, CollectionNode):
+            held = {id(v) for v in self._pyramids.values()}
+            images = [n for _, n in (_tree_entries(tree) if self.plates else tree_entries(tree))]
+            if any(id(n) not in held and id(getattr(n, "_pyramid", None)) not in held
+                   for n in images):
+                raise ValueError("this collection is a selection of its tree; write it from "
+                                 "the whole collection")
+            node = tree
+        else:
+            node = CollectionNode(str(self.name or "collection"))
+            for i, key in enumerate(sorted(self._pyramids)):
+                node.add(MultiscaleNode(str(i), self[key]))
+        return write_rfc8(node, path, document=document, overwrite=overwrite,
+                          storage_options=storage_options, writer=writer, **write_kwargs)
+
+    @property
+    def plates(self) -> list:
+        """The collection's plates (``[]`` when it holds none), navigated as in
+        micro-reader: ``coll.plates[0].wells[3].fields[0].image`` (see
+        :mod:`ome_zarr_pyramid.core.plates`). From a micro-reader file they match
+        ``file.plates``; from an NGFF plate they follow its plate and well metadata."""
+        from ome_zarr_pyramid.core.plates import plates_of
+        return plates_of(self)
 
     # -- mapping ---------------------------------------------------------------
     def _lookup(self, key):
@@ -240,7 +479,7 @@ class PyramidCollection(Mapping):
         return self._pyramids[tuple(key)]
 
     def __getitem__(self, key):
-        return self._lookup(key)
+        return self._open(self._lookup(key))
 
     def __iter__(self) -> Iterator[Tuple[Tuple[str, int], ...]]:
         return iter(self._pyramids)
@@ -256,7 +495,9 @@ class PyramidCollection(Mapping):
         """The entries whose index matches every given value: ``select(view=1)``."""
         keep = {k: p for k, p in self._pyramids.items()
                 if all(dict(k).get(name) == value for name, value in index.items())}
-        return type(self)(keep, name=self.name)
+        # the same tree: plates keep every well (so "well": w stays wells[w]), and their
+        # fields hold the selected images only
+        return type(self)(keep, name=self.name, tree=self.tree)
 
     def concatenate(self, index, axis: str = "c") -> "PyramidCollection":
         """Fold one or more image indices into an axis: ``concatenate("view")`` joins
@@ -288,7 +529,7 @@ class PyramidCollection(Mapping):
         out = {}
         for rest, keys in groups.items():
             keys.sort(key=lambda key: tuple(dict(key)[name] for name in names))
-            parts = [self._pyramids[key] for key in keys]
+            parts = [self._open(self._pyramids[key]) for key in keys]
             joined = concatenate(parts, axis=axis)
             positions = []
             for key, part in zip(keys, parts):
@@ -329,7 +570,8 @@ class PyramidCollection(Mapping):
         from ome_zarr_pyramid.core.io import IO
         write = writer or IO().write_pyramid
         paths = {}
-        for key, pyr in self._pyramids.items():
+        for key, value in self._pyramids.items():
+            pyr = self._open(value)
             path = os.path.join(str(directory), f"{stem}{self.suffix(key, names)}.ome.zarr")
             write(pyr, path, **write_kwargs)
             paths[key] = path
