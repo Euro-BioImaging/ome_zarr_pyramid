@@ -38,7 +38,7 @@ the same path.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -245,6 +245,18 @@ def _tree_entries(tree) -> Iterator[Tuple[Tuple[Tuple[str, int], ...], Any]]:
                           lambda a: (("acquisition", a),))
 
 
+def _order_key(value):
+    """Sorts values of one column: None last, then by type, then by value."""
+    return (value is None, type(value).__name__, value if value is not None else 0)
+
+
+def _sorted_values(values) -> list:
+    try:
+        return sorted(values, key=_order_key)
+    except TypeError:                          # values of one type that do not order
+        return sorted(values, key=lambda v: (v is None, repr(v)))
+
+
 class PyramidCollection(Mapping):
     """Pyramids keyed by where each image sits in its source: ``(("scene", 0),
     ("view", 1))``. A read-only mapping (``len``, iteration over keys, ``items()``);
@@ -263,6 +275,8 @@ class PyramidCollection(Mapping):
         self.name = name
         #: the node tree the collection was read from (a plate, a well, an image), or None
         self.tree = tree
+        # the table's rows built so far, by key (metadata only; see `table`)
+        self._rows: Dict[Tuple, Dict[str, Any]] = {}
 
     @classmethod
     def from_zarr(cls, path, *, storage_options: Optional[dict] = None) -> "PyramidCollection":
@@ -493,11 +507,154 @@ class PyramidCollection(Mapping):
 
     def select(self, **index) -> "PyramidCollection":
         """The entries whose index matches every given value: ``select(view=1)``."""
-        keep = {k: p for k, p in self._pyramids.items()
-                if all(dict(k).get(name) == value for name, value in index.items())}
-        # the same tree: plates keep every well (so "well": w stays wells[w]), and their
-        # fields hold the selected images only
-        return type(self)(keep, name=self.name, tree=self.tree)
+        return self._derive([k for k in self._pyramids
+                             if all(dict(k).get(name) == value for name, value in index.items())])
+
+    def _derive(self, keys) -> "PyramidCollection":
+        """A collection of these keys, in this order: the same tree (plates keep every
+        well, so "well": w stays wells[w]; their fields hold the kept images only) and the
+        table rows already built."""
+        new = type(self)({k: self._pyramids[k] for k in keys}, name=self.name, tree=self.tree)
+        new._rows = {k: self._rows[k] for k in keys if k in self._rows}
+        return new
+
+    # -- the table and its queries ----------------------------------------------
+    @property
+    def table(self):
+        """The collection as a table, one row per image: its key columns, its metadata
+        (axes, shape, dtype, levels, chunks, codec, scale, units, channels, ...; see
+        ``ome_zarr_pyramid.core.query``) and, for plates, ``plate_name``, ``well_name``,
+        ``row_name``, ``column_name`` and ``acquisition_name``. Built from metadata only, once: images not opened yet are read
+        from their metadata files in concurrent batches."""
+        from ome_zarr_pyramid.core.query import CollectionTable
+        self._build_rows()
+        return CollectionTable(list(self._pyramids), [self._rows[k] for k in self._pyramids])
+
+    def _build_rows(self) -> None:
+        from ome_zarr_pyramid.core.ngff_plate import ImageOpener
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+        from ome_zarr_pyramid.core.query import row_from_pyramid, rows_from_files
+
+        missing = [k for k in self._pyramids if k not in self._rows]
+        if not missing:
+            return
+        places = self._plate_places()
+        on_disk: Dict[int, List] = {}                  # storage_options id -> [(key, location)]
+        options: Dict[int, Any] = {}
+        for key in missing:
+            value = self._pyramids[key]
+            opener = getattr(value, "loader", None) if isinstance(value, MultiscaleNode) else None
+            location = opener.path_of(value) if isinstance(opener, ImageOpener) and value.path else None
+            if location is not None and not value.loaded:
+                so = opener.storage_options
+                on_disk.setdefault(id(so), []).append((key, location))
+                options[id(so)] = so
+            else:
+                self._rows[key] = row_from_pyramid(self._open(value), path=location)
+        for group, jobs in on_disk.items():
+            rows = rows_from_files([loc for _, loc in jobs], options[group])
+            for (key, location), row in zip(jobs, rows):
+                # not an NGFF 0.4 / 0.5 image after all: opened, metadata only
+                self._rows[key] = row if row is not None else row_from_pyramid(
+                    self._open(self._pyramids[key]), path=location)
+        for key in missing:
+            row = self._rows[key]
+            row.update(dict(key))
+            row.update(places.get(id(self._pyramids[key]), {}))
+
+    def _plate_places(self) -> Dict[int, Dict[str, Any]]:
+        """Plate name, well name, row and column names and acquisition name of every image
+        of the collection's plates, by the id of the value that holds it."""
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+        from ome_zarr_pyramid.core.plates import plate_nodes
+
+        out: Dict[int, Dict[str, Any]] = {}
+        for plate in plate_nodes(self.tree):
+            attr = plate.attributes["plate"]
+            name = plate.ngff_fields.get("plate", {}).get("name", plate.name)
+            for well in plate.nodes:
+                ref = well.attributes.get("well")
+                row = attr.rows[attr.index_of("rows", ref.row)] if ref else None
+                col = attr.columns[attr.index_of("columns", ref.column)] if ref else None
+                for image in well.walk():
+                    if not isinstance(image, MultiscaleNode):
+                        continue
+                    acq = image.attributes.get("acquisition")
+                    acq_name = None
+                    if acq is not None:
+                        try:
+                            item = attr.acquisitions[attr.index_of("acquisitions", acq)]
+                            acq_name = item.name
+                        except KeyError:
+                            pass
+                    place = {"plate_name": name, "well_name": well.name,
+                             "row_name": row.name or row.id if row else None,
+                             "column_name": col.name or col.id if col else None,
+                             "acquisition_name": acq_name}
+                    out[id(image)] = place
+                    if image._pyramid is not None:
+                        out[id(image._pyramid)] = place
+        return out
+
+    def _check_columns(self, names) -> None:
+        columns = self.table.columns
+        unknown = [n for n in names if n not in columns]
+        if unknown:
+            raise KeyError(f"no column {unknown[0]!r}; the columns are {list(columns)}")
+
+    def filter(self, predicate: Optional[Callable] = None, /, **conditions) -> "PyramidCollection":
+        """The images that pass every condition: a column name with a value (equal) or a
+        function of the value (true), e.g. ``filter(dtype="uint16", unit_x="nanometer",
+        levels=lambda n: n >= 3)``. `predicate`, if given, is a function of each image's
+        record (a dict of its columns): ``filter(lambda image: image["size_z"] ==
+        image["size_c"])``. Keys are columns too: ``filter(well=3)``. Nothing is read beyond
+        the table's metadata."""
+        from ome_zarr_pyramid.core.query import matches
+        self._check_columns(conditions)
+        rows = self.table.rows
+        return self._derive([k for k, row in zip(self._pyramids, rows)
+                             if matches(row, predicate, conditions)])
+
+    def unique(self, column: str) -> list:
+        """The distinct values of a column, sorted (None last): ``unique("dtype")``."""
+        self._check_columns([column])
+        return _sorted_values(set(self.table[column]))
+
+    @property
+    def columns(self) -> Tuple[str, ...]:
+        """The names of the table's columns: the keys, then the image columns, then (for
+        plates) the plate columns. Reads the metadata the table needs."""
+        return self.table.columns
+
+    def count(self, column: str) -> Dict[Any, int]:
+        """The number of images per value of a column: ``count("codec")`` gives
+        ``{'blosc-lz4': 2}``. The number of images is ``len(coll)``."""
+        self._check_columns([column])
+        values = self.table[column]
+        return {v: values.count(v) for v in _sorted_values(set(values))}
+
+    def group_by(self, *columns: str) -> Dict[Any, "PyramidCollection"]:
+        """One collection per distinct value of `columns` (a tuple of values for several):
+        ``group_by("acquisition")``, ``group_by("dtype", "levels")``."""
+        if not columns:
+            raise ValueError("group_by: name at least one column")
+        self._check_columns(columns)
+        groups: Dict[Any, List] = {}
+        for key, row in zip(self._pyramids, self.table.rows):
+            value = row.get(columns[0]) if len(columns) == 1 else tuple(row.get(c) for c in columns)
+            groups.setdefault(value, []).append(key)
+        return {v: self._derive(groups[v]) for v in _sorted_values(set(groups))}
+
+    def sort_by(self, *columns: str, reverse: bool = False) -> "PyramidCollection":
+        """The collection with its images in the order of `columns` (None last):
+        ``sort_by("well", "field")``, ``sort_by("nbytes", reverse=True)``."""
+        if not columns:
+            raise ValueError("sort_by: name at least one column")
+        self._check_columns(columns)
+        rows = dict(zip(self._pyramids, self.table.rows))
+        order = sorted(self._pyramids, key=lambda k: tuple(_order_key(rows[k].get(c)) for c in columns),
+                       reverse=reverse)
+        return self._derive(order)
 
     def concatenate(self, index, axis: str = "c") -> "PyramidCollection":
         """Fold one or more image indices into an axis: ``concatenate("view")`` joins

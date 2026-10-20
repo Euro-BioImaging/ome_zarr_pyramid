@@ -259,3 +259,24 @@ def test_s3_series_layout_write_then_open(bucket, tmp_path, version, ome_group):
     if ome_group:
         from ome_zarr_pyramid.core.ngff_series import _source_xml
         assert _source_xml(back.tree) == XML
+
+
+def test_s3_plate_table_from_metadata_files(bucket, tmp_path):
+    """A plate's table read from an object store: one batch of requests for the images'
+    groups, one for their levels; no image opened; the same rows as the opened pyramids."""
+    from ome_zarr_pyramid import PyramidCollection
+    from ome_zarr_pyramid.core.query import row_from_pyramid
+    from test_collection_zarr import _opened, _plate
+
+    name, opts = bucket
+    src, _ = _plate(tmp_path, "0.5")
+    url = f"s3://{name}/screen.zarr"
+    PyramidCollection.from_zarr(src).write_plate(url, storage_options=opts)
+    coll = PyramidCollection.from_zarr(url, storage_options=opts)
+    table = coll.table
+    assert len(table) == 4 and _opened(coll) == []
+    assert coll.unique("well_name") == ["A2", "B1"]
+    for key, row in zip(coll, table.rows):
+        node = coll._pyramids[key]
+        expected = row_from_pyramid(coll[key], path=node.loader.path_of(node))
+        assert {c: row[c] for c in expected} == expected
