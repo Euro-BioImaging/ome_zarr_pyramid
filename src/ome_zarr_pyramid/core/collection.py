@@ -6,7 +6,7 @@ Two levels, mirroring a microscopy reader (micro-reader's ``File`` / ``Image``):
   axes, pixel sizes and units, stage position, channels and stored resolution levels
   become the NGFF multiscale; every level is a lazy dyna-zarr array over the image.
 * :meth:`PyramidCollection.from_file`: every image of a file -> a ``PyramidCollection``,
-  keyed by the image's index in the file (scene, tile, view, illumination, ...).
+  keyed by the image's index in the file (series, tile, view, illumination, ...).
 
 Nothing here imports micro-reader. An "image" is anything shaped like one:
 
@@ -46,6 +46,33 @@ import numpy as np
 _AXES = "tczyx"
 #: an image index entry that is a resolution LEVEL, not a separate image
 _RESOLUTION = "resolution"
+#: the index that numbers a file's series (bioformats2raw's series; micro-reader 0.1.0
+#: names it so). New code names it through this constant only.
+SERIES_INDEX = "series"
+#: the indices that say where an image sits (its container); any other index (tile,
+#: view, illumination, phase, part, ...) tells apart images in one container
+CONTAINERS = ("plate", "acquisition", "well", "field", SERIES_INDEX)
+
+
+def _crowded(keys) -> List[Tuple[List, List[str]]]:
+    """The groups of `keys` that share one container (equal containment indices) but are
+    several images: ``[(keys, the other index names whose values vary)]``, in key order."""
+    groups: Dict[Tuple, List] = {}
+    for key in keys:
+        place = tuple((n, v) for n, v in key if n in CONTAINERS)
+        groups.setdefault(place, []).append(key)
+    out = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        names = {n for k in members for n, _ in k if n not in CONTAINERS}   # once per group
+        values: Dict[str, set] = {name: set() for name in names}
+        for key in members:
+            index = dict(key)
+            for name in names:
+                values[name].add(index.get(name))
+        out.append((members, sorted(n for n, vals in values.items() if len(vals) > 1)))
+    return out
 
 
 def _quantity(q, unit: Optional[str] = None) -> Optional[Tuple[float, str]]:
@@ -58,6 +85,28 @@ def _quantity(q, unit: Optional[str] = None) -> Optional[Tuple[float, str]]:
         except Exception:                                   # noqa: BLE001
             return None                                     # no conversion: say nothing
     return float(q.value), str(q.unit)
+
+
+class PositionUnitError(ValueError):
+    """An image's stage position along an axis is in a unit ozp cannot convert to that
+    axis's unit, so it cannot become the axis's translation."""
+
+
+def _position(q, unit: Optional[str], *, image: str, axis: str) -> float:
+    """A position quantity's value in `unit`, the axis's own unit. Unlike `_quantity`,
+    a failed conversion raises: a position that silently became 0 would move the image."""
+    if unit is None or getattr(q, "unit", unit) == unit:
+        return float(q.value)
+    exc = None
+    if hasattr(q, "to"):
+        try:
+            return float(q.to(unit).value)
+        except Exception as err:                             # noqa: BLE001
+            exc = err
+    raise PositionUnitError(
+        f"image {image!r}: the position along axis {axis!r} is in {str(q.unit)!r}, which "
+        f"cannot be converted to the axis unit {unit!r}. Give the position in a length "
+        f"unit convertible to {unit!r}, or clear image.metadata.position.") from exc
 
 
 def _hex(color) -> Optional[str]:
@@ -81,7 +130,10 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     - Scale and units: from ``metadata.pixel_sizes``. A missing z or y size takes x's
       value and unit; any other axis without one keeps ome_zarr_pyramid's default
       (1.0, micrometer / second; none for ``c``).
-    - Translation: ``metadata.position`` in each axis's own scale unit, on every level.
+    - Translation: ``metadata.position`` in each axis's own scale unit, on every level
+      (the stored levels are the image's own, so they share level 0's origin), written
+      whenever the image has a position, (0, 0) included. A position along an axis in a
+      unit that cannot be converted to the axis's unit raises ``PositionUnitError``.
     - Channels: name and colour into omero. A channel the image describes without a
       name is ``Channel {i}`` (counted from 0), without a colour white (OME's default
       colour); colours are generated only when the image says nothing about its
@@ -150,14 +202,15 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
 
     position = dict(getattr(meta, "position", None) or {})
     if position:
+        # written whenever the image has a position, (0, 0) included; an axis the
+        # position does not name, and t / c, stay 0. Stored levels are the image's own
+        # (a vendor pyramid): they keep level 0's translation (alignment 0).
         unit_of = dict(zip(axes, units))
-        translation = []
-        for ax in axes:
-            q = _quantity(position.get(ax), unit_of.get(ax)) if ax in "zyx" else None
-            translation.append(q[0] if q is not None else 0.0)
-        if any(translation):
-            for path in pyr.meta.resolution_paths:
-                pyr.meta.update_translation(path, translation)
+        translation = [_position(position[ax], unit_of.get(ax), image=label, axis=ax)
+                       if ax in "zyx" and position.get(ax) is not None else 0.0
+                       for ax in axes]
+        for path in pyr.meta.resolution_paths:
+            pyr.meta.update_translation(path, translation)
 
     channels = list(getattr(meta, "channels", None) or [])
     n_channels = base_shape[axes.index("c")] if "c" in axes else 1
@@ -258,9 +311,9 @@ def _sorted_values(values) -> list:
 
 
 class PyramidCollection(Mapping):
-    """Pyramids keyed by where each image sits in its source: ``(("scene", 0),
+    """Pyramids keyed by where each image sits in its source: ``(("series", 0),
     ("view", 1))``. A read-only mapping (``len``, iteration over keys, ``items()``);
-    ``coll[{"scene": 0, "view": 1}]`` and ``coll.select(view=1)`` look entries up by
+    ``coll[{"series": 0, "view": 1}]`` and ``coll.select(view=1)`` look entries up by
     index; :meth:`write` writes every entry.
 
     A collection read from OME-Zarr (:meth:`from_zarr`) keeps its node tree as
@@ -277,18 +330,23 @@ class PyramidCollection(Mapping):
         self.tree = tree
         # the table's rows built so far, by key (metadata only; see `table`)
         self._rows: Dict[Tuple, Dict[str, Any]] = {}
+        # the index names of the collection this one was selected from (see `select`)
+        self._names: frozenset = frozenset()
 
     @classmethod
     def from_zarr(cls, path, *, storage_options: Optional[dict] = None) -> "PyramidCollection":
         """The collection stored at `path`: an NGFF 0.4/0.5 plate (keyed ``plate``,
         ``acquisition``, ``well``, ``field``, as micro-reader keys plate images), a well
-        on its own (``acquisition``, ``field``), or a single image (the one key ``()``).
-        The plate and well metadata are read now; each image when it is first used.
-        `storage_options` as for ``io.read_pyramid`` (an object-store URL)."""
+        on its own (``acquisition``, ``field``), a bioformats2raw layout (``series``), or
+        a single image (the one key ``()``). The plate and well metadata are read now; each image when it is first used.
+        `storage_options` as for ``io.read_pyramid`` (an object-store URL). A store
+        declaring an NGFF version ozp does not read (0.6) raises
+        :class:`~ome_zarr_pyramid.UnsupportedNGFFVersion` here, from its attributes."""
         from ome_zarr_pyramid.core.io import _open_store_group
         from ome_zarr_pyramid.core.ngff_plate import (
             ImageOpener, _split, _stem, read_plate, read_well)
-        from ome_zarr_pyramid.core.nodes import MultiscaleNode, NodePath
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode, NodePath, check_read_version
+        from ome_zarr_pyramid.core.pyramid import NGFFMetadataHandler
 
         from ome_zarr_pyramid.core import rfc8
 
@@ -302,7 +360,14 @@ class PyramidCollection(Mapping):
         attrs = root.attrs.asdict()
         if rfc8.is_rfc8(attrs.get("ome")):
             return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
-        _, ngff, _ = _split(attrs)
+        version, ngff, _ = _split(attrs)
+        if "multiscales" in ngff and not ("plate" in ngff or "well" in ngff):
+            version = NGFFMetadataHandler.declared_version(attrs)
+        # refused from the root's attributes, before any child group or array is opened
+        # (a lazy image would otherwise fail only on first use); a group with neither a
+        # version nor NGFF metadata gets the "not an OME-Zarr image" error below
+        if version is not None or ngff:
+            check_read_version(version, str(path))
         if "plate" in ngff:
             tree = read_plate(path, storage_options=storage_options, _group=root)
         elif "well" in ngff:
@@ -314,8 +379,8 @@ class PyramidCollection(Mapping):
         elif "bioformats2raw.layout" in ngff:
             from ome_zarr_pyramid.core.ngff_series import read_series
             tree = read_series(path, storage_options=storage_options, _group=root)
-            # keyed as micro-reader keys a file's scenes (bioformats2raw's series)
-            return cls({(("scene", i),): node for i, node in enumerate(tree.nodes)},
+            # keyed as micro-reader keys a file's series (bioformats2raw's series)
+            return cls({((SERIES_INDEX, i),): node for i, node in enumerate(tree.nodes)},
                        name=tree.name, tree=tree)
         else:
             raise ValueError(f"{path}: not an OME-Zarr image, well or plate (its metadata "
@@ -325,7 +390,7 @@ class PyramidCollection(Mapping):
     @classmethod
     def _from_tree(cls, tree) -> "PyramidCollection":
         """A collection over an RFC 8 tree: plates keyed as micro-reader keys plate
-        images, any other collection ``(("scene", i),)``, a single image ``()``."""
+        images, any other collection ``(("series", i),)``, a single image ``()``."""
         from ome_zarr_pyramid.core.plates import plate_nodes
         from ome_zarr_pyramid.core.rfc8 import tree_entries
 
@@ -344,7 +409,14 @@ class PyramidCollection(Mapping):
         anything with ``images``). Images that are only another resolution level of an
         image (an index with ``resolution`` > 0, from ``resolutions="all"``) are folded
         into that image's pyramid, so one entry is one whole image. `kwargs` go to
-        :meth:`Pyramid.from_image`."""
+        :meth:`Pyramid.from_image`.
+
+        Keys are the images' indices as the file gives them (micro-reader 0.1.0:
+        ``(("series", i), ...)``; plate images ``plate``, ``acquisition``, ``well``,
+        ``field``); an index name ozp does not know (the old series name eubi-bridge
+        0.2.x uses) is kept as it is. :attr:`tree` is built from the indices (see
+        :func:`ome_zarr_pyramid.core.plates.tree_from_file`): the file's plates, and its
+        series, each a collection when it holds several images."""
         out = {}
         for image in file.images:
             index = dict(getattr(image, "index", None) or {})
@@ -354,10 +426,9 @@ class PyramidCollection(Mapping):
             if key in out:
                 raise ValueError(f"two images share the index {dict(key)}")
             out[key] = pyramid_from_image(image, version=version, **kwargs)
-        from ome_zarr_pyramid.core.ngff_plate import _stem
-        from ome_zarr_pyramid.core.plates import tree_from_file
+        from ome_zarr_pyramid.core.plates import file_stem, tree_from_file
         path = getattr(file, "path", None)
-        tree = tree_from_file(file, out, name=_stem(str(path)) if path else None)
+        tree = tree_from_file(file, out, name=file_stem(path) if path else None)
         return cls(out, name=path, tree=tree)
 
     def write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
@@ -371,12 +442,13 @@ class PyramidCollection(Mapping):
         `overwrite`. ``version="rfc8"`` writes it as RFC 8 (see `write_collection`;
         `document` puts the plate's RFC 8 document in a standalone ``.json``).
 
-        Images whose index has more than plate / acquisition / well / field (a tile, a
-        view, ...) are written as separate images of their well, with a warning: NGFF
-        0.4/0.5 wells cannot say which tile or view an image is."""
-        import warnings
-
-        from ome_zarr_pyramid.core.ngff_plate import write_plate
+        A field holding several images (its images' keys agree in plate, acquisition,
+        well and field but differ in tile, view, ...) raises
+        :class:`~ome_zarr_pyramid.core.ngff_plate.PlateFieldError` in NGFF 0.4 / 0.5 (and
+        0.6): open the file with ``tiles="mosaic"``, or write ``version="rfc8"``. Images
+        outside the plate (a slide's label or preview, keyed without a plate) are not
+        part of it."""
+        from ome_zarr_pyramid.core.ngff_plate import check_fields, write_plate
         from ome_zarr_pyramid.core.nodes import MultiscaleNode
         from ome_zarr_pyramid.core.plates import plate_nodes
 
@@ -386,27 +458,26 @@ class PyramidCollection(Mapping):
         if not 0 <= plate < len(nodes):
             raise IndexError(f"plate {plate}: the collection holds {len(nodes)} plate(s)")
         node = nodes[plate]
-        held = {id(v) for v in self._pyramids.values()}
-        mine = [k for k in self._pyramids if dict(k).get("plate", 0) == plate]
+        key_of = {id(v): k for k, v in self._pyramids.items()}
+        fields = []                            # (well name, [the index of each image])
         for well in node.nodes:
+            indices = []
             for image in well.walk():
                 if not isinstance(image, MultiscaleNode) or "labels" in image.attributes \
                         or "source" in image.attributes:
                     continue                   # label and derived images are not entries
-                if id(image) not in held and id(getattr(image, "_pyramid", None)) not in held:
+                key = key_of.get(id(image), key_of.get(id(getattr(image, "_pyramid", None))))
+                if key is None:
                     raise ValueError(
                         "this collection is a selection of its plate; write the plate from "
                         "the whole collection (a plate is written with all its images)")
+                indices.append(dict(key))
+            fields.append((well.name, indices))
         if version == "rfc8":
             from ome_zarr_pyramid.core.rfc8 import write_rfc8
             return write_rfc8(node, path, document=document, overwrite=overwrite,
                               storage_options=storage_options, writer=writer, **write_kwargs)
-        extra = sorted({name for k in mine for name, _ in k}
-                       - {"plate", "acquisition", "well", "field"})
-        if extra:
-            warnings.warn(f"plate {plate}: its images are also indexed by {extra}; they are "
-                          f"written as separate images of their well, which NGFF 0.4/0.5 "
-                          f"cannot label with {extra}", stacklevel=2)
+        check_fields(node.name, fields)        # one image per field, in every version
         return write_plate(node, path, version=version, overwrite=overwrite,
                            storage_options=storage_options, writer=writer, **write_kwargs)
 
@@ -416,13 +487,19 @@ class PyramidCollection(Mapping):
                      **write_kwargs) -> Dict[str, str]:
         """Write every entry as one series of a bioformats2raw layout (``<path>/0``,
         ``<path>/1``, ..., in key order; a collection read from that layout keeps its
-        series paths), then the root metadata and the ``OME`` group. Returns
-        ``{series path: path}``. `ome_xml` is stored as ``OME/METADATA.ome.xml``
-        (default: the source layout's). See
+        series paths), then the root metadata and the ``OME`` group with its OME-XML.
+        Returns ``{series path: path}``. `ome_xml` is stored as ``OME/METADATA.ome.xml``
+        (default: the source layout's when it still fits, else a minimal one). See
         :func:`ome_zarr_pyramid.core.ngff_series.write_series`.
+
+        A series holding several images (keys with one series value that differ in a
+        tile, view, ... index) is flattened: each image is written as a series of its
+        own, in key order, with one ``UserWarning`` per call.
 
         ``version="rfc8"``: RFC 8 replaces the layout with a collection of the series
         images, so that is written (see `write_collection`); `ome_xml` is not used."""
+        import warnings
+
         from ome_zarr_pyramid.core.ngff_series import LAYOUT_KEY, write_series
         from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
 
@@ -432,8 +509,19 @@ class PyramidCollection(Mapping):
                 and {id(n) for n in tree.nodes} == {id(v) for v in self._pyramids.values()}:
             node = tree                    # read from a series layout, all of it: as read
         else:                              # any other collection: series 0, 1, ... in key order
+            keys = sorted(self._pyramids)
+            crowded = _crowded(keys) if version != "rfc8" else []
+            if crowded:
+                names = sorted({n for _, varied in crowded for n in varied})
+                many = len(crowded)
+                warnings.warn(
+                    f"write_series: {many} of the collection's series hold"
+                    f"{'' if many > 1 else 's'} several images (they differ in {names}); "
+                    f"each image is written as a series of its own, in key order "
+                    f"({len(keys)} series): the bioformats2raw layout cannot say which "
+                    f"{' / '.join(names)} an image is", UserWarning, stacklevel=2)
             node = CollectionNode("series")
-            for i, key in enumerate(sorted(self._pyramids)):
+            for i, key in enumerate(keys):
                 node.add(MultiscaleNode(str(i), self[key]))
         if version == "rfc8":
             from ome_zarr_pyramid.core.rfc8 import write_rfc8
@@ -505,8 +593,26 @@ class PyramidCollection(Mapping):
         names = sorted({k for key in self._pyramids for k, _ in key})
         return f"PyramidCollection({len(self)} pyramids, indexed by {names})"
 
+    def _index_names(self) -> List[str]:
+        """The index names of the collection's keys, sorted (those of the collection it
+        was selected from included, so an empty selection still knows them)."""
+        return sorted(self._names.union(n for key in self._pyramids for n, _ in key))
+
     def select(self, **index) -> "PyramidCollection":
-        """The entries whose index matches every given value: ``select(view=1)``."""
+        """The entries whose index matches every given value: ``select(view=1)``. A name
+        the collection's keys do not have raises ``KeyError`` naming the ones they have;
+        a known name whose value matches nothing gives an empty collection. (A plate
+        field's ``Field.select`` only filters.)"""
+        known = self._index_names()
+        unknown = [name for name in index if name not in known]
+        if unknown:
+            hint = ""
+            # micro-reader 0.1.0 renamed the index; this hint goes together with
+            # micro-reader's index guard (plan 3.24)
+            if "scene" in unknown and SERIES_INDEX in known:
+                hint = f"; 'scene' is now called {SERIES_INDEX!r} (micro-reader 0.1.0)"
+            raise KeyError(f"select: the collection has no index {unknown[0]!r}; its "
+                           f"indices are {known}{hint}")
         return self._derive([k for k in self._pyramids
                              if all(dict(k).get(name) == value for name, value in index.items())])
 
@@ -516,6 +622,7 @@ class PyramidCollection(Mapping):
         table rows already built."""
         new = type(self)({k: self._pyramids[k] for k in keys}, name=self.name, tree=self.tree)
         new._rows = {k: self._rows[k] for k in keys if k in self._rows}
+        new._names = frozenset(self._index_names())
         return new
 
     # -- the table and its queries ----------------------------------------------

@@ -19,6 +19,7 @@ from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple
 import numpy as np
 import zarr
 
+from ome_zarr_pyramid.core.nodes import READ_VERSIONS, check_read_version
 from ome_zarr_pyramid.utils import defaults
 from ome_zarr_pyramid.utils.compressor_config import CompressorConfig
 from ome_zarr_pyramid.utils.json_utils import make_json_safe
@@ -203,6 +204,40 @@ def calculate_n_layers(shape: Tuple[int, ...],
     return max(1, n_layers)
 
 
+#: downscale methods that keep one pixel per window (a stride): a level's first pixel
+#: centre is level 0's, so its translation is level 0's. Every other method reduces a
+#: window, whose centre lies (F - 1) / 2 level-0 pixels in.
+STRIDE_METHODS = ('simple',)
+
+
+def level_translation(base_translation: Iterable[float], base_scale: Iterable[float],
+                      level_scale: Iterable[float], method: str) -> List[float]:
+    """The translation of a level ozp builds from level 0 with `method`.
+
+    A level's translation is the position (level 0's translation) plus the level's
+    alignment: 0 for a stride method ('simple'), and for a window method (mean, median,
+    min, max, mode) the window centre, ``(F - 1) / 2`` level-0 pixels =
+    ``(level_scale - base_scale) / 2`` in physical units per axis (0 on axes that are
+    not downscaled, such as t and c). Levels read from a file keep what they store; this
+    is only for levels ozp makes.
+    """
+    from ome_zarr_pyramid.utils.scale import DOWNSCALE_METHODS
+    if method not in DOWNSCALE_METHODS:
+        raise ValueError(f"downscale_method must be one of {DOWNSCALE_METHODS}, "
+                         f"got {method!r}")
+    base_translation, base_scale, level_scale = (
+        [float(v) for v in vec] for vec in (base_translation, base_scale, level_scale))
+    if not len(base_translation) == len(base_scale) == len(level_scale):
+        raise ValueError(
+            f"translation {base_translation}, base scale {base_scale} and level scale "
+            f"{level_scale} must have one entry per axis")
+    if method in STRIDE_METHODS:
+        out = base_translation
+    else:
+        out = [t + (s - s0) / 2 for t, s0, s in zip(base_translation, base_scale, level_scale)]
+    return [v if v != 0 else 0.0 for v in out]         # no -0.0 in the metadata
+
+
 # Standard colour names -> OME hex ('RRGGBB', no '#'). CSS basic set plus the
 # channel colours common in microscopy. Used by `Pyramid.set_channels`.
 _COLOR_NAMES = {
@@ -335,7 +370,8 @@ class NGFFMetadataHandler:
     for image pyramids, supporting both v0.4 and v0.5 specifications.
     """
 
-    SUPPORTED_VERSIONS: ClassVar[List[str]] = ["0.4", "0.5"]
+    #: the versions read and written: ``nodes.READ_VERSIONS``, the one list readers check
+    SUPPORTED_VERSIONS: ClassVar[List[str]] = list(READ_VERSIONS)
 
     #: the keys NGFF defines. Any other key of ``metadata`` is an application's custom
     #: block (e.g. 'eubi_bridge'), stored BESIDE the ``ome`` attribute in 0.5 (the spec
@@ -554,21 +590,43 @@ class NGFFMetadataHandler:
         self.version = "0.5" if store_format == 3 else "0.4"
         self._validate_version_and_format(self.version, store_format)
 
+    @staticmethod
+    def declared_version(attrs) -> Any:
+        """The NGFF version an image group's attributes declare: ``ome.version`` (0.5
+        and later), else the first multiscale's ``version`` (0.4); ``'0.4'`` when
+        neither says. Never derived from the zarr format."""
+        if 'ome' in attrs:
+            return cast_to_dict(attrs['ome']).get('version', '0.4')
+        multiscales = attrs.get('multiscales')
+        if isinstance(multiscales, dict):
+            multiscales = [multiscales]
+        first = multiscales[0] if isinstance(multiscales, list) and multiscales else {}
+        return first.get('version', '0.4') if isinstance(first, dict) else '0.4'
+
     def read_metadata(self):
         """Read metadata from connected zarr group."""
         if self.zarr_group is None:
             raise RuntimeError("No zarr group connected. Call connect_to_group first.")
 
+        from ome_zarr_pyramid.core.rfc8 import is_rfc8
+
         metadata_loaded: Optional[Dict[str, Any]] = None
+        # the version the group DECLARES (connect_to_group's one is derived from the
+        # zarr format): refuse one ozp cannot read before anything else is read from it
+        where = str(self.zarr_group.store_path)
         if 'ome' in self.zarr_group.attrs:
             metadata_loaded = self.zarr_group.attrs['ome']  # type: ignore
             self.metadata = metadata_loaded  # type: ignore
-            self.version = cast_to_dict(self.metadata).get('version', '0.4')
+            self.version = self.declared_version(self.zarr_group.attrs)
+            if not is_rfc8(metadata_loaded):
+                # an RFC 8 node ("0.x") is let through as it is: it is read by node
+                # type (rfc8.open_image, PyramidCollection.from_zarr), not as NGFF 0.4/0.5
+                check_read_version(self.version, where)
         elif 'multiscales' in self.zarr_group.attrs:
             multiscales_attr = self.zarr_group.attrs['multiscales']
             self.metadata = {'multiscales': multiscales_attr if isinstance(multiscales_attr, list) else [multiscales_attr]}
-            if self.metadata:
-                self.version = self.metadata.get('multiscales', [{}])[0].get('version', '0.4')
+            self.version = self.declared_version(self.zarr_group.attrs)
+            check_read_version(self.version, where)
         else:
             raise ValueError("No valid metadata found in zarr group")
 
@@ -1126,7 +1184,8 @@ class Pyramid:
             return f"NGFF."
 
     def from_ngff(self, gr: Union[zarr.Group, str, Path]) -> 'Pyramid':
-        """Load pyramid from an NGFF-compliant Zarr group."""
+        """Load pyramid from an NGFF-compliant Zarr group (NGFF 0.4 or 0.5; a group
+        declaring another version, e.g. 0.6, raises ``UnsupportedNGFFVersion``)."""
         self.meta = NGFFMetadataHandler()
         self.meta.connect_to_group(gr)
         self.meta.read_metadata()
@@ -1160,9 +1219,13 @@ class Pyramid:
                    axis_order: Optional[str] = None,  # type: ignore
                    unit_list: Optional[List[str]] = None,  # type: ignore
                    scale: Optional[List[float]] = None,  # type: ignore
-                   version: str = "0.4",
+                   version: str = "0.5",
                    name: str = "unnamed") -> 'Pyramid':
-        """Create a pyramid from any array type without writing to NGFF store."""
+        """Create a pyramid from any array type without writing to NGFF store.
+
+        `version` is the NGFF version it is written in: ``"0.5"`` (zarr v3, the
+        default since ozp 0.3.0) or ``"0.4"`` (zarr v2).
+        """
         ndim = array.ndim
         axes: str = axis_order if axis_order is not None else defaults.axis_order[:ndim]
         units_list: List[str] = unit_list if unit_list is not None else [defaults.unit_map[ax] for ax in axes]
@@ -1205,7 +1268,7 @@ class Pyramid:
                     base_scale: Optional[List[float]] = None,  # type: ignore
                     scale_factor: Optional[List[float]] = None,  # type: ignore
                     scales: Optional[List[List[float]]] = None,  # type: ignore
-                    version: str = "0.4",
+                    version: str = "0.5",
                     name: str = "unnamed",
                     compressor: Optional[CompressorConfig] = None) -> 'Pyramid':
         """Create a pyramid from a list of arrays at different resolutions.
@@ -1235,6 +1298,9 @@ class Pyramid:
         A level may also be any array-like source dyna-zarr can wrap - a
         ``micro_reader.Image``, a reader's own region source (``shape``, ``dtype``,
         ``__getitem__``) - which is wrapped lazily with ``dyna_zarr.from_array``.
+
+        `version` is the NGFF version the pyramid is written in: ``"0.5"`` (zarr v3,
+        the default since ozp 0.3.0) or ``"0.4"`` (zarr v2).
         """
         if isinstance(arrays, (np.ndarray, zarr.Array)) or is_dask_array(arrays) or (
                 not isinstance(arrays, (list, tuple)) and hasattr(arrays, 'shape')):
@@ -1308,7 +1374,7 @@ class Pyramid:
                           unit_list: Optional[List[str]] = None,  # type: ignore
                           scale_factor: Optional[List[float]] = None,  # type: ignore
                           scales: Optional[List[List[float]]] = None,  # type: ignore
-                          version: str = "0.4",
+                          version: str = "0.5",
                           name: str = "unnamed",
                           compressor: Optional[CompressorConfig] = None,
                           colors: Optional[List[dict]] = None,
@@ -1329,7 +1395,7 @@ class Pyramid:
 
             lbl_pyr = Pyramid().from_label_arrays([labels0], axis_order="zyx",
                                                   scales=[[1, 1, 1]], name="nuclei")
-            lbl_pyr.meta.image_label       # {'version': '0.4'}
+            lbl_pyr.meta.image_label       # {'version': '0.5'}
         """
         self.from_arrays(
             arrays, axis_order=axis_order, unit_list=unit_list, scale_factor=scale_factor,
@@ -1625,15 +1691,23 @@ class Pyramid:
             for k, v in src_ms.items():
                 if k not in ('datasets', 'axes'):
                     new_ms[k] = copy.deepcopy(v)
-            # the base level's translation (the physical origin) on every level, as the
-            # deferred write path and eubi-bridge write it
+            # each level's translation: the base level's (the physical origin) plus the
+            # level's alignment under the downscale method (level_translation), as the
+            # deferred write path writes it. No base translation: none on any level.
             base_ct = src_ms['datasets'][0].get('coordinateTransformations', [])
             trans = [t for t in base_ct if t.get('type') == 'translation']
             if trans:
-                for ds in new_ms['datasets']:
+                method = getattr(self.downscaler, 'downscale_method', 'simple')
+                paths = new_pyr.meta.resolution_paths
+                base_scale = new_pyr.meta.get_scale(paths[0])
+                for path, ds in zip(paths, new_ms['datasets']):
                     cts = [t for t in ds.setdefault('coordinateTransformations', [])
                            if t.get('type') != 'translation']
-                    ds['coordinateTransformations'] = cts + copy.deepcopy(trans)
+                    entry = copy.deepcopy(trans[0])
+                    entry['translation'] = level_translation(
+                        trans[0]['translation'], base_scale, new_pyr.meta.get_scale(path),
+                        method)
+                    ds['coordinateTransformations'] = cts + [entry]
             new_pyr.meta._pending_changes = True
         return new_pyr
 
@@ -2537,7 +2611,9 @@ class Pyramid:
             label entry; an ``image-label`` metadata block is ensured (a minimal
             ``{"version": ...}`` is created if absent) and its ``source`` is set to
             point back at this image (``{"image": "../../"}`` per NGFF) unless
-            `source` is given.
+            `source` is given. A label in another NGFF version than this image is
+            converted to this image's version (`to_version`): an NGFF label lives in
+            its image's zarr format.
         name : str, optional
             The name to register the label under. Defaults to the label pyramid's own
             ``multiscales`` name; if that is missing, `name` is REQUIRED.
@@ -2559,7 +2635,12 @@ class Pyramid:
 
         # deep-copy the label's metadata so we can stamp image-label without mutating
         # the caller's pyramid, then ensure the image-label block + source back-link
-        label = image_label._clone_metadata_only()
+        # the label takes this image's NGFF version (and so its zarr format): v2 and v3
+        # groups do not nest, so a label in another version would be invisible to readers
+        if self.meta is not None and str(image_label.meta.version) != str(self.meta.version):
+            label = image_label.to_version(str(self.meta.version))
+        else:
+            label = image_label._clone_metadata_only()
         if label.meta is not None and label.meta.metadata is not None:
             # a label image carries image-label, not omero (the source pyramid it was
             # derived from may have left an omero block behind - drop it)

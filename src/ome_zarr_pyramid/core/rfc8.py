@@ -31,6 +31,7 @@ import posixpath
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from ome_zarr_pyramid.core.collection import SERIES_INDEX
 from ome_zarr_pyramid.core.nodes import (
     CollectionNode, ID_PATTERN, InvalidCollection, LabelsAttribute, MultiscaleNode, Node,
     NodePath, Ref, attributes_to_json, is_plate, is_well, ref_id)
@@ -390,26 +391,52 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
     Returns ``{image path in the collection: written path}``.
 
     Images keep the path they have in the tree (joined through their collections),
-    else a well's ``<row>/<column>/<n>`` in a plate or ``<n>`` in any collection.
-    An existing `path` is refused unless `overwrite` (which clears it first); the
-    collection document is written last."""
+    else a well's ``<row>/<column>/<n>`` in a plate or ``<n>`` in any collection, where
+    collections and images share one counter (``0`` a series collection, ``1`` the
+    image next to it). Two images at one path, or an image group inside another, are
+    refused before anything is written. An existing `path` is refused unless
+    `overwrite` (which clears it first); the collection document is written last."""
     from zarr.errors import ContainsArrayError, ContainsGroupError
 
     from ome_zarr_pyramid.core.io import IO, _store_join
-    from ome_zarr_pyramid.core.ngff_plate import image_paths, well_path
+    from ome_zarr_pyramid.core.ngff_plate import well_path
 
     if not isinstance(node, CollectionNode):
         raise ValueError(f"{node!r}: write_rfc8 writes a collection")
     taken = {n.id for n in node.walk() if n.id is not None}
     jobs: List[Tuple[str, Any, str, Optional[str]]] = []   # (rel path, pyramid, name, id)
+    label_of: Dict[str, str] = {}                          # label path -> its image's path
 
-    def child_prefix(parent: CollectionNode, child: CollectionNode, index: int, prefix: str):
-        if is_plate(parent) and is_well(child):
-            part = well_path(parent.attributes["plate"], child)
-        elif child.path is not None and child.path.type == "zarr":
-            part = child.path.path
-        else:
-            part = str(index)
+    def own_part(parent: CollectionNode, child: Node) -> Optional[str]:
+        if isinstance(child, CollectionNode):
+            if is_plate(parent) and is_well(child):
+                return well_path(parent.attributes["plate"], child)
+            if child.path is not None and child.path.type == "zarr":
+                return child.path.path
+            return None
+        if isinstance(child, MultiscaleNode) and child.path is not None:
+            return child.path.path
+        return None
+
+    def parts_of(coll: CollectionNode) -> Dict[int, str]:
+        """Where each collection and image child of `coll` goes in it: its own path,
+        else the next number no sibling takes (one counter for collections and images,
+        so a collection's folder never holds an image group of the same name)."""
+        children = [c for c in coll.nodes if isinstance(c, (CollectionNode, MultiscaleNode))]
+        own = {id(c): own_part(coll, c) for c in children}
+        used = {posixpath.normpath(p).split("/")[0] for p in own.values() if p is not None}
+        out, n = {}, 0
+        for child in children:
+            if own[id(child)] is not None:
+                out[id(child)] = own[id(child)]
+                continue
+            while str(n) in used:
+                n += 1
+            out[id(child)] = str(n)
+            used.add(str(n))
+        return out
+
+    def join(prefix: str, part: str) -> str:
         return posixpath.normpath(posixpath.join(prefix, part)) if prefix else posixpath.normpath(part)
 
     def build(coll: CollectionNode, prefix: str, root: bool) -> Dict[str, Any]:
@@ -418,14 +445,12 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
             out["id"] = coll.id
         out["name"] = coll.name
         children = []
-        images = [c for c in coll.nodes if isinstance(c, MultiscaleNode)]
-        paths = dict(zip(map(id, images), image_paths(CollectionNode("_", images))))
-        for index, child in enumerate(coll.nodes):
+        parts = parts_of(coll)
+        for child in coll.nodes:
             if isinstance(child, CollectionNode):
-                children.append(build(child, child_prefix(coll, child, index, prefix), False))
+                children.append(build(child, join(prefix, parts[id(child)]), False))
             elif isinstance(child, MultiscaleNode):
-                rel = posixpath.normpath(posixpath.join(prefix, paths[id(child)])) if prefix \
-                    else posixpath.normpath(paths[id(child)])
+                rel = join(prefix, parts[id(child)])
                 pyr = child.pyramid
                 labels = dict(getattr(pyr, "_labels", {}) or {})
                 ident = child.id if child.id is not None or not labels else _safe_id(child.name, taken)
@@ -441,6 +466,7 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
                 for label_name, label in labels.items():
                     label_rel = f"{rel}/labels/{label_name}"
                     jobs.append((label_rel, label, label_name, None))
+                    label_of[label_rel] = rel
                     attributes: Dict[str, Any] = {"labels": LabelsAttribute(
                         [Ref(ident)], _label_attributes(label)).to_json()}
                     if "acquisition" in child.attributes:
@@ -464,10 +490,7 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
     beside = {k: copy.deepcopy(v.to_json() if hasattr(v, "to_json") else v)
               for k, v in node.attributes.items()
               if k not in _RFC8_ATTRIBUTES and ":" not in k and k != "bioformats2raw.layout"}
-    names = [rel for rel, _, _, _ in jobs]
-    if len(set(names)) != len(names):
-        raise ValueError(f"collection {node.name!r}: two images would be written at the same "
-                         f"path ({sorted({n for n in names if names.count(n) > 1})})")
+    _check_paths(node.name, jobs, label_of)
 
     try:
         root = _group(str(path), storage_options, mode="w" if overwrite else "w-", zarr_format=3)
@@ -499,6 +522,24 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
     return written
 
 
+def _check_paths(name: str, jobs, label_of: Dict[str, str]) -> None:
+    """Refuse, before anything is written, two images at one path and an image group
+    inside another image group. A label sits in its own image's ``labels/`` group
+    (`label_of`: a label's path -> its image's path)."""
+    names = [rel for rel, _, _, _ in jobs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"collection {name!r}: two images would be written at the same "
+                         f"path ({sorted({n for n in names if names.count(n) > 1})})")
+    images = set(names)
+    for rel in names:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            outer = "/".join(parts[:i])
+            if outer in images and label_of.get(rel) != outer:
+                raise ValueError(f"collection {name!r}: image {rel!r} would be written "
+                                 f"inside the image group {outer!r}")
+
+
 def _relative(doc: Dict[str, Any], offset: str) -> Dict[str, Any]:
     """`doc` with its image paths made relative to a document `offset` away from the
     images' root (``""``: the document is in the root group)."""
@@ -517,9 +558,10 @@ def _relative(doc: Dict[str, Any], offset: str) -> Dict[str, Any]:
 
 
 def tree_entries(tree) -> List[Tuple[Tuple, MultiscaleNode]]:
-    """The flat keys of a collection that is not a plate: ``(("scene", i),)`` for each
-    image in tree order (as micro-reader keys a file's scenes), label and other derived
-    images (a ``labels`` or ``source`` attribute) left out."""
+    """The flat keys of a collection that is not a plate: ``(("series", i),)`` for each
+    image in tree order (as micro-reader keys a file's series), label and other derived
+    images (a ``labels`` or ``source`` attribute) left out. The tree is kept as read: a
+    nested collection's images are numbered on, in tree order."""
     out = []
 
     def walk(coll):
@@ -528,7 +570,7 @@ def tree_entries(tree) -> List[Tuple[Tuple, MultiscaleNode]]:
                 walk(child)
             elif isinstance(child, MultiscaleNode) and "labels" not in child.attributes \
                     and "source" not in child.attributes:
-                out.append(((("scene", len(out)),), child))
+                out.append((((SERIES_INDEX, len(out)),), child))
     if isinstance(tree, MultiscaleNode):
         return [((), tree)]
     walk(tree)

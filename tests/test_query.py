@@ -34,19 +34,19 @@ class Img:
 
 
 def _mixed():
-    """Four scenes that differ: dtype, axes, level count."""
-    images = [Img({"scene": 0}), Img({"scene": 1}, dtype="u1"),
-              Img({"scene": 2}, shape=(3, 4, 16, 16), axes="czyx"), Img({"scene": 3}, levels=3)]
+    """Four series that differ: dtype, axes, level count."""
+    images = [Img({"series": 0}), Img({"series": 1}, dtype="u1"),
+              Img({"series": 2}, shape=(3, 4, 16, 16), axes="czyx"), Img({"series": 3}, levels=3)]
     return PyramidCollection.from_file(SimpleNamespace(path=None, images=images, plates=[]))
 
 
 def test_the_table_of_a_file_collection():
     coll = _mixed()
     table = coll.table
-    assert len(table) == 4 and table.key_columns == ("scene",)
+    assert len(table) == 4 and table.key_columns == ("series",)
     assert set(IMAGE_COLUMNS) <= set(table.columns)
     first = table.rows[0]
-    assert (first["scene"], first["axes"], first["shape"], first["dtype"]) == (0, "cyx", (2, 8, 12), "uint16")
+    assert (first["series"], first["axes"], first["shape"], first["dtype"]) == (0, "cyx", (2, 8, 12), "uint16")
     assert (first["size_c"], first["size_z"], first["nbytes"]) == (2, None, 2 * 8 * 12 * 2)
     assert table["dtype"] == ["uint16", "uint8", "uint16", "uint16"]
     assert "CollectionTable: 4 images" in repr(table)
@@ -55,25 +55,25 @@ def test_the_table_of_a_file_collection():
 def test_queries():
     coll = _mixed()
     u16 = coll.filter(dtype="uint16")
-    assert [dict(k)["scene"] for k in u16] == [0, 2, 3]
-    assert [dict(k)["scene"] for k in coll.filter(size_z=lambda n: n is not None)] == [2]
-    assert [dict(k)["scene"] for k in coll.filter(lambda row: row["nbytes"] > 1000)] == [2]
-    assert [dict(k)["scene"] for k in coll.filter(levels=lambda n: n >= 3)] == [3]
+    assert [dict(k)["series"] for k in u16] == [0, 2, 3]
+    assert [dict(k)["series"] for k in coll.filter(size_z=lambda n: n is not None)] == [2]
+    assert [dict(k)["series"] for k in coll.filter(lambda row: row["nbytes"] > 1000)] == [2]
+    assert [dict(k)["series"] for k in coll.filter(levels=lambda n: n >= 3)] == [3]
     assert coll.count("levels") == {1: 3, 3: 1}
     assert coll.unique("dtype") == ["uint16", "uint8"]                # sorted as text
     assert coll.unique("size_z") == [4, None]                         # None last
     assert len(coll) == 4 and coll.count("axes") == {"cyx": 3, "czyx": 1}
-    assert coll.columns == coll.table.columns and coll.columns[:1] == ("scene",)
+    assert coll.columns == coll.table.columns and coll.columns[:1] == ("series",)
     groups = coll.group_by("axes")
     assert list(groups) == ["cyx", "czyx"] and len(groups["cyx"]) == 3
     by_two = coll.group_by("dtype", "axes")
     assert set(by_two) == {("uint16", "cyx"), ("uint8", "cyx"), ("uint16", "czyx")}
-    assert [dict(k)["scene"] for k in coll.sort_by("nbytes", reverse=True)][:1] == [2]
-    assert [dict(k)["scene"] for k in coll.sort_by("dtype", "scene")] == [0, 2, 3, 1]
+    assert [dict(k)["series"] for k in coll.sort_by("nbytes", reverse=True)][:1] == [2]
+    assert [dict(k)["series"] for k in coll.sort_by("dtype", "series")] == [0, 2, 3, 1]
     # results are collections: chain, index, and their rows are not built again
     sub = coll.filter(dtype="uint16").filter(axes="cyx")
     assert len(sub) == 2 and set(sub._rows) == set(sub._pyramids)
-    assert isinstance(sub[{"scene": 0}], Pyramid)
+    assert isinstance(sub[{"series": 0}], Pyramid)
 
 
 def test_unknown_columns_are_refused():

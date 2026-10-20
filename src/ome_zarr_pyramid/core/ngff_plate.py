@@ -31,11 +31,78 @@ import os
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ome_zarr_pyramid.core.nodes import (
-    CollectionNode, InvalidCollection, MultiscaleNode, Node, NodePath, PlateAttribute,
-    PlateItem, Ref, TYPED_ATTRIBUTES, WellAttribute)
+    READ_VERSIONS, CollectionNode, InvalidCollection, MultiscaleNode, Node, NodePath,
+    PlateAttribute, PlateItem, Ref, TYPED_ATTRIBUTES, WellAttribute, check_read_version)
 
-#: the NGFF versions whose plate layout this module reads and writes
-VERSIONS = ("0.4", "0.5")
+#: the NGFF versions whose plate layout this module reads and writes (the readers'
+#: one list, ``nodes.READ_VERSIONS``)
+VERSIONS = READ_VERSIONS
+#: the version a plate or a series layout is written in when nothing else decides
+DEFAULT_VERSION = "0.5"
+#: the zarr format each NGFF version this module writes is stored in
+_ZARR_FORMATS = {"0.4": 2, "0.5": 3}
+
+
+def zarr_format_of(version) -> int:
+    """The zarr format an NGFF `version` is stored in: 0.4 -> 2, 0.5 -> 3. Any other
+    version raises (ozp writes 0.4 and 0.5 only)."""
+    try:
+        return _ZARR_FORMATS[str(version)]
+    except KeyError:
+        raise ValueError(f"NGFF version {version!r}: ozp writes the versions "
+                         f"{tuple(_ZARR_FORMATS)}") from None
+
+
+class PlateFieldError(ValueError):
+    """A field of a plate holds several images (tiles, views, parts, ...). An NGFF plate
+    (0.4, 0.5 and 0.6) holds one image per field, so the plate cannot be written as it
+    is; the message names the ways out."""
+
+
+def check_fields(plate: str, wells) -> None:
+    """Raise :class:`PlateFieldError` when a field of the plate holds two or more images.
+    `wells`: ``(well name, [image index, ...])`` per well, an index being the image's
+    ``{name: value}`` in its source (``None`` or one without ``field`` when unknown: a
+    well built by hand without field numbers, whose images are each their own field).
+    Images share a field when their containment indices (plate, acquisition, well,
+    field, series) agree; the other indices (tile, view, part, ...) tell them apart."""
+    from ome_zarr_pyramid.core.collection import CONTAINERS, _RESOLUTION
+
+    for well, indices in wells:
+        places: Dict[Tuple, List[Dict[str, Any]]] = {}
+        for index in indices:
+            if not index or "field" not in index:
+                continue
+            index = {k: v for k, v in index.items() if k != _RESOLUTION}
+            place = tuple(sorted((k, v) for k, v in index.items() if k in CONTAINERS))
+            places.setdefault(place, []).append(index)
+        for place, members in places.items():
+            if len({tuple(sorted(m.items())) for m in members}) < 2:
+                continue                   # one image (or the same index twice: not a field's)
+            names = sorted({k for m in members for k in m if k not in CONTAINERS
+                            and len({m2.get(k) for m2 in members}) > 1})
+            where = dict(place)
+            acq = f" (acquisition {where['acquisition']})" if "acquisition" in where else ""
+            raise PlateFieldError(
+                f"plate {plate!r}: well {well!r}, field {where['field']}{acq} holds "
+                f"{len(members)} images (they differ in {names}); an NGFF plate (0.4, 0.5 "
+                f"and 0.6) holds one image per field. Ways out: (1) open the file with "
+                f'tiles="mosaic" (micro-reader >= 0.1), so each field is one image; (2) write '
+                f'with version="rfc8" (experimental), which keeps every image of the '
+                f"field; (3) for an NGFF source, join the field's images with pyrops "
+                f"first.")
+
+
+def _index_of(image: MultiscaleNode) -> Optional[Dict[str, Any]]:
+    """An image node's index in its source, when the tree says it: an ``eubi:index``
+    attribute, else the ``source_index`` of a pyramid already held (``from_image``).
+    An image behind a path that is not open yet has none (nothing is opened here)."""
+    index = image.attributes.get("eubi:index")
+    if isinstance(index, dict):
+        return index
+    pyr = image._pyramid
+    return dict(getattr(pyr, "source_index", None) or {}) if pyr is not None else None
+
 
 _PLATE_FIELDS = ("rows", "columns", "acquisitions", "wells", "name", "field_count", "version")
 _ENTRY_FIELDS = ("path", "rowIndex", "columnIndex")
@@ -110,9 +177,7 @@ def plate_from_attrs(attrs: Mapping[str, Any],
     plate = ngff.pop("plate", None)
     if not isinstance(plate, dict):
         raise InvalidCollection("not an NGFF plate: the group has no 'plate' metadata")
-    if version not in VERSIONS:
-        raise InvalidCollection(f"plate version {version!r}: ozp reads NGFF {VERSIONS} "
-                                f"plates")
+    check_read_version(version, f"plate {name!r}" if name else "plate")
     problems: List[str] = []
 
     def items(key: str) -> List[PlateItem]:
@@ -306,12 +371,21 @@ def read_plate(path, *, storage_options: Optional[dict] = None, _group=None
     :class:`InvalidCollection` naming every problem of a broken plate."""
     root = _root(path, storage_options, _group)
     attrs = root.attrs.asdict()
-    _, ngff, _ = _split(attrs)
+    version, ngff, _ = _split(attrs)
+    if isinstance(ngff.get("plate"), dict):
+        # from the plate's own attributes, before any well group is opened
+        check_read_version(version, f"{path}: plate")
     plate = ngff.get("plate")
     well_paths = list(dict.fromkeys(
         entry["path"] for entry in ((plate.get("wells") or []) if isinstance(plate, dict) else [])
         if isinstance(entry, dict) and isinstance(entry.get("path"), str)))
     wells = dict(zip(well_paths, _group_attrs(root, well_paths)))
+    for well_path, well_attrs in wells.items():
+        # a well declaring a version ozp does not read (0.6) is refused now, not when
+        # one of its images is first used
+        declared = _split(well_attrs)[0] if isinstance(well_attrs, Mapping) else None
+        if declared is not None:
+            check_read_version(declared, f"{path}: well {well_path!r}")
     plate = plate_from_attrs(attrs, wells, name=_stem(path))
     from ome_zarr_pyramid.core.io import _store_join
     for well in plate.children:
@@ -324,8 +398,7 @@ def well_from_attrs(attrs: Mapping[str, Any], *, name: str = "well") -> Collecti
     has no ``well`` attribute, since only the plate says which row and column it is."""
     problems: List[str] = []
     version, _, _ = _split(attrs)
-    if version not in VERSIONS:
-        raise InvalidCollection(f"well version {version!r}: ozp reads NGFF {VERSIONS} wells")
+    check_read_version(version, f"well {name!r}")
     node = _well_from_attrs(attrs, None, name, None, problems)
     if problems:
         raise InvalidCollection("; ".join(problems))
@@ -338,7 +411,9 @@ def read_well(path, *, storage_options: Optional[dict] = None, _group=None
     """Read an NGFF 0.4 or 0.5 well group on its own; its images are opened on first
     use."""
     root = _root(path, storage_options, _group)
-    well = well_from_attrs(root.attrs.asdict(), name=_stem(path) or "well")
+    attrs = root.attrs.asdict()
+    check_read_version(_split(attrs)[0], f"{path}: well")
+    well = well_from_attrs(attrs, name=_stem(path) or "well")
     _attach_openers(well, str(path), storage_options)
     return well
 
@@ -351,7 +426,7 @@ def plate_to_attrs(node: CollectionNode, version: Optional[str] = None
     (``"0.4"`` or ``"0.5"``; default: the version the plate was read as, else 0.5).
     Refuses a tree that breaks a rule, or that 0.4/0.5 cannot hold (a well holding
     collections: the "tall" acquisition form)."""
-    version = str(version or node.ngff_fields.get("version") or "0.5")
+    version = str(version or node.ngff_fields.get("version") or DEFAULT_VERSION)
     if version not in VERSIONS:
         raise ValueError(f"version {version!r}: NGFF plates are written as {VERSIONS}")
     attr = node.attributes.get("plate")
@@ -470,10 +545,9 @@ def write_plate_metadata(node: CollectionNode, path, *, version: Optional[str] =
     are not written. Returns the plate group's attributes."""
     from ome_zarr_pyramid.core.io import _open_store_group
 
-    version = str(version or node.ngff_fields.get("version") or "0.5")
+    version = str(version or node.ngff_fields.get("version") or DEFAULT_VERSION)
     plate_attrs, wells = plate_to_attrs(node, version)
-    zarr_format = 3 if version == "0.5" else 2
-    root = _open_store_group(str(path), zarr_format, mode="a",
+    root = _open_store_group(str(path), zarr_format_of(version), mode="a",
                              storage_options=storage_options)
     root.attrs.put(plate_attrs)
     for path_in_plate, attrs in wells.items():
@@ -493,6 +567,11 @@ def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
       version are converted (``Pyramid.to_version``).
     - The whole plate is checked before any pixel is written, and its metadata is
       written last, so a write that stops half way leaves no plate metadata.
+    - A field holding several images (images whose index, from an ``eubi:index``
+      attribute or a held pyramid's ``source_index``, agrees in plate, acquisition,
+      well, field and series but not in tile, view, ...) raises
+      :class:`PlateFieldError`, in every version. Images without field numbers (a
+      well built by hand) are each their own field.
     - An existing `path` is refused unless `overwrite` (which clears it first).
     - `write_kwargs` go to every image's write (``max_threads``, ``compressor``,
       ``chunk_shape``, ``memory_budget_mb``, ...)."""
@@ -501,8 +580,14 @@ def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
     attr = node.attributes.get("plate")
     if not isinstance(attr, PlateAttribute):
         raise ValueError(f"{node!r} is not a plate: it has no 'plate' attribute")
+    # one image per field, in every version: before any version-specific rule
+    # (walked: a field of several images is a collection of its own in the well)
+    check_fields(node.name, [(well.name, [_index_of(image) for child in well.nodes
+                                          for image in child.walk()
+                                          if isinstance(image, MultiscaleNode)])
+                             for well in node.nodes])
     # every rule of the layout first: before any image is opened (or pixel written)
-    plate_to_attrs(node, str(version or node.ngff_fields.get("version") or "0.5"))
+    plate_to_attrs(node, str(version or node.ngff_fields.get("version") or DEFAULT_VERSION))
     jobs = []                                  # (well path, image path, pyramid)
     for well in node.nodes:
         for image, image_path in zip(well.nodes, image_paths(well)):
@@ -511,7 +596,7 @@ def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
             jobs.append((well_path(attr, well), image_path, image.pyramid))
     versions = sorted({str(pyr.meta.version) for _, _, pyr in jobs})
     version = str(version or node.ngff_fields.get("version")
-                  or (versions[0] if len(versions) == 1 else "0.5"))
+                  or (versions[0] if len(versions) == 1 else DEFAULT_VERSION))
     plate_to_attrs(node, version)              # every rule, before any pixel
     # an image in another version is written in the plate's (Pyramid.to_version)
     jobs = [(w, i, pyr if str(pyr.meta.version) == version else pyr.to_version(version))
@@ -519,7 +604,7 @@ def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
 
     from zarr.errors import ContainsArrayError, ContainsGroupError
     try:
-        _open_store_group(str(path), 3 if version == "0.5" else 2,
+        _open_store_group(str(path), zarr_format_of(version),
                           mode="w" if overwrite else "w-", storage_options=storage_options)
     except (ContainsGroupError, ContainsArrayError, FileExistsError) as exc:
         raise FileExistsError(f"{path} exists; pass overwrite=True to replace it") from exc

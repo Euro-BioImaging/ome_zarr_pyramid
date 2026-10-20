@@ -162,6 +162,25 @@ def test_s3_attached_labels(bucket, data):
     np.testing.assert_array_equal(np.asarray(by_name.layers["0"][...]), lab)
 
 
+def test_s3_write_labels_into_an_existing_04_store(bucket, data):
+    # a label written straight into an existing store takes that store's version (here a
+    # 0.5 label from from_label_arrays() into a 0.4 image: written as 0.4, zarr v2)
+    name, opts = bucket
+    url = f"s3://{name}/img04.zarr"
+    IO().write_pyramid(_pyr(data, "0.4"), url, overwrite=True, storage_options=opts)
+    lab = np.zeros(SHAPE[1:], dtype="uint32")
+    lab[4:12, 8:20, 8:20] = 7
+    IO().write_labels(Pyramid().from_label_arrays([lab], axis_order=AXES[1:]),
+                      f"{url}/labels/seg", labels_group_path=f"{url}/labels",
+                      label_name="seg", storage_options=opts)
+    import obstore
+    from zarr.storage import ObjectStore
+    grp = zarr.open_group(ObjectStore(obstore.store.from_url(f"{url}/labels", **opts)), mode="r")
+    assert grp.metadata.zarr_format == 2 and list(grp.attrs["labels"]) == ["seg"]
+    seg = IO().read_labels(url, name="seg", storage_options=opts)
+    assert seg.meta.version == "0.4" and seg.meta.zarr_format == 2
+    np.testing.assert_array_equal(np.asarray(seg.layers["0"][...]), lab)
+
 def test_s3_dask_pyramid_is_pumped(bucket, data):
     da = pytest.importorskip("dask.array")
     name, opts = bucket
@@ -253,9 +272,9 @@ def test_s3_series_layout_write_then_open(bucket, tmp_path, version, ome_group):
     url = f"s3://{name}/file.ome.zarr"
     PyramidCollection.from_zarr(src).write_series(url, storage_options=opts)
     back = PyramidCollection.from_zarr(url, storage_options=opts)
-    assert list(back) == [(("scene", 0),), (("scene", 1),)]
+    assert list(back) == [(("series", 0),), (("series", 1),)]
     for i, expected in enumerate(data):
-        np.testing.assert_array_equal(np.asarray(back[{"scene": i}].layers["0"][...]), expected)
+        np.testing.assert_array_equal(np.asarray(back[{"series": i}].layers["0"][...]), expected)
     if ome_group:
         from ome_zarr_pyramid.core.ngff_series import _source_xml
         assert _source_xml(back.tree) == XML

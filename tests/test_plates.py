@@ -64,11 +64,16 @@ def test_a_plate_file_navigates_as_in_micro_reader():
     assert np.asarray(one.layers["0"]).max() == 3          # well 0, field 2, view 1
     with pytest.raises(KeyError, match="no well 'C1'"):
         plate.well_index("C1")
-    # the tree holds the same pyramids as the flat collection
+    # the tree holds the same pyramids as the flat collection; a field of two views is
+    # a collection of its own in the well (plan 3.17)
     well_node = plate.node["B3"]
-    assert [n.name for n in well_node] == ["acquisition0_field0_view0", "acquisition0_field0_view1",
-                                           "acquisition0_field2_view0", "acquisition0_field2_view1"]
-    assert well_node.nodes[3].pyramid is one
+    assert (plate.node.kind, plate.node.index, well_node.kind, well_node.index) == (
+        "plate", 0, "well", 0)
+    assert [n.name for n in well_node] == ["acquisition0_field0", "acquisition0_field2"]
+    field2 = well_node["acquisition0_field2"]
+    assert (field2.kind, field2.index, [n.name for n in field2]) == (
+        "field", 2, ["view0", "view1"])
+    assert field2["view1"].pyramid is one
     # a selection keeps every well (index "well": w stays wells[w]), fields narrowed
     picked = coll.select(view=0).plates[0]
     assert [w.name for w in picked.wells] == ["B3", "A1"]
@@ -77,7 +82,12 @@ def test_a_plate_file_navigates_as_in_micro_reader():
 
 def test_a_file_that_is_not_a_plate_has_no_plates():
     coll = PyramidCollection.from_file(_file([]))
-    assert coll.plates == [] and coll.tree is None
+    assert coll.plates == []
+    # the images still have a tree: each under the root, named by its index values
+    assert coll.tree.kind is None and coll.tree.name == "screen.idx"
+    assert [n.name for n in coll.tree][:2] == ["plate0_acquisition0_well0_field0_view0",
+                                              "plate0_acquisition0_well0_field0_view1"]
+    assert len(coll.tree) == 6
 
 
 def test_a_well_outside_the_layout_is_refused():

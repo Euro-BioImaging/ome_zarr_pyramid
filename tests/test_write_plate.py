@@ -91,11 +91,15 @@ def test_field_numbers_are_renumbered_but_nothing_else(tmp_path):
     assert [f.index for f in back.plates[0].wells[0].fields] == [0, 1]
 
 
-def test_images_with_more_indices_are_written_with_a_warning(tmp_path):
+def test_a_field_with_several_images_raises_but_rfc8_keeps_them(tmp_path):
+    # 9.4b / 5.2: an NGFF plate field is one image (more in test_write_plate_raises.py)
+    from ome_zarr_pyramid import PlateFieldError
     coll = PyramidCollection.from_file(_file(views=True))
-    with pytest.warns(UserWarning, match=r"also indexed by \['view'\]"):
-        written = coll.write_plate(str(tmp_path / "p.zarr"))
-    assert sorted(written)[:4] == ["A/1/0", "A/1/1", "B/3/0", "B/3/1"] and len(written) == 6
+    with pytest.raises(PlateFieldError, match=r"they differ in \['view'\]"):
+        coll.write_plate(str(tmp_path / "p.zarr"))
+    assert not os.path.exists(tmp_path / "p.zarr")
+    written = coll.write_plate(str(tmp_path / "r.zarr"), version="rfc8")
+    assert len(written) == 6
 
 
 def test_an_ngff_plate_is_copied(tmp_path):

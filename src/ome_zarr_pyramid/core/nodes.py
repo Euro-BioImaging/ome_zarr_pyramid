@@ -36,6 +36,40 @@ class InvalidCollection(ValueError):
     """A tree that breaks a rule of RFC 8; the message lists every problem found."""
 
 
+#: the NGFF versions ozp reads (images, plates, wells, series layouts); the one list
+#: every reader checks against (``NGFFMetadataHandler.SUPPORTED_VERSIONS`` is this)
+READ_VERSIONS = ("0.4", "0.5")
+
+
+class UnsupportedNGFFVersion(InvalidCollection):
+    """A store declares an NGFF version ozp cannot read (e.g. 0.6). Raised from the
+    group's attributes, before any array is opened. A subclass of
+    :class:`InvalidCollection` (and so of ``ValueError``): the plate and well readers
+    raised that for a version they did not read, and still catch the same way."""
+
+
+def check_read_version(version, what: str) -> None:
+    """Raise :class:`UnsupportedNGFFVersion` unless `version` (the version string the
+    group declares, never one derived from its zarr format) is one ozp reads. `what`
+    names the group in the message. RFC 8 groups (version ``"0.x"``) are not checked
+    here: their readers dispatch on the node ``type`` before any NGFF reader runs."""
+    if version is not None and str(version) in READ_VERSIONS:
+        return
+    newest = READ_VERSIONS[-1]
+    if version is None:
+        raise UnsupportedNGFFVersion(f"{what}: no NGFF version is declared; ozp reads NGFF "
+                                     f"{READ_VERSIONS} (write the store with a tool that "
+                                     f"records its version)")
+    if version == "0.6":
+        hint = (f"0.6 support is planned; until then read this store with a 0.6-capable "
+                f"tool, or write it as {newest}")
+    else:
+        hint = (f"read this store with a tool that reads NGFF {version}, or write it as "
+                f"{newest}")
+    raise UnsupportedNGFFVersion(f"{what}: NGFF version {version!r}; ozp reads NGFF "
+                                 f"{READ_VERSIONS} ({hint})")
+
+
 def _check_id(value, what: str) -> Optional[str]:
     if value is None:
         return None
@@ -413,13 +447,21 @@ class CollectionNode(_HasContent):
     """A collection: child nodes held in memory (``nodes``) or behind ``path``, opened
     on first access to :attr:`nodes`. Both together are a collection behind a path whose
     children are already open. Child names are unique; ``coll["well A01"]`` looks a
-    child up by name."""
+    child up by name.
+
+    ``kind`` says what the collection groups (``"plate"``, ``"well"``, ``"field"``,
+    ``"series"``; ``None`` for a generic collection) and ``index`` its value of that
+    index (well ``w``, series ``i``), when it was built from an image index. They are
+    not written to RFC 8 JSON."""
 
     TYPE = "collection"
 
     def __init__(self, name: str, nodes: Optional[List[Node]] = None, *,
-                 path: Optional[NodePath] = None, **kwargs):
+                 path: Optional[NodePath] = None, kind: Optional[str] = None,
+                 index: Optional[int] = None, **kwargs):
         super().__init__(name, path=path, **kwargs)
+        self.kind = kind
+        self.index = index
         self._nodes: Optional[List[Node]] = None
         if nodes is not None or path is None:
             self._nodes = []

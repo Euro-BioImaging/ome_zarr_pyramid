@@ -1,5 +1,5 @@
 """The bioformats2raw series layout: read as a collection of its series (keyed like
-micro-reader's scenes, each opened on first use) and written again with the same root
+micro-reader's series, each opened on first use) and written again with the same root
 metadata, OME group and OME-XML; any collection can be written in the layout."""
 import os
 
@@ -66,8 +66,8 @@ def _validate(path):
 def test_a_layout_round_trips(tmp_path, version):
     src, data = _layout(tmp_path, version, extra={"lab:run": 7})
     coll = PyramidCollection.from_zarr(src)
-    assert list(coll) == [(("scene", 0),), (("scene", 1),)] and _opened(coll) == []
-    np.testing.assert_array_equal(np.asarray(coll[{"scene": 1}].layers["0"]), data[1])
+    assert list(coll) == [(("series", 0),), (("series", 1),)] and _opened(coll) == []
+    np.testing.assert_array_equal(np.asarray(coll[{"series": 1}].layers["0"]), data[1])
     assert _opened(coll) == ["1"]
     out = str(tmp_path / "copy.ome.zarr")
     assert sorted(coll.write_series(out)) == ["0", "1"]
@@ -91,7 +91,11 @@ def test_without_an_ome_group_the_series_are_the_consecutive_integers(tmp_path):
     assert [n.name for n in coll.tree] == ["0", "1"]
     out = str(tmp_path / "out.zarr")
     coll.write_series(out)
-    assert not os.path.exists(os.path.join(out, "OME"))             # none in, none out
+    # none in: ozp writes the OME group with a minimal OME-XML, one Image per series
+    assert zarr.open_group(os.path.join(out, "OME"), mode="r").attrs.asdict() == {
+        "ome": {"version": "0.5", "series": ["0", "1"]}}
+    with open(os.path.join(out, "OME", "METADATA.ome.xml"), encoding="utf-8") as f:
+        assert f.read().count("<Image ") == 2
 
 
 def test_problems_are_named(tmp_path):
@@ -106,19 +110,20 @@ def test_problems_are_named(tmp_path):
 
 def test_any_collection_is_written_as_series_in_either_version(tmp_path):
     from test_collection import FakeImage
-    images = [FakeImage(np.full((2, 8, 8), v, "u2"), "cyx", index={"scene": v}) for v in (0, 1, 2)]
+    images = [FakeImage(np.full((2, 8, 8), v, "u2"), "cyx", index={"series": v}) for v in (0, 1, 2)]
     coll = PyramidCollection.from_file(type("F", (), {"images": images, "path": None, "plates": []})(),
                                        version="0.4")
     out = str(tmp_path / "out.zarr")
-    coll.write_series(out, version="0.5", ome_xml=XML)
+    xml3 = XML.replace('</OME>', '<Image ID="Image:2" Name="third"/></OME>')
+    coll.write_series(out, version="0.5", ome_xml=xml3)          # one Image per series
     root = zarr.open_group(out, mode="r")
     assert root.metadata.zarr_format == 3
     assert root.attrs.asdict() == {"ome": {"version": "0.5", "bioformats2raw.layout": 3}}
     assert zarr.open_group(os.path.join(out, "OME"), mode="r").attrs.asdict() == {
         "ome": {"version": "0.5", "series": ["0", "1", "2"]}}
     back = PyramidCollection.from_zarr(out)
-    assert len(back) == 3 and back[{"scene": 2}].meta.version == "0.5"
-    np.testing.assert_array_equal(np.asarray(back[{"scene": 2}].layers["0"]), np.full((2, 8, 8), 2))
+    assert len(back) == 3 and back[{"series": 2}].meta.version == "0.5"
+    np.testing.assert_array_equal(np.asarray(back[{"series": 2}].layers["0"]), np.full((2, 8, 8), 2))
     _validate(out)
 
 

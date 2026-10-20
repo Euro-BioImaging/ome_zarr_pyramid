@@ -114,17 +114,17 @@ def test_collections_inline_behind_json_and_zarr_read_lazily(tmp_path):
                    "path": {"type": "json", "path": "./sub/child.json"},
                    "attributes": {"ex:a": 1, "ex:b": 2}}]}})
     coll = PyramidCollection.from_zarr(parent)
-    assert [dict(k)["scene"] for k in coll] == [0, 1] and _opened(coll) == []
+    assert [dict(k)["series"] for k in coll] == [0, 1] and _opened(coll) == []
     sub = coll.tree["sub-collection"]
     assert sub.attributes == {"ex:a": 1, "ex:b": 2, "ex:c": 3}      # the parent's win
     assert sub["b"].attributes["ngio:source"]["ref"]["id"] == "a"   # kept as written
-    _assert_data(coll[{"scene": 0}])
-    _assert_data(coll[{"scene": 1}])
+    _assert_data(coll[{"series": 0}])
+    _assert_data(coll[{"series": 1}])
     # the same collection in a zarr group's zarr.json
     g = zarr.open_group(str(tmp_path / "group.zarr"), mode="w", zarr_format=3)
     g.attrs["ome"] = {"version": "0.x", "type": "collection", "name": "in a group", "nodes": [
         {"type": "multiscale", "name": "a", "path": {"type": "zarr", "path": "../images/a.zarr"}}]}
-    _assert_data(PyramidCollection.from_zarr(str(tmp_path / "group.zarr"))[{"scene": 0}])
+    _assert_data(PyramidCollection.from_zarr(str(tmp_path / "group.zarr"))[{"series": 0}])
 
 
 def test_the_rfc_hcs_examples_read_as_plates(tmp_path):
@@ -215,17 +215,17 @@ def test_series_and_any_collection_are_written_as_rfc8(tmp_path):
     back = PyramidCollection.from_zarr(out)
     assert list(back) == list(series)
     for i, expected in enumerate(data):
-        np.testing.assert_array_equal(np.asarray(back[{"scene": i}].layers["0"]), expected)
-        assert back[{"scene": i}].meta.version == "0.5"
+        np.testing.assert_array_equal(np.asarray(back[{"series": i}].layers["0"]), expected)
+        assert back[{"series": i}].meta.version == "0.5"
     # a collection with no tree: a flat collection of its images
     from test_collection import FakeImage
-    images = [FakeImage(np.full((2, 8, 8), v, "u2"), "cyx", index={"scene": v}) for v in (0, 1)]
+    images = [FakeImage(np.full((2, 8, 8), v, "u2"), "cyx", index={"series": v}) for v in (0, 1)]
     plain = PyramidCollection.from_file(type("F", (), {"images": images, "path": None,
                                                        "plates": []})(), version="0.4")
     out2 = str(tmp_path / "plain.zarr")
     plain.write_collection(out2)
     again = PyramidCollection.from_zarr(out2)
-    np.testing.assert_array_equal(np.asarray(again[{"scene": 1}].layers["0"]), np.full((2, 8, 8), 1))
+    np.testing.assert_array_equal(np.asarray(again[{"series": 1}].layers["0"]), np.full((2, 8, 8), 1))
 
 
 def test_write_collection_refuses(tmp_path):

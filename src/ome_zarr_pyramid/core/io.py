@@ -28,7 +28,7 @@ import zarr
 
 from ome_zarr_pyramid.core import tensorstore_writer
 from ome_zarr_pyramid.core._compat import downscale_processes, renamed
-from ome_zarr_pyramid.core.pyramid import Pyramid
+from ome_zarr_pyramid.core.pyramid import Pyramid, level_translation
 from ome_zarr_pyramid.utils.array_utils import get_array_chunks, get_chunk_shape
 from ome_zarr_pyramid.utils.logging_config import get_logger
 from ome_zarr_pyramid.utils.optional_deps import is_dask_array, is_installed, require
@@ -264,9 +264,10 @@ def _plan_level_factors(plan: dict, full, base_shape, dmethod: str):
     return factors, targets
 
 
-def _full_pyramid(pyramid, full, arrays, rechunked):
-    """The full pyramid over `arrays` (one per level of `full`), carrying the source
-    `pyramid`'s metadata: what a plan-expanded write saves on the group."""
+def _full_pyramid(pyramid, full, arrays, rechunked, method):
+    """The full pyramid over `arrays` (one per level of `full`, built from level 0 with
+    downscale `method`), carrying the source `pyramid`'s metadata: what a plan-expanded
+    write saves on the group."""
     import copy as _copy
     fpaths = full.meta.resolution_paths
     unit_clean = [u for u in full.meta.unit_list if u is not None]
@@ -280,12 +281,15 @@ def _full_pyramid(pyramid, full, arrays, rechunked):
     full_dask._storage_chunks = getattr(pyramid, '_storage_chunks', None)
     full_dask = rechunked(full_dask)
     # from_arrays carries scales only: put the source's physical origin (its base
-    # translation) on every level, or a written pyramid loses its position
+    # translation) plus each level's alignment under `method` on every level, or a
+    # written pyramid loses its position
     base_translation = (pyramid.meta.get_base_translation()
                         if pyramid.meta is not None else None)
     if base_translation is not None and full_dask.meta is not None:
+        base_scale = full.meta.get_scale(fpaths[0])
         for p in fpaths:
-            full_dask.meta.update_translation(p, base_translation)
+            full_dask.meta.update_translation(p, level_translation(
+                base_translation, base_scale, full.meta.get_scale(p), method))
     # `full_dask` was rebuilt via from_arrays (axes/scales/units/name only), so overlay the
     # SOURCE pyramid's non-dataset metadata (omero channels/colours/windows and any custom
     # top-level attrs). Without this, writing the extra levels re-saves the group attrs and
@@ -562,23 +566,27 @@ def _data_window_limits(pyramid) -> tuple:
 _UPDATE_WINDOW_MODES = ("keep", "dtype", "data", "auto", "none")
 
 
-def _write_ome_xml(path, xml: str, series, zarr_format: int,
+def _write_ome_xml(path, xml: str, series, version: str,
                    storage_options: Optional[dict] = None) -> None:
     """``<path>/OME/METADATA.ome.xml`` and its ``OME`` group, as bioformats2raw lays
-    them out (and eubi-bridge wrote them): the group's attributes list *series*
-    (default ``["0"]``; 0.4: ``series``, 0.5: ``ome.series``). Written through the zarr
-    store of the output, so local and object-store outputs are written alike."""
+    them out (and eubi-bridge wrote them), in the output's NGFF `version`: the group's
+    attributes list *series* (default ``["0"]``; 0.4: ``series``, later versions:
+    ``ome.series`` beside ``ome.version``). Written through the zarr store of the
+    output, so local and object-store outputs are written alike."""
+    from ome_zarr_pyramid.core.ngff_plate import zarr_format_of
     from ome_zarr_pyramid.core.pyramid import _run_coroutine
     from zarr.core.buffer import default_buffer_prototype
     if not isinstance(xml, str) or not xml.strip():
         raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
+    version = str(version)
+    zarr_format = zarr_format_of(version)          # raises for a version ozp does not write
     series = [str(s) for s in (series if series is not None else [0])]
     root = _open_store_group(path, zarr_format, mode="a", storage_options=storage_options)
     ome = root.require_group("OME")
-    if int(zarr_format) == 2:
+    if version == "0.4":
         ome.attrs["series"] = series
     else:
-        ome.attrs["ome"] = {"version": "0.5", "series": series}
+        ome.attrs["ome"] = {"version": version, "series": series}
     store_path = ome.store_path
     key = f"{store_path.path}/METADATA.ome.xml" if store_path.path else "METADATA.ome.xml"
     root = getattr(store_path.store, "root", None)
@@ -608,6 +616,55 @@ def _open_store_group(path, zarr_format: int, mode: str = "a",
     else:
         store = str(path)
     return zarr.open_group(store, mode=mode, zarr_format=zarr_format)
+
+
+def _existing_group_version(path, storage_options: Optional[dict] = None) -> Optional[str]:
+    """The NGFF version a label written into the existing group at `path` must take, or
+    None when no group is there. A zarr v2 group is 0.4 (ozp writes v2 only as 0.4); a
+    v3 group is its ``ome.version``, 0.5 when it records none. A v3 group declaring
+    another version (0.6) raises :class:`UnsupportedNGFFVersion`: ozp writes 0.4 / 0.5."""
+    if _is_remote_store(path):
+        try:
+            group = _object_store_group(str(path), None, "r", storage_options)
+        except FileNotFoundError:
+            return None
+        zarr_format, attrs = group.metadata.zarr_format, dict(group.attrs)
+    else:
+        p = Path(path)
+        if (p / "zarr.json").is_file():            # zarr-python reads v3 first too
+            zarr_format = 3
+            attrs = zarr.open_group(str(p), mode="r", zarr_format=3).attrs
+        elif (p / ".zgroup").is_file():
+            zarr_format, attrs = 2, {}
+        else:
+            return None
+    if zarr_format == 2:
+        return "0.4"
+    version = str(dict(attrs.get("ome") or {}).get("version", "0.5"))
+    if version != "0.5":
+        from ome_zarr_pyramid.core.nodes import UnsupportedNGFFVersion
+        raise UnsupportedNGFFVersion(
+            f"{path}: an NGFF {version} group; ozp writes labels into NGFF 0.4 / 0.5 "
+            f"stores only (write the label to a store of its own, or convert the image "
+            f"to version='0.5' first)")
+    return version
+
+
+def _labels_target_version(labels_group_path, storage_options: Optional[dict] = None
+                           ) -> Optional[str]:
+    """The NGFF version of the store a label goes into through ``labels_group_path``: the
+    labels group's own, or, before that group exists, its image's (the parent group).
+    None when neither exists (a new store: the label keeps its own version)."""
+    version = _existing_group_version(labels_group_path, storage_options)
+    if version is None:
+        if _is_remote_store(labels_group_path):
+            parent = str(labels_group_path).rstrip("/").rpartition("/")[0]
+            if parent.endswith(":/"):                # the labels group is a bucket root
+                return None
+        else:
+            parent = Path(labels_group_path).parent
+        version = _existing_group_version(parent, storage_options)
+    return version
 
 
 def _iter_region_slices(shape, region_shape):
@@ -704,6 +761,12 @@ class PyramidIO:
         -------
         Pyramid
             Loaded pyramid with metadata and arrays
+
+        Raises
+        ------
+        UnsupportedNGFFVersion
+            The store declares an NGFF version ozp does not read (0.6, say); raised
+            from its attributes, before any array or label is opened.
         """
         remote = _is_remote_store(path) and not _is_legacy_https(path)
         if not remote:
@@ -762,20 +825,27 @@ class PyramidIO:
 
     def _discover_labels(self, pyramid: Pyramid, path: Path) -> None:
         """Populate ``pyramid._labels`` from the image's NGFF ``labels/`` group, if
-        present. Best-effort and lazy: failures leave the collection empty."""
+        present. Lazy and best-effort, never silent: a ``labels/`` group that cannot be
+        read, or a label that cannot be opened (one declaring an NGFF version ozp does
+        not read, 0.6, among them), is left out with a ``UserWarning`` naming it and
+        why; the image itself still opens."""
         labels_dir = Path(path) / "labels"
         if not labels_dir.exists():
             return
         try:
             grp = zarr.open_group(str(labels_dir), mode="r")
             names = _read_label_names(grp)
-        except Exception:
+        except Exception as exc:
+            warnings.warn(f"the labels of {path} are left out: {type(exc).__name__} "
+                          f"reading {labels_dir}: {exc}", UserWarning, stacklevel=3)
             return
         for nm in names:
             try:
                 pyramid._labels[nm] = self.read_labels(labels_dir / nm)
-            except Exception:
-                continue
+            except Exception as exc:
+                warnings.warn(f"label {nm!r} of {path} is left out: {type(exc).__name__} "
+                              f"reading {labels_dir / nm}: {exc}", UserWarning,
+                              stacklevel=3)
 
     def write_pyramid(self,
                       pyramid: Pyramid,
@@ -832,8 +902,10 @@ class PyramidIO:
         ``pyramid.meta.is_label`` (it carries an ``image-label`` block) and its
         metadata is attached automatically; pass ``labels_group_path`` + ``label_name``
         to also register it under a parent ``labels/`` group (the NGFF convention).
-        An IMAGE pyramid's attached `labels` (from ``add_image_label``) are written
-        recursively into ``<path>/labels/<name>``.
+        A label written into an existing store that way takes that store's NGFF
+        version (the labels group's, or its image's). An IMAGE pyramid's attached
+        `labels` (from ``add_image_label``) are written recursively into
+        ``<path>/labels/<name>``, in the image's version.
 
         Storage chunking (decoupled from any PROCESSING tile size an op imposed):
         ``chunk_shape`` (a per-axis tuple, or a ``{level: tuple}`` dict) is used as
@@ -982,12 +1054,26 @@ class PyramidIO:
         if not _is_remote_store(path):
             path = Path(path) if isinstance(path, str) else path
 
+        # a label written into an existing store (labels_group_path) takes that store's
+        # NGFF version, as add_image_label does: v2 and v3 groups do not nest, so a v3
+        # label under a v2 labels/ group (or the reverse) is invisible to readers, and a
+        # second labels/ group of the other format hides the labels already there.
+        if layers is None and labels_group_path is not None:
+            target = _labels_target_version(labels_group_path, storage_options)
+            if target is not None and target != str(pyramid.meta.version):
+                pyramid = pyramid.to_version(target)
+
         # capture any attached labels NOW (top-level image write only): the storage
         # rechunk below rebinds `pyramid` to a clone that does not carry `_labels`.
         # They are written into `<path>/labels/<name>` after the image (see
         # `_write_attached_labels`). `layers is not None` = an internal sub-write.
         write_lbls = layers is None and include_labels and bool(getattr(pyramid, '_labels', None))
         attached_labels = dict(getattr(pyramid, '_labels', {})) if write_lbls else {}
+        # a label is written in its image's NGFF version: zarr v2 and v3 groups do not
+        # nest, so a v3 label under a v2 image (or the reverse) is invisible to readers.
+        attached_labels = {nm: (lbl if str(lbl.meta.version) == str(pyramid.meta.version)
+                                else lbl.to_version(str(pyramid.meta.version)))
+                           for nm, lbl in attached_labels.items()}
 
         # LABEL image? detect via meta.is_label and capture its image-label block now
         # (so it survives the rechunk rebind below); attached after the arrays. Register
@@ -1141,7 +1227,7 @@ class PyramidIO:
         pyramid.meta.save_changes()
         if ome_xml is not None:
             xml = ome_xml(pyramid) if callable(ome_xml) else ome_xml
-            _write_ome_xml(path, xml, ome_series, zarr_format, storage_options)
+            _write_ome_xml(path, xml, ome_series, pyramid.meta.version, storage_options)
         return pyramid
 
     def _write_measuring_windows(self, pyramid, path, **kwargs) -> None:
@@ -1295,7 +1381,7 @@ class PyramidIO:
                                         compressor_params=compressor_params,
                                         storage_options=storage_options)
         if ome_xml is not None:
-            _write_ome_xml(path, ome_xml, ome_series, label_zarr_format, storage_options)
+            _write_ome_xml(path, ome_xml, ome_series, label_version, storage_options)
 
     def _write_attached_labels(self, labels: dict, path, *, overwrite: bool,
                                backend: str = 'auto', compressor=None,
@@ -1363,7 +1449,7 @@ class PyramidIO:
             return lvl if hasattr(lvl, '_with_transform') else DynamicArray(lvl)
 
         arrays = [base_arr] + [lazy_level(base_arr, f) for f in factors[1:]]
-        built = _full_pyramid(pyramid, full, arrays, rechunked)
+        built = _full_pyramid(pyramid, full, arrays, rechunked, dmethod)
 
         remote = _is_remote_store(path)
         path = str(path) if remote else Path(path)
@@ -1560,7 +1646,7 @@ class PyramidIO:
 
         def _build(arrays):
             """The full pyramid over `arrays`, carrying the source's metadata."""
-            return _full_pyramid(pyramid, full, arrays, _rechunked)
+            return _full_pyramid(pyramid, full, arrays, _rechunked, dmethod)
 
         level_kwargs = dict(write_kwargs)
         if level_kwargs.get('compressor') is None and pyramid.compressor is not None:
@@ -1631,7 +1717,10 @@ class PyramidIO:
             ``write_labels(label_pyr, path)`` just works. An explicit dict overrides it.
         labels_group_path : str or Path, optional
             Path to the parent `labels` group to register the label in. If given
-            with `label_name`, that group is created/updated with the name.
+            with `label_name`, that group is created/updated with the name. When that
+            group, or the image holding it, already exists, the label is written in
+            that store's NGFF version (`Pyramid.to_version`), whatever its own: a 0.5
+            label from ``from_label_arrays()`` goes into a 0.4 image as 0.4 (zarr v2).
         label_name : str, optional
             Name to register in the parent `labels` group.
         overwrite : bool
