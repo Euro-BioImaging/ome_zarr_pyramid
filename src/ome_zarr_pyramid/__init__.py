@@ -11,12 +11,12 @@ downscaling) are the public surface::
 ``io`` is one shared :class:`~ome_zarr_pyramid.core.io.IO`; ``IO()`` still works.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "Bugra Oezdemir"
 
 from ome_zarr_pyramid.core.io import IO
 from ome_zarr_pyramid.core.pyramid import Pyramid
-from ome_zarr_pyramid.core.collection import PyramidCollection
+from ome_zarr_pyramid.core.collection import PositionUnitError, PyramidCollection
 from ome_zarr_pyramid.core.concatenate import concatenate
 
 #: The package's reader/writer, shared by everyone in this process. It holds no state:
@@ -24,4 +24,4 @@ from ome_zarr_pyramid.core.concatenate import concatenate
 #: anything stored here would apply to every thread and library in the process.
 io = IO()
 
-__all__ = ["Pyramid", "PyramidCollection", "concatenate", "IO", "io"]
+__all__ = ["Pyramid", "PyramidCollection", "concatenate", "IO", "io", "PositionUnitError"]

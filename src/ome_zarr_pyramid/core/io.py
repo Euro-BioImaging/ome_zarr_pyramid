@@ -28,7 +28,7 @@ import zarr
 
 from ome_zarr_pyramid.core import tensorstore_writer
 from ome_zarr_pyramid.core._compat import downscale_processes, renamed
-from ome_zarr_pyramid.core.pyramid import Pyramid
+from ome_zarr_pyramid.core.pyramid import Pyramid, level_translation
 from ome_zarr_pyramid.utils.array_utils import get_array_chunks, get_chunk_shape
 from ome_zarr_pyramid.utils.logging_config import get_logger
 from ome_zarr_pyramid.utils.optional_deps import is_dask_array, is_installed, require
@@ -264,9 +264,10 @@ def _plan_level_factors(plan: dict, full, base_shape, dmethod: str):
     return factors, targets
 
 
-def _full_pyramid(pyramid, full, arrays, rechunked):
-    """The full pyramid over `arrays` (one per level of `full`), carrying the source
-    `pyramid`'s metadata: what a plan-expanded write saves on the group."""
+def _full_pyramid(pyramid, full, arrays, rechunked, method):
+    """The full pyramid over `arrays` (one per level of `full`, built from level 0 with
+    downscale `method`), carrying the source `pyramid`'s metadata: what a plan-expanded
+    write saves on the group."""
     import copy as _copy
     fpaths = full.meta.resolution_paths
     unit_clean = [u for u in full.meta.unit_list if u is not None]
@@ -280,12 +281,15 @@ def _full_pyramid(pyramid, full, arrays, rechunked):
     full_dask._storage_chunks = getattr(pyramid, '_storage_chunks', None)
     full_dask = rechunked(full_dask)
     # from_arrays carries scales only: put the source's physical origin (its base
-    # translation) on every level, or a written pyramid loses its position
+    # translation) plus each level's alignment under `method` on every level, or a
+    # written pyramid loses its position
     base_translation = (pyramid.meta.get_base_translation()
                         if pyramid.meta is not None else None)
     if base_translation is not None and full_dask.meta is not None:
+        base_scale = full.meta.get_scale(fpaths[0])
         for p in fpaths:
-            full_dask.meta.update_translation(p, base_translation)
+            full_dask.meta.update_translation(p, level_translation(
+                base_translation, base_scale, full.meta.get_scale(p), method))
     # `full_dask` was rebuilt via from_arrays (axes/scales/units/name only), so overlay the
     # SOURCE pyramid's non-dataset metadata (omero channels/colours/windows and any custom
     # top-level attrs). Without this, writing the extra levels re-saves the group attrs and
@@ -1303,7 +1307,7 @@ class PyramidIO:
             return lvl if hasattr(lvl, '_with_transform') else DynamicArray(lvl)
 
         arrays = [base_arr] + [lazy_level(base_arr, f) for f in factors[1:]]
-        built = _full_pyramid(pyramid, full, arrays, rechunked)
+        built = _full_pyramid(pyramid, full, arrays, rechunked, dmethod)
 
         remote = _is_remote_store(path)
         path = str(path) if remote else Path(path)
@@ -1500,7 +1504,7 @@ class PyramidIO:
 
         def _build(arrays):
             """The full pyramid over `arrays`, carrying the source's metadata."""
-            return _full_pyramid(pyramid, full, arrays, _rechunked)
+            return _full_pyramid(pyramid, full, arrays, _rechunked, dmethod)
 
         level_kwargs = dict(write_kwargs)
         if level_kwargs.get('compressor') is None and pyramid.compressor is not None:

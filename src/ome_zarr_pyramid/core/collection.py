@@ -60,6 +60,28 @@ def _quantity(q, unit: Optional[str] = None) -> Optional[Tuple[float, str]]:
     return float(q.value), str(q.unit)
 
 
+class PositionUnitError(ValueError):
+    """An image's stage position along an axis is in a unit ozp cannot convert to that
+    axis's unit, so it cannot become the axis's translation."""
+
+
+def _position(q, unit: Optional[str], *, image: str, axis: str) -> float:
+    """A position quantity's value in `unit`, the axis's own unit. Unlike `_quantity`,
+    a failed conversion raises: a position that silently became 0 would move the image."""
+    if unit is None or getattr(q, "unit", unit) == unit:
+        return float(q.value)
+    exc = None
+    if hasattr(q, "to"):
+        try:
+            return float(q.to(unit).value)
+        except Exception as err:                             # noqa: BLE001
+            exc = err
+    raise PositionUnitError(
+        f"image {image!r}: the position along axis {axis!r} is in {str(q.unit)!r}, which "
+        f"cannot be converted to the axis unit {unit!r}. Give the position in a length "
+        f"unit convertible to {unit!r}, or clear image.metadata.position.") from exc
+
+
 def _hex(color) -> Optional[str]:
     if not color:
         return None
@@ -81,7 +103,10 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     - Scale and units: from ``metadata.pixel_sizes``. A missing z or y size takes x's
       value and unit; any other axis without one keeps ome_zarr_pyramid's default
       (1.0, micrometer / second; none for ``c``).
-    - Translation: ``metadata.position`` in each axis's own scale unit, on every level.
+    - Translation: ``metadata.position`` in each axis's own scale unit, on every level
+      (the stored levels are the image's own, so they share level 0's origin), written
+      whenever the image has a position, (0, 0) included. A position along an axis in a
+      unit that cannot be converted to the axis's unit raises ``PositionUnitError``.
     - Channels: name and colour into omero. A channel the image describes without a
       name is ``Channel {i}`` (counted from 0), without a colour white (OME's default
       colour); colours are generated only when the image says nothing about its
@@ -150,14 +175,15 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
 
     position = dict(getattr(meta, "position", None) or {})
     if position:
+        # written whenever the image has a position, (0, 0) included; an axis the
+        # position does not name, and t / c, stay 0. Stored levels are the image's own
+        # (a vendor pyramid): they keep level 0's translation (alignment 0).
         unit_of = dict(zip(axes, units))
-        translation = []
-        for ax in axes:
-            q = _quantity(position.get(ax), unit_of.get(ax)) if ax in "zyx" else None
-            translation.append(q[0] if q is not None else 0.0)
-        if any(translation):
-            for path in pyr.meta.resolution_paths:
-                pyr.meta.update_translation(path, translation)
+        translation = [_position(position[ax], unit_of.get(ax), image=label, axis=ax)
+                       if ax in "zyx" and position.get(ax) is not None else 0.0
+                       for ax in axes]
+        for path in pyr.meta.resolution_paths:
+            pyr.meta.update_translation(path, translation)
 
     channels = list(getattr(meta, "channels", None) or [])
     n_channels = base_shape[axes.index("c")] if "c" in axes else 1

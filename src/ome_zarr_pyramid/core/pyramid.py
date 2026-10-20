@@ -203,6 +203,40 @@ def calculate_n_layers(shape: Tuple[int, ...],
     return max(1, n_layers)
 
 
+#: downscale methods that keep one pixel per window (a stride): a level's first pixel
+#: centre is level 0's, so its translation is level 0's. Every other method reduces a
+#: window, whose centre lies (F - 1) / 2 level-0 pixels in.
+STRIDE_METHODS = ('simple',)
+
+
+def level_translation(base_translation: Iterable[float], base_scale: Iterable[float],
+                      level_scale: Iterable[float], method: str) -> List[float]:
+    """The translation of a level ozp builds from level 0 with `method`.
+
+    A level's translation is the position (level 0's translation) plus the level's
+    alignment: 0 for a stride method ('simple'), and for a window method (mean, median,
+    min, max, mode) the window centre, ``(F - 1) / 2`` level-0 pixels =
+    ``(level_scale - base_scale) / 2`` in physical units per axis (0 on axes that are
+    not downscaled, such as t and c). Levels read from a file keep what they store; this
+    is only for levels ozp makes.
+    """
+    from ome_zarr_pyramid.utils.scale import DOWNSCALE_METHODS
+    if method not in DOWNSCALE_METHODS:
+        raise ValueError(f"downscale_method must be one of {DOWNSCALE_METHODS}, "
+                         f"got {method!r}")
+    base_translation, base_scale, level_scale = (
+        [float(v) for v in vec] for vec in (base_translation, base_scale, level_scale))
+    if not len(base_translation) == len(base_scale) == len(level_scale):
+        raise ValueError(
+            f"translation {base_translation}, base scale {base_scale} and level scale "
+            f"{level_scale} must have one entry per axis")
+    if method in STRIDE_METHODS:
+        out = base_translation
+    else:
+        out = [t + (s - s0) / 2 for t, s0, s in zip(base_translation, base_scale, level_scale)]
+    return [v if v != 0 else 0.0 for v in out]         # no -0.0 in the metadata
+
+
 # Standard colour names -> OME hex ('RRGGBB', no '#'). CSS basic set plus the
 # channel colours common in microscopy. Used by `Pyramid.set_channels`.
 _COLOR_NAMES = {
@@ -1625,15 +1659,23 @@ class Pyramid:
             for k, v in src_ms.items():
                 if k not in ('datasets', 'axes'):
                     new_ms[k] = copy.deepcopy(v)
-            # the base level's translation (the physical origin) on every level, as the
-            # deferred write path and eubi-bridge write it
+            # each level's translation: the base level's (the physical origin) plus the
+            # level's alignment under the downscale method (level_translation), as the
+            # deferred write path writes it. No base translation: none on any level.
             base_ct = src_ms['datasets'][0].get('coordinateTransformations', [])
             trans = [t for t in base_ct if t.get('type') == 'translation']
             if trans:
-                for ds in new_ms['datasets']:
+                method = getattr(self.downscaler, 'downscale_method', 'simple')
+                paths = new_pyr.meta.resolution_paths
+                base_scale = new_pyr.meta.get_scale(paths[0])
+                for path, ds in zip(paths, new_ms['datasets']):
                     cts = [t for t in ds.setdefault('coordinateTransformations', [])
                            if t.get('type') != 'translation']
-                    ds['coordinateTransformations'] = cts + copy.deepcopy(trans)
+                    entry = copy.deepcopy(trans[0])
+                    entry['translation'] = level_translation(
+                        trans[0]['translation'], base_scale, new_pyr.meta.get_scale(path),
+                        method)
+                    ds['coordinateTransformations'] = cts + [entry]
             new_pyr.meta._pending_changes = True
         return new_pyr
 
