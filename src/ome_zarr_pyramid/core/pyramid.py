@@ -737,6 +737,12 @@ class NGFFMetadataHandler:
             if name in attrs:
                 del attrs[name]
         self._removed_custom = set()
+        for ms in meta_dict.get('multiscales') or []:
+            # NGFF: a multiscale SHOULD name its downscaling `type` (the strict schemas
+            # require it): the method ozp made the levels with, the one read with the
+            # image, else "unknown" (levels given as they are, a single level)
+            if isinstance(ms, dict) and not ms.get('type'):
+                ms['type'] = 'unknown'
         if meta_dict.get('version', '') == '0.5':
             metadata_dict = cast_to_dict(make_json_safe(self.metadata))
             # the NGFF keys under `ome`, custom blocks beside it (the spec's placement)
@@ -1708,6 +1714,10 @@ class Pyramid:
                         trans[0]['translation'], base_scale, new_pyr.meta.get_scale(path),
                         method)
                     ds['coordinateTransformations'] = cts + [entry]
+            if len(new_ms.get('datasets') or []) > 1:
+                # the downscale method that made the levels (NGFF: multiscales `type`;
+                # the strict schemas require it)
+                new_ms['type'] = getattr(self.downscaler, 'downscale_method', 'simple')
             new_pyr.meta._pending_changes = True
         return new_pyr
 

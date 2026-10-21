@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.3.0"
+version = "0.3.1"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 # 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
@@ -75,6 +75,9 @@ dev = [
     # tests/test_write_remote.py: an in-process S3 emulator + the remote extra
     "moto[server]>=5",
     "obstore>=0.11",
+    # tests/ngff_validation.py: every written store against the official NGFF schemas
+    "jsonschema>=4.18",
+    "referencing",
 ]
 
 [project.urls]
