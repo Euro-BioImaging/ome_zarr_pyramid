@@ -162,6 +162,25 @@ def test_s3_attached_labels(bucket, data):
     np.testing.assert_array_equal(np.asarray(by_name.layers["0"][...]), lab)
 
 
+def test_s3_write_labels_into_an_existing_04_store(bucket, data):
+    # a label written straight into an existing store takes that store's version (here a
+    # 0.5 label from from_label_arrays() into a 0.4 image: written as 0.4, zarr v2)
+    name, opts = bucket
+    url = f"s3://{name}/img04.zarr"
+    IO().write_pyramid(_pyr(data, "0.4"), url, overwrite=True, storage_options=opts)
+    lab = np.zeros(SHAPE[1:], dtype="uint32")
+    lab[4:12, 8:20, 8:20] = 7
+    IO().write_labels(Pyramid().from_label_arrays([lab], axis_order=AXES[1:]),
+                      f"{url}/labels/seg", labels_group_path=f"{url}/labels",
+                      label_name="seg", storage_options=opts)
+    import obstore
+    from zarr.storage import ObjectStore
+    grp = zarr.open_group(ObjectStore(obstore.store.from_url(f"{url}/labels", **opts)), mode="r")
+    assert grp.metadata.zarr_format == 2 and list(grp.attrs["labels"]) == ["seg"]
+    seg = IO().read_labels(url, name="seg", storage_options=opts)
+    assert seg.meta.version == "0.4" and seg.meta.zarr_format == 2
+    np.testing.assert_array_equal(np.asarray(seg.layers["0"][...]), lab)
+
 def test_s3_dask_pyramid_is_pumped(bucket, data):
     da = pytest.importorskip("dask.array")
     name, opts = bucket
@@ -219,3 +238,64 @@ def test_metadata_is_updated_in_place_remotely(bucket, data, version):
         assert (ch["window"]["start"], ch["window"]["end"]) == (int(data[k].min()),
                                                                 int(data[k].max()))
     np.testing.assert_array_equal(np.asarray(back.layers["0"][...]), data)
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_s3_plate_write_then_open(bucket, tmp_path, version):
+    """A plate written to an object store and opened from it: the wells' metadata comes
+    in one batch of requests, the images on first use."""
+    from ome_zarr_pyramid import PyramidCollection
+    from test_collection_zarr import _plate
+
+    name, opts = bucket
+    src, data = _plate(tmp_path, version)
+    url = f"s3://{name}/screen.zarr"
+    PyramidCollection.from_zarr(src).write_plate(url, storage_options=opts)
+    back = PyramidCollection.from_zarr(url, storage_options=opts)
+    assert [w.name for w in back.plates[0].wells] == ["A2", "B1"]
+    for (w, a), expected in data.items():
+        pyr = back[{"plate": 0, "acquisition": a, "well": w, "field": 0}]
+        np.testing.assert_array_equal(np.asarray(pyr.layers["0"][...]), expected)
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        PyramidCollection.from_zarr(src).write_plate(url, storage_options=opts)
+
+
+@pytest.mark.parametrize("version, ome_group", [("0.4", True), ("0.5", True), ("0.5", False)])
+def test_s3_series_layout_write_then_open(bucket, tmp_path, version, ome_group):
+    """A bioformats2raw layout written to an object store and opened from it: through the
+    OME group's series list, or (without one) by listing the root's integer groups."""
+    from ome_zarr_pyramid import PyramidCollection
+    from test_series import XML, _layout
+
+    name, opts = bucket
+    src, data = _layout(tmp_path, version, series=ome_group)
+    url = f"s3://{name}/file.ome.zarr"
+    PyramidCollection.from_zarr(src).write_series(url, storage_options=opts)
+    back = PyramidCollection.from_zarr(url, storage_options=opts)
+    assert list(back) == [(("series", 0),), (("series", 1),)]
+    for i, expected in enumerate(data):
+        np.testing.assert_array_equal(np.asarray(back[{"series": i}].layers["0"][...]), expected)
+    if ome_group:
+        from ome_zarr_pyramid.core.ngff_series import _source_xml
+        assert _source_xml(back.tree) == XML
+
+
+def test_s3_plate_table_from_metadata_files(bucket, tmp_path):
+    """A plate's table read from an object store: one batch of requests for the images'
+    groups, one for their levels; no image opened; the same rows as the opened pyramids."""
+    from ome_zarr_pyramid import PyramidCollection
+    from ome_zarr_pyramid.core.query import row_from_pyramid
+    from test_collection_zarr import _opened, _plate
+
+    name, opts = bucket
+    src, _ = _plate(tmp_path, "0.5")
+    url = f"s3://{name}/screen.zarr"
+    PyramidCollection.from_zarr(src).write_plate(url, storage_options=opts)
+    coll = PyramidCollection.from_zarr(url, storage_options=opts)
+    table = coll.table
+    assert len(table) == 4 and _opened(coll) == []
+    assert coll.unique("well_name") == ["A2", "B1"]
+    for key, row in zip(coll, table.rows):
+        node = coll._pyramids[key]
+        expected = row_from_pyramid(coll[key], path=node.loader.path_of(node))
+        assert {c: row[c] for c in expected} == expected

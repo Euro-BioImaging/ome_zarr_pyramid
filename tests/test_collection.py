@@ -32,7 +32,7 @@ class FakeImage:
     def __init__(self, data, axes, metadata=None, index=None, levels=(), name="img"):
         self._data, self.axes, self.metadata, self.name = data, axes, metadata, name
         self.shape, self.dtype = data.shape, data.dtype
-        self.index = index or {"scene": 0}
+        self.index = index or {"series": 0}
         self.resolutions = [self] + [FakeImage(lv, axes, metadata, index) for lv in levels]
 
     def __getitem__(self, key):
@@ -67,7 +67,7 @@ def test_from_image_maps_levels_scales_units_position_and_channels():
     assert waves[0] == {"emission_wavelength": {"value": 461.0, "unit": "nanometer"}}
     assert waves[1]["excitation_wavelength"]["unit"] == "nanometer"
     assert waves[1]["excitation_wavelength"]["value"] == pytest.approx(488.0)
-    assert pyr.source_index == {"scene": 0}
+    assert pyr.source_index == {"series": 0}
 
 
 def test_acquisition_is_written_in_the_named_custom_block(tmp_path):
@@ -151,15 +151,15 @@ def test_rgb_samples_are_refused_with_the_way_out():
 
 
 def test_collection_from_file_keys_selects_and_folds_resolutions(tmp_path):
-    images = [_image({"scene": s, "view": v}) for s in (0, 1) for v in (0, 1)]
+    images = [_image({"series": s, "view": v}) for s in (0, 1) for v in (0, 1)]
     # resolutions="all" lists a level as its own image: folded, not a fifth entry
-    level = _image({"scene": 0, "view": 0, "resolution": 1})
+    level = _image({"series": 0, "view": 0, "resolution": 1})
     coll = PyramidCollection.from_file(SimpleNamespace(images=images + [level], path="f.czi"))
-    assert len(coll) == 4 and coll.varying == ("scene", "view")
-    assert coll[{"scene": 1, "view": 0}].source_index == {"scene": 1, "view": 0}
+    assert len(coll) == 4 and coll.varying == ("series", "view")
+    assert coll[{"series": 1, "view": 0}].source_index == {"series": 1, "view": 0}
     assert len(coll.select(view=1)) == 2
-    assert coll.suffix({"scene": 1, "view": 0}) == "_scene1_view0"
-    paths = coll.select(scene=0).write(tmp_path, "f", overwrite=True)
+    assert coll.suffix({"series": 1, "view": 0}) == "_series1_view0"
+    paths = coll.select(series=0).write(tmp_path, "f", overwrite=True)
     assert sorted(os.path.basename(p) for p in paths.values()) == [
         "f_view0.ome.zarr", "f_view1.ome.zarr"]          # only what varies in THIS set
 
@@ -172,7 +172,7 @@ def test_two_images_with_one_index_are_refused():
 def test_with_micro_reader_on_an_ome_tiff(tmp_path):
     mr = pytest.importorskip("micro_reader")
     tifffile = pytest.importorskip("tifffile")
-    path = str(tmp_path / "two_scenes.ome.tif")
+    path = str(tmp_path / "two_series.ome.tif")
     data = np.arange(2 * 3 * 16 * 16, dtype="uint16").reshape(2, 3, 16, 16)
     with tifffile.TiffWriter(path, ome=True) as tw:
         for s in range(2):
@@ -181,10 +181,10 @@ def test_with_micro_reader_on_an_ome_tiff(tmp_path):
                                              "Channel": {"Name": ["a", "b", "c"]}})
     coll = PyramidCollection.from_file(mr.open(path, samples="channels"))
     assert len(coll) == 2
-    pyr = coll[{"scene": 1}]
+    pyr = coll[{"series": 1}]
     assert pyr.meta.get_scale("0")[-2:] == [0.25, 0.25]
     assert [c["label"] for c in pyr.meta.metadata["omero"]["channels"]] == ["a", "b", "c"]
-    out = str(tmp_path / "scene1.ome.zarr")
+    out = str(tmp_path / "series1.ome.zarr")
     IO().write_pyramid(pyr, out, overwrite=True)
     np.testing.assert_array_equal(np.asarray(IO().read_pyramid(out).layers["0"][...]),
                                   data[1] + 1)

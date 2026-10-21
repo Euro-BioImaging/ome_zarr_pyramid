@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.2.0"
+version = "0.3.0"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 # 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
@@ -51,7 +51,8 @@ dependencies = [
     # 0.0.7: numpy + TensorStore wrapping, ufuncs, stack, tuple-axis reductions.
     # 0.0.9: the write engine - io.write(dimension_names=), io.create_sink (the dask
     # pump), TensorStore sources keeping their chunks / codecs / shards.
-    "dyna-zarr>=0.1.0",
+    # bounded at the next minor (release policy rule 2): a dyna-zarr 0.2 may break ozp
+    "dyna-zarr>=0.1.0,<0.2",
 ]
 
 [project.optional-dependencies]

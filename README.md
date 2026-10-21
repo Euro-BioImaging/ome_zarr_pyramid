@@ -18,6 +18,9 @@ large-scale volumes with the same code.
   base (e.g. a segmentation) is computed a single time, not once per level.
 - **Elementwise algebra.** `Pyramid` objects support arithmetic, comparison and
   bitwise operators across every level at once (`img > 128`, `a * b`, `~mask`).
+- **Collections.** Plates, wells, a file's series and other groups of images are one
+  `PyramidCollection`: read from OME-Zarr or from a microscopy file, written as an NGFF
+  plate, a bioformats2raw layout or an NGFF RFC 8 collection.
 
 ## Install
 
@@ -171,6 +174,14 @@ Methods:
 
 They give the same pixels as TensorStore's `downsample`.
 
+Each coarser level is placed where its pixels come from. With `"simple"`, a level's
+first pixel is level 0's first pixel, so every level has level 0's translation. With
+the other methods, a level's first pixel is the average (or median, ...) of a window
+of level-0 pixels, so it sits at the window's centre: the level's translation is level
+0's plus half the difference of the two pixel sizes. For 0.5 µm pixels at (5, 3) µm,
+downscaled twice by 2 with `"mean"`, the levels are at (5, 3), (5.25, 3.25) and
+(5.75, 3.75) µm. Levels read from a store keep the translations stored there.
+
 `downscale_backend` chooses where the window methods run. Both produce the same pixels:
 
 ```python
@@ -227,7 +238,7 @@ image_pyr = Pyramid().from_arrays(       # -> Pyramid
     axis_order="cyx",
     unit_list=[None, "micrometer", "micrometer"],
     scales=[[1, 0.325, 0.325]],      # physical pixel size at level 0
-    version="0.4",                    # NGFF version ('0.4' or '0.5')
+    version="0.5",                    # NGFF version: '0.5' (zarr v3, the default) or '0.4'
     name="my_image",
 )
 
@@ -251,7 +262,114 @@ image_pyr = Pyramid.from_image(image)
 ```
 
 For every image of a file at once, `PyramidCollection.from_file(micro_reader.open(...))`
-gives one lazy pyramid per image.
+gives one lazy pyramid per image (see [Collections](#collections-plates-series-and-other-groups-of-images)).
+Each pyramid is keyed by the image's index in the file, as micro-reader gives it:
+
+```python
+coll = PyramidCollection.from_file(micro_reader.open("sample.czi"))
+list(coll)                    # [(('series', 0),), (('series', 1),)]
+pyr = coll[{"series": 1}]
+coll.select(series=0)         # -> PyramidCollection
+coll.write("out", "sample")   # out/sample_series0.ome.zarr, out/sample_series1.ome.zarr
+coll.tree                     # the file as nodes: its plates, and its series
+```
+
+A file's series are numbered by the index `series` (micro-reader 0.1.0 and later).
+`select` with an index name the collection does not have raises a `KeyError` that lists
+the names it has; a known name with a value no image has gives an empty collection.
+Any other object with `images` works too, with whatever index names its images carry.
+
+In `coll.tree`, named after the file (`sample`), a series that holds several images
+(the tiles of a scan, several views) is a collection of its own; a series of one image
+is just that image. A plate's wells hold their fields the same way.
+`coll.write_collection("sample.zarr")` writes this tree as an RFC 8 collection. Read
+back, its images are keyed `("series", 0)`, `("series", 1)`, ... in tree order, tiles
+included: which tile an image was is not kept yet.
+
+## Collections: plates, series and other groups of images
+
+A `PyramidCollection` holds many pyramids: the wells and fields of a plate, the series
+of a file, or any other group of images. Opening one reads its metadata only; each
+image is opened when you use it.
+
+```python
+from ome_zarr_pyramid import PyramidCollection
+
+plate_coll = PyramidCollection.from_zarr("plate.ome.zarr")   # an NGFF plate; no image read yet
+plate = plate_coll.plates[0]
+plate.rows, plate.columns                     # ('A', 'B', ...), ('1', '2', ...)
+well = plate.wells[plate.well_index("B3")]    # Well(row=1, column=2, name='B3')
+pyr = well.fields[0].image                    # -> Pyramid, opened now
+```
+
+Plates are navigated as in micro-reader: rows and columns count from 0,
+`plate.wells[w]` is the well with index `"well": w`, and `well.fields[f]` its f-th field.
+When a field has one image per acquisition, pick one first:
+`well.fields[0].select(acquisition=1).image`.
+
+Every image also has a flat key, the same one micro-reader gives a plate image:
+
+```python
+list(plate_coll)[0]          # (('plate', 0), ('acquisition', 0), ('well', 0), ('field', 0))
+pyr = plate_coll[{"plate": 0, "acquisition": 0, "well": 3, "field": 0}]
+second_run = plate_coll.select(acquisition=1)                # -> PyramidCollection
+```
+
+### Write a plate
+
+A plate opened with micro-reader (Harmony, MetaXpress, IN Cell, CellVoyager, ...) or
+read from OME-Zarr is written as an NGFF plate, one image after the other:
+
+```python
+import micro_reader
+
+plate_coll = PyramidCollection.from_file(micro_reader.open("Images/Index.idx.xml"))
+plate_coll.write_plate("plate.ome.zarr")                       # NGFF 0.5
+plate_coll.write_plate("plate_v04.ome.zarr", version="0.4")    # NGFF 0.4
+```
+
+The write options of `io.write_pyramid` (`max_threads`, `compressor`,
+`memory_budget_mb`, ...) apply to every image. The plate and well metadata are written
+last, so a plate that stops half way is not mistaken for a complete one.
+
+An NGFF plate holds one image per field. A field with several images (the tiles of a
+tiled scan, several views) raises `PlateFieldError`, which names the ways out: open the
+file with `tiles="mosaic"` (micro-reader 0.1 or later) so each field is one image; write
+`version="rfc8"` (experimental), which keeps every tile; or, for a plate read from
+NGFF, join a field's images into one with pyrops. Images that are not in the plate (a
+slide's label or preview) are left out.
+
+### Series (the bioformats2raw layout)
+
+```python
+series_coll = PyramidCollection.from_zarr("converted.ome.zarr")  # series 0, 1, ...
+pyr = series_coll[{"series": 1}]
+series_coll.write_series("copy.ome.zarr")      # the same layout, with its OME-XML
+```
+
+Any collection can be written this way, for example all series of a file opened with
+micro-reader.
+A series that holds several images (tiles, views) is written as one series per image,
+in key order, with a warning.
+
+The `OME` group always gets an OME-XML with one `Image` per series, in series order:
+the one of the layout the images were read from while it still fits, else a short one
+ozp writes (size, pixel type and dimension order of each series). When it replaces the
+source's, it warns. An `ome_xml=` you pass must have one `Image` per series, or the
+write stops with `OMEXMLError` before anything is written.
+
+### NGFF RFC 8 collections
+
+[RFC 8](https://ngff.openmicroscopy.org/rfc/8/index.html) describes plates, series and
+any other group of images as one tree of nodes. It is still a proposal; ozp reads it
+and writes it when you ask for `version="rfc8"`:
+
+```python
+plate_coll.write_plate("plate_rfc8.zarr", version="rfc8")            # a plate as RFC 8
+plate_coll.write_collection("out.zarr", document="collection.json")   # the tree in its own .json
+coll = PyramidCollection.from_zarr("collection.json")                 # a .json or a zarr group
+coll.tree                                                             # the nodes and their attributes
+```
 
 ## Write options
 
@@ -281,6 +399,27 @@ io.write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
   to the min/max of level 0 as written, measured during the write itself, so the output is
   not read again. The window's `min`/`max` stay as they are. For percentiles or
   another level, use `Pyramid.set_display_range()` before writing.
+
+### OME-Zarr 0.4 or 0.5
+
+A pyramid is written in its own version (the one it was read or built as).
+Built in ozp (`from_array`, `from_arrays`, `from_label_arrays`, `from_image`,
+`PyramidCollection.from_file`), it is 0.5 unless you pass `version="0.4"`.
+`to_version` gives the same pyramid in the other one:
+
+```python
+io.write_pyramid(pyr.to_version("0.4"), "out_v04.ome.zarr")    # 0.4, zarr v2
+```
+
+Going to 0.4, the levels are written without shards (zarr v2 has none). When the
+input's codec does not exist in the format written (bz2 or plain lz4 in 0.5), or is
+one the writer does not know (zlib, lzma), blosc-lz4 is written instead, with a
+warning; pass `compressor=` to choose another.
+
+ozp does not read OME-Zarr 0.6 yet. Opening a 0.6 image, plate, well or series
+raises `UnsupportedNGFFVersion` (from `ome_zarr_pyramid`), which names the version
+found and the versions ozp reads; nothing in the store is read past its metadata.
+NGFF RFC 8 collections (version `"0.x"`) open as before.
 
 ### Object storage
 
