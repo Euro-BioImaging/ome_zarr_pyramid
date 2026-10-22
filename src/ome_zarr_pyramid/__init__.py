@@ -11,7 +11,7 @@ downscaling) are the public surface::
 ``io`` is one shared :class:`~ome_zarr_pyramid.core.io.IO`; ``IO()`` still works.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 __author__ = "Bugra Oezdemir"
 
 from ome_zarr_pyramid.core.io import IO

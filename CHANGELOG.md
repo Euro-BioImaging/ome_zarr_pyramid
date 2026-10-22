@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased: coordinate systems (the spatial model, plan 9.9)
+## 0.4.0 (2026-10-22): coordinate systems, NGFF 0.6, RFC 8 scenes, validation
+
+A minor release under the release policy: field collections are renamed and fields are
+no longer renumbered on read (see Breaking changes), so it is not a patch. It ships the
+spatial model's trains T2 and T3 together (decision T2-2): the coordinate-system graph,
+`eubi:` keys in 0.4 / 0.5, RFC 8 scenes, NGFF 0.6 reading and writing (opt-in with
+`version="0.6"`; the default stays 0.5) and whole-store validation. eubi-bridge 0.3.0 and
+0.3.1 bound ome_zarr_pyramid below 0.4 and keep 0.3.x; eubi-bridge 0.3.2 is the first that
+reads 0.4.0. It reads micro-reader 0.2.0's coordinate systems; with micro-reader 0.1.x,
+whose files declare none, positions stay unplaced as before.
 
 ### New
 
