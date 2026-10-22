@@ -298,3 +298,18 @@ def test_s3_plate_table_from_metadata_files(bucket, tmp_path):
         node = coll._pyramids[key]
         expected = row_from_pyramid(coll[key], path=node.loader.path_of(node))
         assert {c: row[c] for c in expected} == expected
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_a_remote_store_is_validated_through_obstore(bucket, data, version):
+    """ozp.validate and validate=True read a remote store's metadata through obstore,
+    with the storage_options the writers take (plan 5.23)."""
+    pytest.importorskip("jsonschema")
+    import ome_zarr_pyramid as ozp
+    name, opts = bucket
+    url = f"s3://{name}/img.zarr"
+    IO().write_pyramid(_pyr(data, version), url, overwrite=True, storage_options=opts,
+                       validate=True)
+    assert ozp.validate(url, storage_options=opts) == []
+    assert ozp.validate(f"s3://{name}/nothing.zarr", storage_options=opts) == [
+        f"s3://{name}/nothing.zarr: no group at the root"]

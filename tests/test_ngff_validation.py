@@ -1,7 +1,9 @@
 """Every kind of store ozp writes passes the whole-store NGFF check of
-``tests/ngff_validation.py``: each group against the official (strict) schemas of its
-roles, and the hierarchy, which no schema checks. The check catches the stray OME group
-ozp 0.3.0 wrote under single images, which validators passed."""
+``tests/ngff_validation.py``, in each NGFF version ozp writes (0.4, 0.5, 0.6): each group
+against the official (strict) schemas of its roles, and the hierarchy, which no schema
+checks. In 0.6 that includes the scenes on plates, wells and bioformats2raw roots (plan
+5.18, 9.17). The check catches the stray OME group ozp 0.3.0 wrote under single images,
+which validators passed."""
 import os
 
 import numpy as np
@@ -19,7 +21,7 @@ pytest.importorskip("referencing")
 XML = ('<?xml version="1.0" encoding="UTF-8"?>\n'
        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
        '<Image ID="Image:0" Name="v"/></OME>')
-VERSIONS = ["0.4", "0.5"]
+VERSIONS = ["0.4", "0.5", "0.6"]
 
 
 def _pyr(version, value=1):
@@ -96,3 +98,44 @@ def test_the_check_catches_a_missing_type(tmp_path):
     del ome["multiscales"][0]["type"]
     g.attrs["ome"] = ome
     assert any("strict_image.schema" in p and "'type'" in p for p in problems(path))
+
+
+# -- NGFF 0.6 scenes (plan 5.5, 5.18; 9.17: all three layouts are safe) ----------------
+
+def test_a_mosaic_plate_with_its_scene_is_valid_ngff(tmp_path):
+    from test_eubi_keys import _plate_file
+    path = str(tmp_path / "p.ome.zarr")
+    _plate_file(per_well=False).write_plate(path, version="0.6")
+    assert "scene" in zarr.open_group(path, mode="r").attrs["ome"]
+    assert problems(path) == []
+
+
+def test_a_plate_with_one_scene_per_well_is_valid_ngff(tmp_path):
+    from test_eubi_keys import _plate_file
+    path = str(tmp_path / "p.ome.zarr")
+    _plate_file(per_well=True).write_plate(path, version="0.6")
+    assert "scene" in zarr.open_group(os.path.join(path, "B", "2"), mode="r").attrs["ome"]
+    assert problems(path) == []
+
+
+def test_a_series_layout_with_its_scene_is_valid_ngff(tmp_path):
+    from test_spatial_collection import _cs, _file, _placed
+    images = [_placed({"series": 0}, "stage", value=1), _placed({"series": 1}, "stage", y=50,
+                                                                value=2)]
+    path = str(tmp_path / "s.ome.zarr")
+    PyramidCollection.from_file(_file(images, [_cs("stage")])).write_series(path, version="0.6")
+    assert "scene" in zarr.open_group(path, mode="r").attrs["ome"]
+    assert problems(path) == []
+
+
+def test_the_check_catches_a_scene_edge_into_nowhere(tmp_path):
+    from test_spatial_collection import _cs, _file, _placed
+    images = [_placed({"series": 0}, "stage", value=1), _placed({"series": 1}, "stage", y=50,
+                                                                value=2)]
+    path = str(tmp_path / "s.ome.zarr")
+    PyramidCollection.from_file(_file(images, [_cs("stage")])).write_series(path, version="0.6")
+    g = zarr.open_group(path, mode="r+")
+    ome = g.attrs["ome"]
+    ome["scene"]["coordinateTransformations"][0]["input"]["path"] = "7"
+    g.attrs["ome"] = ome
+    assert any("scene edge end '7' is no image group" in p for p in problems(path))

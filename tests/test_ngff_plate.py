@@ -1,6 +1,7 @@
 """NGFF 0.4 / 0.5 plates into the collection model and back: the JSON of real plates
-(idr0010 0.5, MoBIE and Fractal 0.4) is written back unchanged, a plate built in memory
-is written in either version, and a broken plate is refused with every problem named."""
+(idr0010 0.5, MoBIE and Fractal 0.4) is written back unchanged but for what ozp derives
+(each acquisition's maximumfieldcount, decision 9.12-S), a plate built in memory is
+written in either version, and a broken plate is refused with every problem named."""
 import copy
 import glob
 import os
@@ -29,16 +30,40 @@ def _attrs(path):
     return root, root.attrs.asdict()
 
 
-def _expected(attrs):
+def _expected(attrs, root=None):
     """What ozp writes for a read plate: the same attributes, with a custom key found
-    inside `ome` moved beside it (ozp's custom-metadata rule; idr0010's `_creator`)."""
+    inside `ome` moved beside it (ozp's custom-metadata rule; idr0010's `_creator`), and,
+    for a plate (`root` given), each acquisition without one gets its maximumfieldcount:
+    the most fields of it in one well (decision 9.12-S)."""
     attrs = copy.deepcopy(attrs)
     ome = attrs.get("ome")
     if isinstance(ome, dict):
         from ome_zarr_pyramid.core.pyramid import NGFFMetadataHandler
         for key in [k for k in ome if k != "version" and k not in NGFFMetadataHandler.NGFF_KEYS]:
             attrs[key] = ome.pop(key)
+    plate = (attrs.get("ome") or attrs).get("plate")
+    if root is not None and plate and plate.get("acquisitions"):
+        acquisitions = plate["acquisitions"]
+        most = {}
+        for well in plate["wells"]:
+            w = root[well["path"]].attrs.asdict()
+            images = (w.get("ome") or w)["well"]["images"]
+            for a in acquisitions:
+                n = len(images) if len(acquisitions) == 1 else sum(
+                    1 for i in images if i.get("acquisition") == a["id"])
+                most[a["id"]] = max(most.get(a["id"], 0), n)
+        for a in acquisitions:
+            if "maximumfieldcount" not in a and most.get(a["id"]):
+                a["maximumfieldcount"] = most[a["id"]]
     return attrs
+
+
+def _without_derived(node):
+    """`node`'s plate attribute without the maximumfieldcount ozp derived on writing."""
+    attr = copy.deepcopy(node.attributes["plate"])
+    for a in attr.acquisitions:
+        a.extra.pop("maximumfieldcount", None)
+    return attr
 
 
 @pytest.mark.skipif(not REAL, reason="the local NGFF plates are not here")
@@ -47,7 +72,7 @@ def test_real_plates_write_back_unchanged(path, tmp_path):
     root, attrs = _attrs(path)
     node = read_plate(path)
     plate_attrs, wells = plate_to_attrs(node)
-    assert plate_attrs == _expected(attrs)
+    assert plate_attrs == _expected(attrs, root)
     for well_path, well_attrs in wells.items():
         assert well_attrs == _expected(root[well_path].attrs.asdict())
     # and on disk, in the version it was read as (under the same folder name: a plate
@@ -55,9 +80,12 @@ def test_real_plates_write_back_unchanged(path, tmp_path):
     out = str(tmp_path / os.path.basename(path))
     write_plate_metadata(node, out)
     out_root, out_attrs = _attrs(out)
-    assert out_attrs == _expected(attrs)
+    assert out_attrs == _expected(attrs, root)
     assert out_root.metadata.zarr_format == root.metadata.zarr_format
-    assert read_plate(out) == node
+    back = read_plate(out)
+    assert _without_derived(back) == node.attributes["plate"]
+    assert [(w.name, [f.name for f in w]) for w in back] == [(w.name, [f.name for f in w])
+                                                              for w in node]
 
 
 @pytest.mark.skipif(not os.path.isdir(IDR0010), reason="idr0010 is not here")
@@ -115,8 +143,9 @@ def test_a_plate_built_in_memory_is_written_in_either_version(tmp_path, version)
     plate_json = attrs["ome"]["plate"] if version == "0.5" else attrs["plate"]
     assert plate_json["wells"] == [{"path": "A/2", "rowIndex": 0, "columnIndex": 1},
                                    {"path": "B/1", "rowIndex": 1, "columnIndex": 0}]
-    assert plate_json["acquisitions"] == [{"id": 0, "name": "first"},
-                                          {"id": 1, "name": "second", "starttime": 1700000000}]
+    assert plate_json["acquisitions"] == [   # each well holds one field of each acquisition
+        {"id": 0, "name": "first", "maximumfieldcount": 1},
+        {"id": 1, "name": "second", "starttime": 1700000000, "maximumfieldcount": 1}]
     assert plate_json["name"] == "screen 1" and plate_json["field_count"] == 2
     assert ("version" in plate_json) == (version == "0.4")
     assert attrs["lab:barcode"] == "P-001"
@@ -126,7 +155,7 @@ def test_a_plate_built_in_memory_is_written_in_either_version(tmp_path, version)
     back = read_plate(out)
     assert [w.name for w in back] == ["A2", "B1"]
     assert back["A2"]["1"].attributes["acquisition"] == Ref("1")
-    assert back.attributes["plate"] == _built().attributes["plate"]
+    assert _without_derived(back) == _built().attributes["plate"]
 
 
 def test_only_the_wide_form_and_no_labels_are_written_in_04_05():
@@ -161,7 +190,9 @@ def _well(*acquisitions):
 def test_a_valid_synthetic_plate_reads():
     plate = plate_from_attrs(_plate_json(), {"A/1": _well(0, 1), "A/2": _well(1)})
     assert [w.name for w in plate] == ["A1", "A2"]
-    assert plate_to_attrs(plate)[0] == _plate_json()
+    # acquisition 0: one field in A/1; acquisition 1: one in A/1, one in A/2
+    assert plate_to_attrs(plate)[0] == _plate_json(acquisitions=[
+        {"id": 0, "maximumfieldcount": 1}, {"id": 1, "maximumfieldcount": 1}])
 
 
 def test_a_broken_plate_is_refused_naming_every_problem():
@@ -189,7 +220,7 @@ def test_a_broken_plate_is_refused_naming_every_problem():
 
 @pytest.mark.parametrize("attrs, message", [
     ({"multiscales": []}, "no 'plate' metadata"),
-    ({"ome": {"version": "0.6", "plate": {"rows": [], "columns": []}}}, "version '0.6'"),
+    ({"ome": {"version": "0.7", "plate": {"rows": [], "columns": []}}}, "version '0.7'"),
     (_plate_json(rows=[{"label": "A"}]), r"rows\[0\] has no name"),
     (_plate_json(acquisitions=[{"id": "first"}]), "id 'first' is not an integer"),
 ])

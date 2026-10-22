@@ -1,5 +1,155 @@
 # Changelog
 
+## 0.4.0 (2026-10-22): coordinate systems, NGFF 0.6, RFC 8 scenes, validation
+
+A minor release under the release policy: field collections are renamed and fields are
+no longer renumbered on read (see Breaking changes), so it is not a patch. It ships the
+spatial model's trains T2 and T3 together (decision T2-2): the coordinate-system graph,
+`eubi:` keys in 0.4 / 0.5, RFC 8 scenes, NGFF 0.6 reading and writing (opt-in with
+`version="0.6"`; the default stays 0.5) and whole-store validation. eubi-bridge 0.3.0 and
+0.3.1 bound ome_zarr_pyramid below 0.4 and keep 0.3.x; eubi-bridge 0.3.2 is the first that
+reads 0.4.0. It reads micro-reader 0.2.0's coordinate systems; with micro-reader 0.1.x,
+whose files declare none, positions stay unplaced as before.
+
+### New
+
+- `ome_zarr_pyramid.core.spatial`: the spatial model's values (`Axis`,
+  `CoordinateSystem`, `Transformation`, `ExternalRef`), ids (`system_id`,
+  `clean_id_part`), the transform model (identity, translation, scale, affine and
+  sequence as matrices; `compose`, `invert`; other types are kept as read and raise
+  `TransformError` when used) and their JSON (`eubi:` entries).
+- `PyramidCollection.coordinate_systems`, `system_of` and `coordinate_transformations`:
+  where the images are. `from_file` takes them from micro-reader's file
+  (`file.coordinate_systems`, each image's `metadata.coordinate_system`) and checks the
+  model's invariants (`check_invariants`, `InvariantError`). A file without
+  `coordinate_systems` (eubi-bridge's own objects) gets minimal definitions. `select`,
+  `filter` and `sort_by` keep the part of the graph their entries keep; `concatenate`
+  places a joined image in its parts' system and drops edges at its parts, with a
+  warning.
+- A lone `Pyramid` keeps its system: `Pyramid.from_image` and `coll.pyramid(key)`
+  write it as the custom metadata `eubi:coordinate_system` and
+  `eubi:coordinate_systems`, read back with the pyramid. A collection built from such
+  pyramids takes their systems; one id from two sources (two files, two stores) is two
+  systems (`<set>--<id>`) unless `join_systems=True`.
+
+- NGFF 0.4 / 0.5 output keeps the model in `eubi:` keys beside `ome` (plan 9.15):
+  `write_plate`, `write_series` and `write` write each image's key (`eubi:index`) and
+  system (`eubi:coordinate_system`, with its definition), each well's and series root's
+  image list (`eubi:images`), each plate's and well's `eubi:kind`, the systems and edges
+  of each connected part on the group that holds it (`eubi:coordinate_systems`,
+  `eubi:coordinate_transformations`; edges NGFF 0.4 / 0.5 cannot hold give a warning),
+  and `eubi:version` 1 on the root. A system without axes gets them from its images.
+  `PyramidCollection.from_zarr` reads them back without opening an image: the same keys
+  (gapped field numbers 0, 2 stay 0, 2), positions, systems and edges; a series layout
+  whose series were flattened (tiles written as series of their own) gets its series
+  level back. A store without these keys reads as before.
+- `PyramidCollection.components()`: the graph's connected parts and the collection that
+  owns each.
+- NGFF RFC 8 output keeps the model too (plan 9.10): each connected part of the graph
+  becomes a `scene` attribute on the collection that owns it, when every image under
+  that collection belongs to it and each image's axes equal its system's (else the
+  positions stay in the images, with a warning). A scene lists the shared system first
+  and one edge per image into it (a translation, or a scale and translation when the
+  units differ); the images' own levels then hold only their alignment. Other edges go
+  into the scene, adjusted to that; an attached label image gets its image's edge.
+  Images, collections and the root carry `eubi:index`, `eubi:coordinate_system`,
+  `eubi:kind` and `eubi:version`; a plate whose fields hold several images has every
+  field as a sub-collection; an unnamed plate keeps `""` as `eubi:name` and reads back
+  with it. `PyramidCollection.from_zarr` reads all of it back without opening an image
+  (positions are added to the levels when an image opens), and reads an image that two
+  collections list once (one key), writing it back as one path. Writing RFC 8 gives an
+  `RFC8Warning`: RFC 8 is a draft.
+- Exported: `RFC8Warning`, `InvariantError`, `TransformError`.
+- `add_missing_translation=True` on `PyramidCollection(...)` and
+  `PyramidCollection.from_zarr`: an image placed in a coordinate system but without a
+  level-0 translation is placed at that system's origin (translation 0; a copy, the
+  pyramid given is not changed). Without it, such an image raises `InvariantError`
+  (rule I4), now with a message naming the argument; from a store, when the image opens.
+- `PyramidCollection.from_zarr` on a well alone keys and places its images as in its
+  plate, from the well's `eubi:images` and the systems on it: the plate's keys (plate,
+  well and field numbers, gaps kept), each image's coordinate system and position. A
+  well without these keys reads as before (acquisition and field, the spec's numbering).
+- `PyramidCollection.write` (one store per entry) warns when the collection has edges
+  other than positions (affine edges, registrations): a store of one image has no place
+  for them. They were left out without a word before.
+- NGFF 0.6 (plan 9.11, first part): ozp reads 0.6 images, labels, plates, wells and
+  series layouts, and writes them with `version="0.6"` (zarr v3; the default stays 0.5).
+  A 0.6 image is held like any other (axes, and a scale and translation per level) and
+  written back in 0.6's form: the axes in a coordinate system named `physical`, one
+  transformation per level (`scale`, or `sequence[scale, translation]`). A foreign
+  image's other coordinate systems and transformations, and the name of its own system,
+  are written back as read; written as 0.4 / 0.5 they are kept under `eubi:ngff06`, with
+  a warning. A label gets an identity link from its image. A level transformation 0.6
+  does not allow (a translation alone, an affine) raises `Unreadable06` instead of
+  being misread. A `scene` written by another tool places its images: their positions
+  are added to their levels when they open (the image's own system must be the one the
+  scene names, else a warning), and its other edges join the graph.
+- `write_plate` and `write_series` with `version="0.6"` put each connected part of the
+  graph into a `scene` on the plate, well or series root that holds it (plan 5.5, 5.18),
+  when every image under that group belongs to it and each image's axes equal its
+  system's: the shared system first, one edge per image into it (a translation, or a
+  scale and translation when the units differ), the other edges adjusted to it; the
+  images' own levels then hold only their alignment, and each image group points back
+  at the scene's group (`eubi:scene`). Otherwise the positions stay in the images, with
+  a warning naming the group and why. Checked against the official 0.6 schemas of each
+  role and with ngff-zarr 0.49 and ome-zarr-py 0.21 (plan 9.17).
+  `io.read_pyramid(path, apply_scene=True)` reads such an image alone with its position;
+  without it the read warns, naming the scene's group. 0.6 output writes the multiscale
+  `type`: the downscale method that made the levels, else `"unknown"`.
+- NGFF validation (plan 5.23). Every write checks the metadata it is about to save,
+  with no extra dependency: an image's multiscales (2 to 5 axes with unique names, 2 or
+  3 of them space axes; per level a scale, then at most one translation, each as long
+  as the axes, scales above 0; in 0.6 one transformation per level, every level into the
+  same system of the image's own) and each 0.6 scene (every image below it attached, by
+  its own system's name, into a scene system with the image's axes). A problem stops the
+  write of that group's metadata with `NGFFValidationError` (from `ome_zarr_pyramid`),
+  which lists each problem in `.problems`.
+- `ome_zarr_pyramid.validate(path)` checks a whole store, local or remote
+  (`storage_options`), and returns its problems (`[]` for a valid one): every group
+  against the official 0.4, 0.5 or 0.6 schemas of each role it has (the schemas ship with
+  the package), plus where each group sits, which no schema checks (an `OME` group only
+  under a bioformats2raw root, series and wells and fields that are groups, dataset paths
+  that are arrays, scene edges that end at images). `validate(path, strict=True)` also
+  returns what the strict schemas find: the spec's SHOULDs (a plate's name, an image's
+  name and metadata, a label's colors, ...). `io.write_pyramid`, `write_plate`,
+  `write_series` and `PyramidCollection.write` take `validate=True` to run it on what they
+  wrote: they raise `NGFFValidationError` for a problem and warn with
+  `NGFFValidationWarning` for strict findings, which a store copied from another tool
+  often has (Fractal and MoBIE plates, for example). Both need the new `validate` extra
+  (`pip install 'ome_zarr_pyramid[validate]'`: jsonschema, referencing); without it
+  they raise naming the extra, before anything is written. `validate(path,
+  schemas=False)` checks only where the groups sit and needs no extra. RFC 8 groups
+  (version `"0.x"`) have no published schema yet and are skipped.
+- ozp writes two SHOULD fields where they are missing and it can derive them exactly:
+  each plate acquisition's `maximumfieldcount` (the most fields of that acquisition in
+  one well) and an empty multiscale `metadata` in 0.4 / 0.5 (0.6 wrote one already). A
+  value read with the store is kept. So a store ozp makes on its own meets the strict
+  schemas.
+
+### Breaking changes
+
+- NGFF 0.6 stores are read instead of refused with `UnsupportedNGFFVersion` (which stays
+  for versions ozp does not know, 0.7 say); `zarr_format_of("0.6")` is 3.
+- Metadata NGFF does not allow (a scale of 0, a translation shorter than the axes, one
+  space axis, ...) is no longer written as given: the write stops with
+  `NGFFValidationError` (a `ValueError`) before that group's metadata is saved. This
+  includes `io.update_metadata` on a store whose metadata has such a value.
+
+- RFC 8 output: a level's scale and translation are one `sequence` (was two edges, plan
+  5.4; both read); a plate of fields with several images writes every field as a
+  sub-collection, so a one-image field's path moves one level down.
+- Plate and series output carries the `eubi:` keys above (new attributes beside `ome`);
+  a well's fields read back with their own numbers, no longer renumbered 0, 1, ...; a
+  flattened series layout reads back keyed by series and tile.
+- `concatenate` refuses pyramids placed in different coordinate systems (or some placed,
+  some not); `PyramidCollection.concatenate` refused them already.
+- `PyramidCollection.from_file`'s tree follows micro-reader's `File.collection` rule
+  (plan 3.17, checked by a test against micro-reader): acquisition makes no collection,
+  so a field holding images of several acquisitions is one field collection; a field
+  collection is named `field<n>` (was `acquisition0_field<n>`) and its images keep
+  their acquisition in their names (`acquisition0_tile3`, was `tile3`). The root's
+  children are in the order of the images (the plates where the first plate image is).
+
 ## 0.3.1 (2026-10-21)
 
 ### Fixes

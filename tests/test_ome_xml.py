@@ -84,7 +84,7 @@ def test_update_metadata_repairs_a_store_ozp_030_wrote(tmp_path, version):
     _no_ome_group(path)
     assert _read(path) == XML                                 # the XML stays
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         IO().update_metadata(path)                            # nothing left to repair
 
 
@@ -276,10 +276,10 @@ def test_a_file_collection_written_as_series_gets_a_minimal_ome_xml(tmp_path):
 def test_the_ome_group_follows_the_output_version():
     from ome_zarr_pyramid.core.io import _write_ome_xml
     from ome_zarr_pyramid.core.ngff_plate import zarr_format_of
-    assert (zarr_format_of("0.4"), zarr_format_of("0.5")) == (2, 3)
-    for version in ("0.6", "rfc8", None):
+    assert (zarr_format_of("0.4"), zarr_format_of("0.5"), zarr_format_of("0.6")) == (2, 3, 3)
+    for version in ("0.7", "rfc8", None):
         with pytest.raises(ValueError, match="ozp writes the versions"):
             zarr_format_of(version)
     with pytest.raises(ValueError, match="ozp writes the versions"):
-        _write_ome_xml("never-written.zarr", XML, ["0"], "0.6")
+        _write_ome_xml("never-written.zarr", XML, ["0"], "0.7")
     assert not os.path.exists("never-written.zarr")

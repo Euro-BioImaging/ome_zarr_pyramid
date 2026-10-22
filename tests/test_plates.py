@@ -69,11 +69,11 @@ def test_a_plate_file_navigates_as_in_micro_reader():
     well_node = plate.node["B3"]
     assert (plate.node.kind, plate.node.index, well_node.kind, well_node.index) == (
         "plate", 0, "well", 0)
-    assert [n.name for n in well_node] == ["acquisition0_field0", "acquisition0_field2"]
-    field2 = well_node["acquisition0_field2"]
+    assert [n.name for n in well_node] == ["field0", "field2"]
+    field2 = well_node["field2"]
     assert (field2.kind, field2.index, [n.name for n in field2]) == (
-        "field", 2, ["view0", "view1"])
-    assert field2["view1"].pyramid is one
+        "field", 2, ["acquisition0_view0", "acquisition0_view1"])
+    assert field2["acquisition0_view1"].pyramid is one
     # a selection keeps every well (index "well": w stays wells[w]), fields narrowed
     picked = coll.select(view=0).plates[0]
     assert [w.name for w in picked.wells] == ["B3", "A1"]

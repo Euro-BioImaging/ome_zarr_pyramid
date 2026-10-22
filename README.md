@@ -400,15 +400,16 @@ io.write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
   not read again. The window's `min`/`max` stay as they are. For percentiles or
   another level, use `Pyramid.set_display_range()` before writing.
 
-### OME-Zarr 0.4 or 0.5
+### OME-Zarr 0.4, 0.5 or 0.6
 
 A pyramid is written in its own version (the one it was read or built as).
 Built in ozp (`from_array`, `from_arrays`, `from_label_arrays`, `from_image`,
-`PyramidCollection.from_file`), it is 0.5 unless you pass `version="0.4"`.
-`to_version` gives the same pyramid in the other one:
+`PyramidCollection.from_file`), it is 0.5 unless you pass `version="0.4"` or
+`version="0.6"`. `to_version` gives the same pyramid in another one:
 
 ```python
 io.write_pyramid(pyr.to_version("0.4"), "out_v04.ome.zarr")    # 0.4, zarr v2
+io.write_pyramid(pyr.to_version("0.6"), "out_v06.ome.zarr")    # 0.6, zarr v3
 ```
 
 Going to 0.4, the levels are written without shards (zarr v2 has none). When the
@@ -416,10 +417,35 @@ input's codec does not exist in the format written (bz2 or plain lz4 in 0.5), or
 one the writer does not know (zlib, lzma), blosc-lz4 is written instead, with a
 warning; pass `compressor=` to choose another.
 
-ozp does not read OME-Zarr 0.6 yet. Opening a 0.6 image, plate, well or series
-raises `UnsupportedNGFFVersion` (from `ome_zarr_pyramid`), which names the version
-found and the versions ozp reads; nothing in the store is read past its metadata.
-NGFF RFC 8 collections (version `"0.x"`) open as before.
+ozp reads and writes 0.4, 0.5 and 0.6. In 0.6 a plate, well or series can hold a
+`scene` that places its images; ozp writes one where the images share a coordinate
+system, and places the images of a scene written by another tool. A version ozp does
+not know raises `UnsupportedNGFFVersion` (from `ome_zarr_pyramid`), which names the
+version found and the versions ozp reads. NGFF RFC 8 collections (version `"0.x"`) open
+as before.
+
+### Check a store
+
+Every write checks the metadata it saves (axes, scales, translations, 0.6 scenes) and
+stops with `NGFFValidationError` when NGFF does not allow it. To check a whole store
+against the official NGFF schemas, install the `validate` extra
+(`pip install 'ome_zarr_pyramid[validate]'`):
+
+```python
+import ome_zarr_pyramid as ozp
+
+problems = ozp.validate("out.ome.zarr")         # [] when the store is valid
+io.write_pyramid(pyr, "out.ome.zarr", validate=True)    # raises if the result is not
+```
+
+`validate` checks each group against the schemas of the version it declares and where
+each group sits, which no schema checks: for example an `OME` group outside a
+bioformats2raw layout. The strict schemas check the spec's recommendations too (a plate's
+name, an image's name, a label's colors): `ozp.validate(path, strict=True)` lists those,
+and `validate=True` warns about them (`NGFFValidationWarning`) instead of raising. A plate
+copied from another tool often misses some; ozp fills the ones it can derive. It works on `s3://` and other object-store URLs
+too (`storage_options=`). `write_plate`, `write_series` and `PyramidCollection.write`
+also take `validate=True`.
 
 ### Object storage
 

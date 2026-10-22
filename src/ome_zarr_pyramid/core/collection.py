@@ -37,10 +37,14 @@ the same path.
 """
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
+
+from ome_zarr_pyramid.core.validation import validating
 
 #: the axes an NGFF multiscale may have here
 _AXES = "tczyx"
@@ -248,6 +252,106 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     return pyr
 
 
+@dataclass
+class Component:
+    """One connected component of a collection's graph (plan 3.6, see
+    :meth:`PyramidCollection.components`): its shared system ids, its entries (in the
+    collection's order), its edges other than positions, and its owner (the path of
+    names from the root to the collection that writes it; None for a single entry)."""
+    systems: set
+    entries: list
+    edges: list
+    owner: Optional[Tuple[str, ...]]
+
+
+def _no_translation(where, key, sid) -> str:
+    return (f"{where}I4: entry {dict(key)} is placed in {sid!r} but has no level-0 "
+            f"translation, so its position is unknown. Pass add_missing_translation=True "
+            f"(to PyramidCollection(...) or PyramidCollection.from_zarr) to place it at the "
+            f"origin of {sid!r}, or remove its coordinate system")
+
+
+def _with_zero_translation(pyr):
+    """A metadata copy of `pyr` with translation 0 on every level (decision O-2)."""
+    out = pyr._clone_metadata_only()
+    for attr in ("acquisition", "source_index", "joined_index", "source_series"):
+        if hasattr(pyr, attr):
+            setattr(out, attr, getattr(pyr, attr))
+    n = len(out.meta.axis_order)
+    for path in out.meta.resolution_paths:
+        if out.meta.get_translation(path) is None:
+            out.meta.update_translation(path, [0.0] * n)
+    return out
+
+
+def _translation_on_load(node, key, sid, add: bool, where: str) -> None:
+    """Check, when a placed image of a store opens, that it has a level-0 translation (I4):
+    add zeros with `add`, else raise naming the argument (decision O-2)."""
+    from ome_zarr_pyramid.core.spatial import InvariantError
+    loader = node.loader
+
+    def load(n, loader=loader):
+        pyr = loader(n)
+        if pyr.meta.get_translation(pyr.meta.resolution_paths[0]) is None:
+            if not add:
+                raise InvariantError(_no_translation(f"{where}: ", key, sid))
+            n_axes = len(pyr.meta.axis_order)
+            for path in pyr.meta.resolution_paths:
+                if pyr.meta.get_translation(path) is None:
+                    pyr.meta.update_translation(path, [0.0] * n_axes)
+        return pyr
+    for attr in ("location", "base", "path_of"):
+        if hasattr(loader, attr):
+            setattr(load, attr, getattr(loader, attr))
+    node.loader = load
+
+
+def _read_scenes(groups, key_of_path, out, systems, system_of, where):
+    """The 0.6 scenes on `groups` taken into the graph read so far (``ngff06.
+    graph_from_scenes``): ``(systems, system_of, edges)``. Each placed image's position is
+    folded into its levels when it opens; opens no image now."""
+    from ome_zarr_pyramid.core import ngff06
+    if not any(ngff06.scene_of(attrs) for attrs in groups.values()):
+        return systems, system_of, []
+    held = {cs.id: cs for cs in systems}
+    systems, system_of, positions, edges, names = ngff06.graph_from_scenes(
+        groups, key_of_path, held, system_of, where)
+    for key, p in positions.items():
+        node = out.get(key)
+        if node is not None and getattr(node, "loader", None) is not None:
+            ngff06.fold_on_load(node, p, names.get(key), where)
+    return systems, system_of, edges
+
+
+def _tree_of_keys(tree, entries):
+    """A series layout read from a store as the tree of its images' keys (plan 3.18): the
+    tree :func:`~ome_zarr_pyramid.core.plates.tree_from_file` builds, whose leaves open
+    the store's image groups as the layout's nodes did (nothing is opened here). Returns
+    ``(tree, {key: leaf})``; the root keeps the layout's attributes."""
+    from ome_zarr_pyramid.core.nodes import MultiscaleNode
+    from ome_zarr_pyramid.core.plates import tree_from_file
+
+    shim = type("_Keys", (), {"plates": []})()
+    new = tree_from_file(shim, entries, name=tree.name)
+    leaf_of = {}
+    for leaf in new.walk():
+        inner = getattr(leaf, "_pyramid", None)
+        if isinstance(leaf, MultiscaleNode) and isinstance(inner, MultiscaleNode):
+            leaf._pyramid, leaf.loader, leaf.path = None, inner.loader, inner.path
+            leaf_of[id(inner)] = leaf
+    new.attributes.update(tree.attributes)
+    new.ngff_fields = dict(tree.ngff_fields)
+    return new, {key: leaf_of[id(node)] for key, node in entries.items()}
+
+
+def _end_text(end) -> str:
+    return str(dict(end)) if isinstance(end, tuple) else repr(getattr(end, "name", end))
+
+
+def _path_text(path) -> str:
+    return "the root" if not path else "/".join(path)
+
+
 def _key(index: Dict[str, int]) -> Tuple[Tuple[str, int], ...]:
     """A hashable collection key: the image index without its resolution level."""
     return tuple((str(k), int(v)) for k, v in index.items() if k != _RESOLUTION)
@@ -319,10 +423,35 @@ class PyramidCollection(Mapping):
     A collection read from OME-Zarr (:meth:`from_zarr`) keeps its node tree as
     :attr:`tree` (see :mod:`ome_zarr_pyramid.core.nodes`), and opens each pyramid on
     first access: listing, selecting and indexing keys open nothing.
+
+    Where the images are (plan 1.3-1.5, 3.3, 3.4): :attr:`coordinate_systems` are the
+    shared coordinate systems, by id; :attr:`system_of` names, per entry, the system its
+    position is in (the position itself is the entry's level-0 translation, in the image's
+    own units); an entry not in it is unplaced. :attr:`coordinate_transformations` holds
+    the edges that are not positions (affine edges, registrations, other types as read).
+
+    Built from pyramids in memory, without a graph, the collection lifts the system each
+    pyramid keeps (plan 3.26; see :func:`ome_zarr_pyramid.core.spatial.pyramid_system`).
+    One id is one system only among pyramids of one source (read from one store, or taken
+    from one collection with :meth:`pyramid`): a pyramid of another source whose id is
+    taken gets ``<set>--<id>`` (8.16), unless ``join_systems=True`` says they are one
+    space. Take an entry out with :meth:`pyramid` to keep where it is.
+
+    A pyramid that names a system but has no level-0 translation raises
+    :class:`~ome_zarr_pyramid.core.spatial.InvariantError` (I4): its position is
+    unknown. ``add_missing_translation=True`` places it at the system's origin instead
+    (translation 0 on every level, on a copy: the pyramid given is not changed;
+    decision O-2). :meth:`from_zarr` takes the same argument.
     """
 
     def __init__(self, pyramids: Optional[Dict[Tuple[Tuple[str, int], ...], Any]] = None,
-                 name: Optional[str] = None, tree=None):
+                 name: Optional[str] = None, tree=None, *,
+                 coordinate_systems: Optional[Iterable] = None,
+                 system_of: Optional[Dict[Tuple[Tuple[str, int], ...], str]] = None,
+                 coordinate_transformations: Optional[Iterable] = None,
+                 join_systems: bool = False, add_missing_translation: bool = False):
+        from ome_zarr_pyramid.core.spatial import system_from, transformation_from
+
         # a value is a Pyramid, or a MultiscaleNode opened on first access
         self._pyramids = dict(pyramids or {})
         self.name = name
@@ -332,16 +461,272 @@ class PyramidCollection(Mapping):
         self._rows: Dict[Tuple, Dict[str, Any]] = {}
         # the index names of the collection this one was selected from (see `select`)
         self._names: frozenset = frozenset()
+        systems: Dict[str, Any] = {}
+        for cs in coordinate_systems or ():
+            cs = system_from(cs)
+            if cs.id in systems:
+                from ome_zarr_pyramid.core.spatial import InvariantError
+                raise InvariantError(f"I1: two coordinate systems are called {cs.id!r}")
+            systems[cs.id] = cs
+        self._systems = systems
+        self._system_of = {tuple(k): str(v) for k, v in (system_of or {}).items()}
+        self._edges = [transformation_from(t) for t in coordinate_transformations or ()]
+        # where the entries came from (3.26): a collection taken from this one shares it
+        self._source = ("set", id(self))
+        if coordinate_systems is None and system_of is None and coordinate_transformations is None:
+            if self._lift(join_systems):
+                if add_missing_translation:
+                    self._add_missing_translations()
+                self.check_invariants()
+
+    def _add_missing_translations(self) -> None:
+        """Give each placed, loaded pyramid without a level-0 translation zeros on every
+        level, on a metadata copy (the pyramid given is not changed; decision O-2)."""
+        from ome_zarr_pyramid.core.pyramid import Pyramid
+        for key in self._system_of:
+            pyr = self._pyramids.get(key)
+            if isinstance(pyr, Pyramid) and pyr.meta is not None and                     pyr.meta.get_translation(pyr.meta.resolution_paths[0]) is None:
+                self._pyramids[key] = _with_zero_translation(pyr)
+
+    def _lift(self, join: bool) -> bool:
+        """Take the systems the loaded pyramids keep (3.26, 8.16); True when any did. Lazy
+        entries (an image node of a store) are not opened."""
+        import dataclasses
+
+        from ome_zarr_pyramid.core.pyramid import Pyramid
+        from ome_zarr_pyramid.core.spatial import (
+            clean_id_part, merge_systems, pyramid_system, source_name, source_token)
+
+        ids: Dict[Tuple, str] = {}            # (source, id in the pyramid) -> id here
+        prefixes: Dict[Any, str] = {}         # source -> its "<set>" part
+        for key, value in self._pyramids.items():
+            if not isinstance(value, Pyramid) or value.meta is None:
+                continue
+            sid, cs = pyramid_system(value)
+            if sid is None:
+                continue
+            source = None if join else source_token(value)
+            here = ids.get((source, sid))
+            if here is None:
+                here = sid
+                if sid in self._systems:      # another source's system has the id
+                    if source not in prefixes:
+                        named = source_name(value)
+                        prefixes[source] = (clean_id_part(named) if named
+                                            else f"set{len(prefixes) + 1}")
+                    here = f"{prefixes[source]}--{sid}"
+                    n = 2
+                    while here in self._systems:
+                        here = f"{prefixes[source]}{n}--{sid}"
+                        n += 1
+                ids[(source, sid)] = here
+            mine = cs if here == cs.id else dataclasses.replace(cs, id=here)
+            self._systems[here] = (merge_systems(self._systems[here], mine)
+                                   if here in self._systems else mine)
+            self._system_of[key] = here
+        return bool(ids)
+
+    # -- where the images are (3.3, 3.4) ------------------------------------------
+    @property
+    def coordinate_systems(self) -> Dict[str, Any]:
+        """The shared coordinate systems, by id (a copy: build a new collection to change
+        them)."""
+        return dict(self._systems)
+
+    @property
+    def system_of(self) -> Dict[Tuple[Tuple[str, int], ...], str]:
+        """For each placed entry, the id of the system its position (its level-0
+        translation) is in. An entry not listed is unplaced."""
+        return dict(self._system_of)
+
+    @property
+    def coordinate_transformations(self) -> List[Any]:
+        """The graph's edges other than positions (a copy)."""
+        return list(self._edges)
+
+    def check_invariants(self, *, images: bool = True) -> None:
+        """Raise :class:`~ome_zarr_pyramid.core.spatial.InvariantError` when the graph breaks
+        the model's invariants (plan 3.22): I1 (ids pattern-safe and unique), I2 (a
+        position's system is a listed, nominal one), I4 (a placed entry has a level-0
+        translation), I5 (every edge end is a listed system, an entry of the collection or
+        an outside reference) and I8 (a placed image's axes are among its system's, when
+        the system's axes are known). Opens every placed pyramid's metadata, unless
+        ``images=False`` (I4 and I8 are then left out: a store read lazily)."""
+        from ome_zarr_pyramid.core.spatial import (
+            ExternalRef, InvariantError, PATTERN_SAFE, is_image_key, steps)
+        where = f"{self.name}: " if self.name else ""
+        for sid in self._systems:
+            if not PATTERN_SAFE.fullmatch(sid):
+                raise InvariantError(f"{where}I1: system id {sid!r} is not pattern-safe")
+        for key, sid in self._system_of.items():
+            if key not in self._pyramids:
+                raise InvariantError(f"{where}system_of names {dict(key)}, which is not an "
+                                     f"entry of the collection")
+            cs = self._systems.get(sid)
+            if cs is None:
+                raise InvariantError(f"{where}I2: entry {dict(key)} is placed in {sid!r}, "
+                                     f"which is not one of the systems {list(self._systems)}")
+            if cs.estimated:
+                raise InvariantError(f"{where}I2: entry {dict(key)} is placed in {sid!r}, an "
+                                     f"estimated system; positions go into nominal ones only")
+            if not images:
+                continue
+            pyr = self._open(self._pyramids[key])
+            if pyr.meta.get_translation(pyr.meta.resolution_paths[0]) is None:
+                raise InvariantError(_no_translation(where, key, sid))
+            if cs.axes is not None:
+                names = {a.name for a in cs.axes}
+                missing = [a for a in pyr.meta.axis_order if a not in names]
+                if missing:
+                    raise InvariantError(f"{where}I8: entry {dict(key)} has axes "
+                                         f"{missing} that its system {sid!r} does not have")
+
+        def check_end(end, edge):
+            if end is None or isinstance(end, ExternalRef):
+                return
+            if is_image_key(end):
+                if end not in self._pyramids:
+                    raise InvariantError(f"{where}I5: an edge ({edge.type}) starts or ends at "
+                                         f"{dict(end)}, which is not an entry")
+            elif end not in self._systems:
+                raise InvariantError(f"{where}I5: an edge ({edge.type}) starts or ends at "
+                                     f"{end!r}, which is not one of the systems "
+                                     f"{list(self._systems)}")
+
+        for edge in self._edges:
+            for step in (edge,) + (steps(edge) if edge.type == "sequence" else ()):
+                check_end(step.input, edge)
+                check_end(step.output, edge)
+
+    def components(self, *, warn: bool = True) -> List["Component"]:
+        """The graph's connected components (plan 3.6), the unit a writer gives one owner.
+        Nodes: the shared systems and every entry's own system; edges: the positions
+        (:attr:`system_of`) and every edge of :attr:`coordinate_transformations`, in either
+        direction (an end outside the set joins nothing). An entry without any edge is in
+        no component (unplaced). A component with two or more entries has an owner: the
+        smallest collection of :attr:`tree` holding all of them, as the path of names
+        from the root (``()``: the root; no tree: ``()``); one with a single entry has
+        none (it is written in the single-image form).
+
+        When the edges that are not positions join components that would otherwise have
+        different owners, `warn` gives a ``UserWarning`` naming the edges and the new
+        owner (a plate-wide registration makes the plate the owner of every well's
+        system, so no well is a scene of its own)."""
+        from ome_zarr_pyramid.core.spatial import ExternalRef, is_image_key, steps
+
+        parent: Dict[Any, Any] = {}
+
+        def find(node):
+            parent.setdefault(node, node)
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
+
+        def join(a, b):
+            parent[find(a)] = find(b)
+
+        def node_of(end):
+            if end is None or isinstance(end, ExternalRef):
+                return None
+            return ("entry", end) if is_image_key(end) else ("system", end)
+
+        for key, sid in self._system_of.items():
+            join(("entry", key), ("system", sid))
+        positions = {node: find(node) for node in list(parent)}
+        groups = {}
+        for node, root in positions.items():
+            if node[0] == "entry":
+                groups.setdefault(root, []).append(node[1])
+        before = {root: self._owner_of(keys) for root, keys in groups.items() if len(keys) > 1}
+        joining = []
+        for edge in self._edges:
+            ends = [node_of(e) for step in (edge,) + (steps(edge) if edge.type == "sequence" else ())
+                    for e in (step.input, step.output)]
+            ends = [e for e in ends if e is not None]
+            for a, b in zip(ends, ends[1:]):
+                if find(a) != find(b):
+                    joining.append((edge, a, b))
+                join(a, b)
+        out: Dict[Any, Component] = {}
+        for node in list(parent):
+            c = out.setdefault(find(node), Component(set(), [], [], None))
+            if node[0] == "entry":
+                c.entries.append(node[1])
+            else:
+                c.systems.add(node[1])
+        for edge in self._edges:
+            end = next((node_of(e) for e in (edge.input, edge.output) if node_of(e) is not None), None)
+            if end is not None:
+                out[find(end)].edges.append(edge)
+        components = []
+        for root, c in out.items():
+            if not c.entries:
+                continue                        # systems linked only to each other
+            order = {k: i for i, k in enumerate(self._pyramids)}
+            entries = sorted(c.entries, key=lambda k: order.get(k, len(order)))
+            owner = self._owner_of(entries) if len(entries) > 1 else None
+            components.append(Component(c.systems, entries, c.edges, owner))
+            owners = {before[r] for r, keys in groups.items()
+                      if r in before and find(("entry", keys[0])) == root}
+            if warn and len(owners) > 1:
+                import warnings
+                named = sorted({f"{e.type} {_end_text(e.input)} -> {_end_text(e.output)}"
+                                for e, a, b in joining if find(a) == root})
+                warnings.warn(f"{len(named)} edge(s) ({'; '.join(named[:3])}"
+                              f"{' ...' if len(named) > 3 else ''}) join systems that "
+                              f"{sorted(map(_path_text, owners))} would own; they are "
+                              f"written together under {_path_text(owner)}",
+                              UserWarning, stacklevel=2)
+        return components
+
+    def _owner_of(self, keys) -> Tuple[str, ...]:
+        """The path of names from the root to the smallest collection of the tree
+        holding every entry of `keys` (``()``: the root, also without a tree)."""
+        from ome_zarr_pyramid.core.nodes import CollectionNode
+        if self.tree is None or not isinstance(self.tree, CollectionNode):
+            return ()
+        ids = {}
+        for key, value in self._pyramids.items():
+            ids[id(value)] = key
+        where: Dict[Any, Tuple[str, ...]] = {}
+
+        def walk(node, path):
+            for child in node.nodes:
+                if isinstance(child, CollectionNode):
+                    walk(child, path + (child.name,))
+                    continue
+                key = ids.get(id(child), ids.get(id(getattr(child, "_pyramid", None))))
+                if key is not None:
+                    where[key] = path
+        walk(self.tree, ())
+        paths = [where.get(k, ()) for k in keys]
+        common = paths[0]
+        for p in paths[1:]:
+            n = 0
+            while n < min(len(common), len(p)) and common[n] == p[n]:
+                n += 1
+            common = common[:n]
+        return common
 
     @classmethod
-    def from_zarr(cls, path, *, storage_options: Optional[dict] = None) -> "PyramidCollection":
-        """The collection stored at `path`: an NGFF 0.4/0.5 plate (keyed ``plate``,
+    def from_zarr(cls, path, *, storage_options: Optional[dict] = None,
+                  add_missing_translation: bool = False) -> "PyramidCollection":
+        """The collection stored at `path`: an NGFF 0.4 / 0.5 / 0.6 plate (keyed ``plate``,
         ``acquisition``, ``well``, ``field``, as micro-reader keys plate images), a well
-        on its own (``acquisition``, ``field``), a bioformats2raw layout (``series``), or
-        a single image (the one key ``()``). The plate and well metadata are read now; each image when it is first used.
-        `storage_options` as for ``io.read_pyramid`` (an object-store URL). A store
-        declaring an NGFF version ozp does not read (0.6) raises
-        :class:`~ome_zarr_pyramid.UnsupportedNGFFVersion` here, from its attributes."""
+        on its own (keyed as in its plate when it carries ``eubi:images``, else
+        ``acquisition``, ``field``), a bioformats2raw layout (``series``), an RFC 8
+        collection, or a single image (the one key ``()``). The plate and well metadata
+        are read now; each image when it is first used. `storage_options` as for
+        ``io.read_pyramid`` (an object-store URL). A store declaring an NGFF version ozp
+        does not read (0.7, say) raises :class:`~ome_zarr_pyramid.UnsupportedNGFFVersion`
+        here, from its attributes.
+
+        An image the store places in a coordinate system but that has no level-0
+        translation raises :class:`~ome_zarr_pyramid.core.spatial.InvariantError` (I4)
+        when it opens; ``add_missing_translation=True`` places it at the system's origin
+        instead (decision O-2)."""
+        add = add_missing_translation
         from ome_zarr_pyramid.core.io import _open_store_group
         from ome_zarr_pyramid.core.ngff_plate import (
             ImageOpener, _split, _stem, read_plate, read_well)
@@ -351,15 +736,15 @@ class PyramidCollection(Mapping):
         from ome_zarr_pyramid.core import rfc8
 
         if str(path).lower().endswith(".json"):                # a standalone RFC 8 document
-            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
+            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options), add)
         from zarr.errors import ContainsArrayError
         try:
             root = _open_store_group(str(path), None, mode="r", storage_options=storage_options)
         except ContainsArrayError:            # an array: an RFC 8 singlescale image
-            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
+            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options), add)
         attrs = root.attrs.asdict()
         if rfc8.is_rfc8(attrs.get("ome")):
-            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options))
+            return cls._from_tree(rfc8.read_rfc8(path, storage_options=storage_options), add)
         version, ngff, _ = _split(attrs)
         if "multiscales" in ngff and not ("plate" in ngff or "well" in ngff):
             version = NGFFMetadataHandler.declared_version(attrs)
@@ -375,27 +760,171 @@ class PyramidCollection(Mapping):
         elif "multiscales" in ngff:
             tree = MultiscaleNode(_stem(path) or "image", path=NodePath("zarr", "."),
                                   loader=ImageOpener(path, storage_options))
-            return cls({(): tree}, name=tree.name, tree=tree)
+            # a lone image keeps its system (3.26), from the attributes read already
+            from ome_zarr_pyramid.core.spatial import SYSTEM_KEY, SYSTEMS_KEY, system_from_json
+            custom = _split(attrs)[2]
+            sid = custom.get(SYSTEM_KEY)
+            systems = [system_from_json(o) for o in custom.get(SYSTEMS_KEY) or []]
+            coll = cls({(): tree}, name=tree.name, tree=tree, coordinate_systems=systems,
+                       system_of={(): str(sid)} if sid is not None else {},
+                       coordinate_transformations=())
+            return coll._finish_store_read(path, add)
         elif "bioformats2raw.layout" in ngff:
             from ome_zarr_pyramid.core.ngff_series import read_series
             tree = read_series(path, storage_options=storage_options, _group=root)
-            # keyed as micro-reader keys a file's series (bioformats2raw's series)
-            return cls({((SERIES_INDEX, i),): node for i, node in enumerate(tree.nodes)},
-                       name=tree.name, tree=tree)
+            # keyed as micro-reader keys a file's series (bioformats2raw's series), or by
+            # their eubi:index (3.18)
+            entries = [(((SERIES_INDEX, i),), node) for i, node in enumerate(tree.nodes)]
+            where = {id(n): (n.path.path, tree) for _, n in entries}
+            return cls._keyed_from_store(entries, where, tree, root, path, series=True, add=add)
         else:
             raise ValueError(f"{path}: not an OME-Zarr image, well or plate (its metadata "
                              f"has no 'multiscales', 'well' or 'plate')")
-        return cls(dict(_tree_entries(tree)), name=tree.name, tree=tree)
+        entries = list(_tree_entries(tree))
+        if "plate" not in ngff:
+            # a well on its own: keyed and placed as in its plate, from its eubi:images
+            # and the systems on it (decision O-5); its spec keys when it has none
+            where = {id(n): (n.path.path, tree) for _, n in entries if n.path is not None}
+            return cls._keyed_from_store(entries, where, tree, root, path, series=False,
+                                         listing_groups={"": tree.attributes}, add=add)
+        where = {}
+        for well in tree.nodes:
+            for image in well.walk():
+                if isinstance(image, MultiscaleNode) and image.path is not None:
+                    where[id(image)] = (f"{well.path.path}/{image.path.path}", well)
+        return cls._keyed_from_store(entries, where, tree, root, path, series=False, add=add)
 
     @classmethod
-    def _from_tree(cls, tree) -> "PyramidCollection":
+    def _keyed_from_store(cls, entries, where, tree, root, path, *, series: bool,
+                          listing_groups: Optional[Mapping[str, Any]] = None, add: bool = False):
+        """The collection of a plate or series layout read from a store, with the keys
+        and the graph its ``eubi:`` keys hold (plan 3.18, 5.7, 5.11): keys from
+        ``eubi:images`` (``eubi:index`` wins for numbers the spec does not state: field,
+        series, tile, ...; the spec's plate, acquisition and well win, a disagreement
+        warns), ``system_of`` from it, the systems and edges from the groups read. A
+        store written with ``eubi:version`` whose listing group lacks ``eubi:images``
+        has its image groups read in one batch. A series layout whose every image has an
+        index gets the tree of its keys (series flattened on writing get their series
+        level back). `listing_groups` names the groups whose ``eubi:`` keys hold the graph
+        (default: the root and, for a plate, its wells). Opens no image."""
+        import warnings
+
+        from ome_zarr_pyramid.core import eubi_keys as ek
+        from ome_zarr_pyramid.core.ngff_plate import _group_attrs, _split
+
+        root_attrs = tree.attributes
+        marked = ek.VERSION_KEY in root_attrs
+        ek.check_version(root_attrs, str(path))
+        found: Dict[int, Optional[dict]] = {}
+        missing = []
+        for key, node in entries:
+            if id(node) not in where:          # an image without a path: its spec key
+                continue
+            image_path, listing = where[id(node)]
+            listed = listing.attributes.get(ek.IMAGES_KEY)
+            if isinstance(listed, Mapping):
+                found[id(node)] = listed.get(node.path.path)
+            elif marked:
+                missing.append((node, image_path))
+        if missing:                            # one batch of the image groups (3.18)
+            for (node, _), attrs in zip(missing, _group_attrs(root, [p for _, p in missing])):
+                custom = _split(attrs)[2] if attrs else {}
+                if ek.INDEX_KEY in custom:
+                    found[id(node)] = {"index": custom[ek.INDEX_KEY],
+                                       "coordinate_system": custom.get(ek.SYSTEM_KEY)}
+        out, system_of, key_of_path = {}, {}, {}
+        disagree = []
+        for key, node in entries:
+            entry = found.get(id(node))
+            if isinstance(entry, Mapping) and isinstance(entry.get("index"), Mapping):
+                written = ek.key_from_json(entry["index"])
+                if not series:                 # the spec's numbers win (5.11)
+                    spec = dict(key)
+                    names = [n for n, _ in written]
+                    for n in ("well", "acquisition", "plate"):
+                        if n in spec and n not in names:
+                            names.insert(0, n)
+                    values = dict(written)
+                    for n in ("plate", "acquisition", "well"):
+                        if n in spec:
+                            if n in values and values[n] != spec[n]:
+                                disagree.append((dict(key), dict(written)))
+                            values[n] = spec[n]
+                    written = tuple((n, values[n]) for n in names)
+                key = written
+                if entry.get("coordinate_system") is not None:
+                    system_of[key] = str(entry["coordinate_system"])
+            if key in out:
+                raise ValueError(f"{path}: two images have the index {dict(key)} "
+                                 f"({ek.INDEX_KEY} / {ek.IMAGES_KEY})")
+            out[key] = node
+            if id(node) in where:
+                key_of_path[where[id(node)][0]] = key
+        if disagree:
+            warnings.warn(f"{path}: {len(disagree)} image(s) whose {ek.INDEX_KEY} disagrees "
+                          f"with the plate's own numbering (e.g. {disagree[0][1]} for "
+                          f"{disagree[0][0]}); the plate's is kept (plan 5.11)",
+                          UserWarning, stacklevel=3)
+        if listing_groups is not None:
+            groups = dict(listing_groups)
+        else:
+            groups = {"": root_attrs}
+            if not series:
+                groups.update({well.path.path: well.attributes for well in tree.nodes})
+        systems, edges = ek.graph_from_groups(groups, key_of_path, str(path))
+        systems, system_of, scene_edges = _read_scenes(groups, key_of_path, out, systems,
+                                                       system_of, str(path))
+        edges = list(edges) + scene_edges
+        if series and marked and len(found) == len(entries) and out:
+            tree, out = _tree_of_keys(tree, out)   # flattened series get their level back
+        coll = cls(out, name=tree.name, tree=tree, coordinate_systems=systems,
+                   system_of=system_of, coordinate_transformations=edges)
+        return coll._finish_store_read(path, add)
+
+    def _finish_store_read(self, path, add_missing_translation: bool = False) -> "PyramidCollection":
+        """Scope the ids to the store (5.24) and check the graph without opening an image;
+        a system named without its definition gets one with unknown axes, with a warning
+        (3.26). Each placed image is checked for its level-0 translation when it opens
+        (I4; zeros with `add_missing_translation`, decision O-2)."""
+        import warnings
+
+        from ome_zarr_pyramid.core.spatial import CoordinateSystem
+        bare = sorted(set(self._system_of.values()) - set(self._systems))
+        if bare:
+            warnings.warn(f"{path}: coordinate system(s) {bare} are named without their "
+                          f"definition; they get unknown axes, filled when written",
+                          UserWarning, stacklevel=3)
+            for sid in bare:
+                self._systems[sid] = CoordinateSystem(sid)
+        self._source = ("store", str(path))
+        self.check_invariants(images=False)
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+        for key, sid in self._system_of.items():
+            node = self._pyramids.get(key)
+            if isinstance(node, MultiscaleNode) and getattr(node, "loader", None) is not None \
+                    and getattr(node, "_pyramid", None) is None:
+                _translation_on_load(node, key, sid, add_missing_translation, str(path))
+        return self
+
+    @classmethod
+    def _from_tree(cls, tree, add: bool = False) -> "PyramidCollection":
         """A collection over an RFC 8 tree: plates keyed as micro-reader keys plate
         images, any other collection ``(("series", i),)``, a single image ``()``."""
         from ome_zarr_pyramid.core.plates import plate_nodes
         from ome_zarr_pyramid.core.rfc8 import tree_entries
 
-        entries = (_tree_entries(tree) if plate_nodes(tree) else tree_entries(tree))
-        return cls(dict(entries), name=tree.name, tree=tree)
+        from ome_zarr_pyramid.core import rfc8_keys
+
+        entries = list(_tree_entries(tree) if plate_nodes(tree) else tree_entries(tree))
+        entries, systems, system_of, edges = rfc8_keys.graph_from_tree(tree, entries, tree.name)
+        out = {}
+        for key, node in entries:
+            if key in out:
+                raise ValueError(f"{tree.name}: two images have the index {dict(key)}")
+            out[key] = node
+        coll = cls(out, name=tree.name, tree=tree, coordinate_systems=systems,
+                   system_of=system_of, coordinate_transformations=edges)
+        return coll._finish_store_read(tree.name, add)
 
     @staticmethod
     def _open(value):
@@ -416,8 +945,18 @@ class PyramidCollection(Mapping):
         ``field``); an index name ozp does not know (the old series name eubi-bridge
         0.2.x uses) is kept as it is. :attr:`tree` is built from the indices (see
         :func:`ome_zarr_pyramid.core.plates.tree_from_file`): the file's plates, and its
-        series, each a collection when it holds several images."""
+        series, each a collection when it holds several images.
+
+        Where the images are (3.3, 3.4): :attr:`coordinate_systems` and
+        :attr:`coordinate_transformations` are the file's (``file.coordinate_systems``,
+        ``file.coordinate_transformations``), and an image whose
+        ``metadata.coordinate_system`` names a system is placed in it, its position being
+        its level-0 translation. A file without ``coordinate_systems`` (eubi-bridge's own
+        objects) gives each system its images name a minimal definition: the id, and the
+        axes of the images in it (3.26). An image that names no system is unplaced, its
+        position still written as its translation (5.12)."""
         out = {}
+        system_of = {}
         for image in file.images:
             index = dict(getattr(image, "index", None) or {})
             if int(index.get(_RESOLUTION, 0)) != 0:
@@ -426,11 +965,32 @@ class PyramidCollection(Mapping):
             if key in out:
                 raise ValueError(f"two images share the index {dict(key)}")
             out[key] = pyramid_from_image(image, version=version, **kwargs)
+            sid = getattr(getattr(image, "metadata", None), "coordinate_system", None)
+            if sid is not None:
+                system_of[key] = str(sid)
         from ome_zarr_pyramid.core.plates import file_stem, tree_from_file
+        from ome_zarr_pyramid.core.spatial import merge_systems, minimal_system
         path = getattr(file, "path", None)
         tree = tree_from_file(file, out, name=file_stem(path) if path else None)
-        return cls(out, name=path, tree=tree)
+        systems = getattr(file, "coordinate_systems", None)
+        if systems is None:
+            # the file does not describe its systems (eubi-bridge's own objects): each
+            # one an image names gets a minimal definition, its axes the images' own (3.26)
+            minimal: Dict[str, Any] = {}
+            for key, sid in system_of.items():
+                mine = minimal_system(sid, out[key])
+                minimal[sid] = merge_systems(minimal[sid], mine) if sid in minimal else mine
+            systems = list(minimal.values())
+        coll = cls(out, name=path, tree=tree, coordinate_systems=systems,
+                   system_of=system_of,
+                   coordinate_transformations=getattr(file, "coordinate_transformations",
+                                                      None) or ())
+        if path:
+            coll._source = ("file", str(path))
+        coll.check_invariants()
+        return coll
 
+    @validating
     def write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
                     overwrite: bool = False, storage_options: Optional[dict] = None,
                     writer: Optional[Callable] = None, document: Optional[str] = None,
@@ -474,13 +1034,55 @@ class PyramidCollection(Mapping):
                 indices.append(dict(key))
             fields.append((well.name, indices))
         if version == "rfc8":
+            from ome_zarr_pyramid.core import rfc8_keys
             from ome_zarr_pyramid.core.rfc8 import write_rfc8
-            return write_rfc8(node, path, document=document, overwrite=overwrite,
-                              storage_options=storage_options, writer=writer, **write_kwargs)
+            return write_rfc8(rfc8_keys.annotate(self, node, key_of), path, document=document,
+                              overwrite=overwrite, storage_options=storage_options,
+                              writer=writer, **write_kwargs)
         check_fields(node.name, fields)        # one image per field, in every version
+        node = self._plate_with_keys(node, key_of, version)
         return write_plate(node, path, version=version, overwrite=overwrite,
                            storage_options=storage_options, writer=writer, **write_kwargs)
 
+    def _plate_with_keys(self, node, key_of, version):
+        """A copy of plate `node` carrying the ``eubi:`` keys of 0.4 / 0.5 (plan 5.7): each
+        image a stamped clone with its ``eubi:index`` (``pyramid(key)``), each well its
+        ``eubi:images`` and ``eubi:kind``, the plate ``eubi:version`` and ``eubi:kind``,
+        and each component's systems and edges on its owner (3.6). The collection and its
+        tree are not changed."""
+        from ome_zarr_pyramid.core import eubi_keys as ek
+        from ome_zarr_pyramid.core.ngff_plate import DEFAULT_VERSION, image_paths, well_path
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+
+        out = node.copy()
+        for n in out.walk():
+            n.attributes = ek.strip(n.attributes)
+        attr = out.attributes["plate"]
+        paths, listing, leaves = {}, {}, []
+        for well, copied in zip(node.nodes, out.nodes):
+            where = well_path(attr, copied)
+            for image, image_copy, image_path in zip(well.nodes, copied.nodes,
+                                                     image_paths(copied)):
+                if not isinstance(image, MultiscaleNode) or "labels" in image.attributes \
+                        or "source" in image.attributes:
+                    continue
+                key = key_of.get(id(image), key_of.get(id(getattr(image, "_pyramid", None))))
+                paths[key], listing[key] = f"{where}/{image_path}", where
+                leaves.append((image_copy, key))
+        written = str(version or node.ngff_fields.get("version") or DEFAULT_VERSION)
+        groups, pyramids = ek.graph_attrs(self._derive(list(paths)), paths, listing,
+                                          set(listing.values()), written)
+        out.attributes.update(groups.get("", {}))
+        out.attributes[ek.KIND_KEY] = "plate"
+        for copied in out.nodes:
+            copied.attributes.update(groups.get(well_path(attr, copied), {}))
+            copied.attributes[ek.KIND_KEY] = "well"
+        for image_copy, key in leaves:
+            image_copy.pyramid = pyramids[key]
+            image_copy.attributes[ek.INDEX_KEY] = ek.index_json(key)
+        return out
+
+    @validating
     def write_series(self, path, *, version: Optional[str] = None, overwrite: bool = False,
                      ome_xml: Optional[str] = None, storage_options: Optional[dict] = None,
                      writer: Optional[Callable] = None, document: Optional[str] = None,
@@ -504,10 +1106,12 @@ class PyramidCollection(Mapping):
         from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
 
         tree = self.tree
+        key_of = self._key_of_nodes()          # each image node's key (for the writers)
         if isinstance(tree, CollectionNode) and LAYOUT_KEY in tree.attributes \
                 and "plate" not in tree.attributes \
                 and {id(n) for n in tree.nodes} == {id(v) for v in self._pyramids.values()}:
             node = tree                    # read from a series layout, all of it: as read
+            keys = [key_of[id(n)] for n in tree.nodes]
         else:                              # any other collection: series 0, 1, ... in key order
             keys = sorted(self._pyramids)
             crowded = _crowded(keys) if version != "rfc8" else []
@@ -522,13 +1126,42 @@ class PyramidCollection(Mapping):
                     f"{' / '.join(names)} an image is", UserWarning, stacklevel=2)
             node = CollectionNode("series")
             for i, key in enumerate(keys):
-                node.add(MultiscaleNode(str(i), self[key]))
+                child = node.add(MultiscaleNode(str(i), self[key]))
+                key_of[id(child)] = key
         if version == "rfc8":
+            from ome_zarr_pyramid.core import rfc8_keys
             from ome_zarr_pyramid.core.rfc8 import write_rfc8
-            return write_rfc8(node, path, document=document, overwrite=overwrite,
+            return write_rfc8(rfc8_keys.annotate(self, node, key_of), path,
+                              document=document, overwrite=overwrite,
                               storage_options=storage_options, writer=writer, **write_kwargs)
+        node = self._series_with_keys(node, keys, version)
         return write_series(node, path, version=version, overwrite=overwrite, ome_xml=ome_xml,
                             storage_options=storage_options, writer=writer, **write_kwargs)
+
+    def _series_with_keys(self, node, keys, version):
+        """A copy of series layout `node` (its images are the entries `keys`, in order)
+        carrying the ``eubi:`` keys of 0.4 / 0.5 (plan 5.7): each series image a stamped clone with its ``eubi:index``, the root
+        ``eubi:version``, ``eubi:images`` and the graph (the root is the only collection
+        group of the layout, so it owns every component)."""
+        from ome_zarr_pyramid.core import eubi_keys as ek
+        from ome_zarr_pyramid.core.ngff_plate import DEFAULT_VERSION, image_paths
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode
+
+        out = node.copy()
+        out.attributes = ek.strip(out.attributes)
+        paths, leaves = {}, []
+        images = [(c, p) for n, c, p in zip(node.nodes, out.nodes, image_paths(out))
+                  if isinstance(n, MultiscaleNode)]
+        for (image_copy, series_path), key in zip(images, keys):
+            paths[key] = series_path
+            leaves.append((image_copy, key))
+        written = str(version or node.ngff_fields.get("version") or DEFAULT_VERSION)
+        groups, pyramids = ek.graph_attrs(self._derive(list(paths)), paths,
+                                          {k: "" for k in paths}, [""], written)
+        out.attributes.update(groups.get("", {}))
+        for image_copy, key in leaves:
+            image_copy.pyramid = pyramids[key]
+        return out
 
     def write_collection(self, path, *, version: str = "rfc8", document: Optional[str] = None,
                          overwrite: bool = False, storage_options: Optional[dict] = None,
@@ -547,23 +1180,33 @@ class PyramidCollection(Mapping):
         if version != "rfc8":
             raise ValueError(f"write_collection writes version='rfc8'; NGFF {version} plates "
                              f"and series are write_plate / write_series")
+        from ome_zarr_pyramid.core import rfc8_keys
+
         tree = self.tree
+        key_of = self._key_of_nodes()
         if isinstance(tree, MultiscaleNode):
             node = CollectionNode(tree.name, [tree])
         elif isinstance(tree, CollectionNode):
             held = {id(v) for v in self._pyramids.values()}
             images = [n for _, n in (_tree_entries(tree) if self.plates else tree_entries(tree))]
             if any(id(n) not in held and id(getattr(n, "_pyramid", None)) not in held
-                   for n in images):
+                   and getattr(n, "_alias_of", None) is None for n in images):
                 raise ValueError("this collection is a selection of its tree; write it from "
                                  "the whole collection")
             node = tree
         else:
             node = CollectionNode(str(self.name or "collection"))
             for i, key in enumerate(sorted(self._pyramids)):
-                node.add(MultiscaleNode(str(i), self[key]))
-        return write_rfc8(node, path, document=document, overwrite=overwrite,
+                child = node.add(MultiscaleNode(str(i), self[key]))
+                key_of[id(child)] = key
+        return write_rfc8(rfc8_keys.annotate(self, node, key_of),
+                          path, document=document, overwrite=overwrite,
                           storage_options=storage_options, writer=writer, **write_kwargs)
+
+    def _key_of_nodes(self) -> Dict[int, Any]:
+        """``id`` of each entry's value (its tree node, or its pyramid) -> its key (for the
+        writers; a node a writer builds is added by its own ``id``)."""
+        return {id(v): k for k, v in self._pyramids.items()}
 
     @property
     def plates(self) -> list:
@@ -582,6 +1225,30 @@ class PyramidCollection(Mapping):
 
     def __getitem__(self, key):
         return self._open(self._lookup(key))
+
+    def pyramid(self, key):
+        """The entry at `key` as a pyramid of its own (plan 3.26, 8.25): a metadata clone
+        (sharing the arrays) that keeps the system the entry is placed in, as the custom
+        metadata ``eubi:coordinate_system`` and ``eubi:coordinate_systems`` (its id and
+        definition), or none when the entry is unplaced. Written alone, it keeps where it
+        is; put back into a collection with others from this one, it shares their systems.
+        ``coll[key]`` is the shared object, never changed."""
+        from ome_zarr_pyramid.core.plates import file_stem
+        from ome_zarr_pyramid.core.spatial import stamp_system
+
+        if isinstance(key, Mapping):
+            key = _key(key)
+        key = tuple(key)
+        shared = self[key]
+        clone = shared._clone_metadata_only()
+        for attr in ("acquisition", "source_index", "joined_index", "source_series"):
+            if hasattr(shared, attr):
+                setattr(clone, attr, copy.deepcopy(getattr(shared, attr)))
+        sid = self._system_of.get(key)
+        stamp_system(clone, self._systems[sid] if sid is not None else None)
+        clone._spatial_source = self._source
+        clone._spatial_set_name = file_stem(self.name) if self.name else None
+        return clone
 
     def __iter__(self) -> Iterator[Tuple[Tuple[str, int], ...]]:
         return iter(self._pyramids)
@@ -616,13 +1283,38 @@ class PyramidCollection(Mapping):
         return self._derive([k for k in self._pyramids
                              if all(dict(k).get(name) == value for name, value in index.items())])
 
+    def _graph_for(self, keys) -> dict:
+        """The part of the graph the entries `keys` keep (3.25): their placements, the
+        edges whose image ends are all among them, and the systems those name (a
+        system nothing names is left out)."""
+        from ome_zarr_pyramid.core.spatial import is_image_key, steps
+
+        kept = set(keys)
+        system_of = {k: s for k, s in self._system_of.items() if k in kept}
+
+        def ends(edge):
+            for step in (edge,) + (steps(edge) if edge.type == "sequence" else ()):
+                yield step.input
+                yield step.output
+
+        edges = [e for e in self._edges
+                 if all(end in kept for end in ends(e) if is_image_key(end))]
+        named = set(system_of.values()) | {end for e in edges for end in ends(e)
+                                           if isinstance(end, str)}
+        systems = [cs for sid, cs in self._systems.items() if sid in named]
+        return {"coordinate_systems": systems, "system_of": system_of,
+                "coordinate_transformations": edges}
+
     def _derive(self, keys) -> "PyramidCollection":
         """A collection of these keys, in this order: the same tree (plates keep every
-        well, so "well": w stays wells[w]; their fields hold the kept images only) and the
-        table rows already built."""
-        new = type(self)({k: self._pyramids[k] for k in keys}, name=self.name, tree=self.tree)
+        well, so "well": w stays wells[w]; their fields hold the kept images only), the
+        part of the graph they keep (3.25) and the table rows already built."""
+        keys = list(keys)
+        new = type(self)({k: self._pyramids[k] for k in keys}, name=self.name, tree=self.tree,
+                         **self._graph_for(keys))
         new._rows = {k: self._rows[k] for k in keys if k in self._rows}
         new._names = frozenset(self._index_names())
+        new._source = self._source
         return new
 
     # -- the table and its queries ----------------------------------------------
@@ -774,7 +1466,13 @@ class PyramidCollection(Mapping):
         the order of the folded indices' values: the first index outermost. Each joined
         pyramid has ``joined_index``: for every position along *axis* (every channel, for
         ``c``), the folded indices' values it came from, e.g. ``[{"view": 0}, {"view": 0},
-        {"view": 1}, ...]``, to name its channels."""
+        {"view": 1}, ...]``, to name its channels.
+
+        The joined image is placed in its parts' coordinate system (3.25); parts in
+        different systems, or some placed and some not, raise ``ValueError``. Edges that
+        start or end at a folded part are dropped, with a warning (they belonged to one
+        part, not to the joined image). The new collection gets a tree built from its keys
+        (with the plates of this one)."""
         from ome_zarr_pyramid.core.concatenate import concatenate
 
         names = (index,) if isinstance(index, str) else tuple(index)
@@ -791,8 +1489,18 @@ class PyramidCollection(Mapping):
             rest = tuple((k, v) for k, v in key if k not in names)
             groups.setdefault(rest, []).append(key)
         out = {}
+        system_of = {}
         for rest, keys in groups.items():
             keys.sort(key=lambda key: tuple(dict(key)[name] for name in names))
+            placed = {self._system_of.get(key) for key in keys}
+            if len(placed) > 1:
+                raise ValueError(
+                    f"concatenate: the entries joined into {dict(rest)} are in different "
+                    f"coordinate systems or some are unplaced: "
+                    f"{ {str(dict(k)): self._system_of.get(k) for k in keys} }; a joined image "
+                    f"has one position, in one system")
+            if None not in placed:
+                system_of[rest] = placed.pop()
             parts = [self._open(self._pyramids[key]) for key in keys]
             joined = concatenate(parts, axis=axis)
             positions = []
@@ -804,7 +1512,25 @@ class PyramidCollection(Mapping):
             joined.joined_index = positions
             joined.source_index = dict(rest)
             out[rest] = joined
-        return type(self)(out, name=self.name)
+        # every entry is a folded part: an edge at an image belonged to that part only;
+        # edges between systems stay
+        graph = self._graph_for([])
+        dropped = len(self._edges) - len(graph["coordinate_transformations"])
+        if dropped:
+            import warnings
+            warnings.warn(f"concatenate: {dropped} edge(s) that start or end at a joined "
+                          f"entry are dropped: each belonged to one part, not to the joined "
+                          f"image", UserWarning, stacklevel=2)
+        named = set(system_of.values()) | {cs.id for cs in graph["coordinate_systems"]}
+        systems = [cs for sid, cs in self._systems.items() if sid in named]
+        from ome_zarr_pyramid.core.plates import tree_from_file
+        shim = type("_Keys", (), {"plates": self.plates})()
+        tree = tree_from_file(shim, out, name=getattr(self.tree, "name", None) or self.name)
+        new = type(self)(out, name=self.name, tree=tree, coordinate_systems=systems,
+                         system_of=system_of,
+                         coordinate_transformations=graph["coordinate_transformations"])
+        new._source = self._source
+        return new
 
     @property
     def varying(self) -> Tuple[str, ...]:
@@ -825,17 +1551,35 @@ class PyramidCollection(Mapping):
                  if name in self.varying]
         return "".join(parts)
 
+    @validating
     def write(self, directory, stem: str, *, names: Optional[Dict[str, str]] = None,
               writer: Optional[Callable] = None, **write_kwargs) -> Dict[Any, str]:
         """Write each entry as ``<directory>/<stem><suffix>.ome.zarr``; returns
-        {key: path}. `write_kwargs` go to ``io.write_pyramid`` (or `writer`)."""
-        import os
+        {key: path}. `write_kwargs` go to ``io.write_pyramid`` (or `writer`).
 
+        Each image keeps where it is (plan 3.26, 5.7): written as :meth:`pyramid` gives
+        it (``eubi:coordinate_system`` and its definition), with its key as
+        ``eubi:index`` and ``eubi:version`` (each output is a root of its own; decision
+        O-4). The graph's other edges (affine edges, registrations) have no place in a
+        store of one image: they are left out with a warning (plan 3.10); `write_series`,
+        `write_plate` and `write_collection` keep them."""
+        import os
+        import warnings
+
+        from ome_zarr_pyramid.core import eubi_keys as ek
         from ome_zarr_pyramid.core.io import IO
+        if self._edges:
+            kinds = sorted({e.type for e in self._edges})
+            warnings.warn(f"write: {len(self._edges)} edge(s) of the coordinate-system graph "
+                          f"({', '.join(kinds)}) are not written, since each store holds one "
+                          f"image; write_series, write_plate or write_collection keep them "
+                          f"(plan 3.10)", UserWarning, stacklevel=2)
         write = writer or IO().write_pyramid
         paths = {}
-        for key, value in self._pyramids.items():
-            pyr = self._open(value)
+        for key in self._pyramids:
+            pyr = self.pyramid(key)
+            pyr.meta.set_custom(ek.INDEX_KEY, ek.index_json(key))
+            pyr.meta.set_custom(ek.VERSION_KEY, ek.EUBI_VERSION)
             path = os.path.join(str(directory), f"{stem}{self.suffix(key, names)}.ome.zarr")
             write(pyr, path, **write_kwargs)
             paths[key] = path

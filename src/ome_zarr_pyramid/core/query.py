@@ -157,11 +157,12 @@ def _array_header(md: Dict[str, Any]) -> Dict[str, Any]:
 
 def row_from_json(attrs: Dict[str, Any], headers: Sequence[Dict[str, Any]],
                   path: Optional[str] = None) -> Dict[str, Any]:
-    """The row of an NGFF 0.4 / 0.5 image from its group attributes and its level arrays'
-    metadata (in dataset order)."""
+    """The row of an NGFF 0.4 / 0.5 / 0.6 image from its group attributes and its level
+    arrays' metadata (in dataset order)."""
+    from ome_zarr_pyramid.core.ngff06 import ozp_multiscales
     ome = attrs.get("ome") if isinstance(attrs.get("ome"), dict) else attrs
-    ms = (ome.get("multiscales") or [{}])[0]
-    version = ome.get("version") or ms.get("version")
+    version, mss = ozp_multiscales(attrs, path or "image")
+    ms = (mss or [{}])[0]
     axes_md = ms.get("axes") or []
     axes = "".join((a.get("name") if isinstance(a, dict) else str(a)).lower() for a in axes_md)
     units = tuple((a.get("unit") if isinstance(a, dict) else None) for a in axes_md)

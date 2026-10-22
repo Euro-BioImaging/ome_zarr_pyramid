@@ -74,7 +74,11 @@ def test_a_layout_round_trips(tmp_path, version):
     for group in ("", "OME"):
         a = zarr.open_group(os.path.join(src, group), mode="r").attrs.asdict()
         b = zarr.open_group(os.path.join(out, group), mode="r").attrs.asdict()
-        assert a == b, group
+        # as read, plus the eubi: keys of 0.4 / 0.5 on the root (plan 5.7)
+        assert {k: v for k, v in b.items() if not k.startswith("eubi:")} == a, group
+    root = zarr.open_group(out, mode="r").attrs.asdict()
+    assert root["eubi:version"] == 1
+    assert root["eubi:images"]["1"] == {"index": {"series": 1}, "coordinate_system": None}
     with open(os.path.join(out, "OME", "METADATA.ome.xml"), newline="") as f:
         assert f.read() == XML
     back = PyramidCollection.from_zarr(out)
@@ -118,7 +122,9 @@ def test_any_collection_is_written_as_series_in_either_version(tmp_path):
     coll.write_series(out, version="0.5", ome_xml=xml3)          # one Image per series
     root = zarr.open_group(out, mode="r")
     assert root.metadata.zarr_format == 3
-    assert root.attrs.asdict() == {"ome": {"version": "0.5", "bioformats2raw.layout": 3}}
+    attrs = root.attrs.asdict()
+    assert attrs["ome"] == {"version": "0.5", "bioformats2raw.layout": 3}
+    assert attrs["eubi:version"] == 1 and sorted(attrs["eubi:images"]) == ["0", "1", "2"]
     assert zarr.open_group(os.path.join(out, "OME"), mode="r").attrs.asdict() == {
         "ome": {"version": "0.5", "series": ["0", "1", "2"]}}
     back = PyramidCollection.from_zarr(out)

@@ -28,7 +28,9 @@ import zarr
 
 from ome_zarr_pyramid.core import tensorstore_writer
 from ome_zarr_pyramid.core._compat import downscale_processes, renamed
+from ome_zarr_pyramid.core.nodes import nests_in_ome
 from ome_zarr_pyramid.core.pyramid import Pyramid, level_translation
+from ome_zarr_pyramid.core.validation import validating
 from ome_zarr_pyramid.utils.array_utils import get_array_chunks, get_chunk_shape
 from ome_zarr_pyramid.utils.logging_config import get_logger
 from ome_zarr_pyramid.utils.optional_deps import is_dask_array, is_installed, require
@@ -46,8 +48,8 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*cannot sch
 
 def _attach_image_label(group: zarr.Group, image_label: dict, version: str) -> None:
     """Attach OME ``image-label`` metadata to a label-image group (version-aware:
-    0.5 nests it under the ``ome`` attr; 0.4 uses a top-level ``image-label``)."""
-    if version == "0.5":
+    0.5 and 0.6 nest it under the ``ome`` attr; 0.4 uses a top-level ``image-label``)."""
+    if nests_in_ome(version):
         ome = dict(group.attrs.get("ome", {}))
         ome["image-label"] = image_label
         group.attrs["ome"] = ome
@@ -55,9 +57,13 @@ def _attach_image_label(group: zarr.Group, image_label: dict, version: str) -> N
         group.attrs["image-label"] = image_label
 
 
-def _register_label_name(labels_group: zarr.Group, name: str, version: str) -> None:
-    """Add ``name`` to a ``labels`` group's label list (the NGFF labels/ convention)."""
-    if version == "0.5":
+def _register_label_name(labels_group: zarr.Group, name: str, version: str, *,
+                         image_path=None, label_system: Optional[str] = None,
+                         storage_options: Optional[dict] = None) -> None:
+    """Add ``name`` to a ``labels`` group's label list (the NGFF labels/ convention). In
+    0.6 the image at `image_path` (the group holding the labels group) also gets the
+    label's link to `label_system`, the label's intrinsic system (3.28)."""
+    if nests_in_ome(version):
         ome = dict(labels_group.attrs.get("ome", {}))
         ome.setdefault("version", version)
         names = list(ome.get("labels", []))
@@ -65,11 +71,43 @@ def _register_label_name(labels_group: zarr.Group, name: str, version: str) -> N
             names.append(name)
         ome["labels"] = names
         labels_group.attrs["ome"] = ome
+        if str(version) == "0.6" and image_path is not None:
+            _link_label_06(image_path, name, label_system, storage_options)
     else:  # 0.4
         names = list(labels_group.attrs.get("labels", []))
         if name not in names:
             names.append(name)
         labels_group.attrs["labels"] = names
+
+
+def _link_label_06(image_path, name: str, label_system: Optional[str],
+                   storage_options: Optional[dict] = None) -> None:
+    """Give the 0.6 image at `image_path` the identity link from its intrinsic system to
+    label `name`'s `label_system` (3.28; the spec's "labels" section), unless it has a
+    link for that label already. Nothing when no 0.6 image is there (yet)."""
+    from ome_zarr_pyramid.core.ngff06 import INTRINSIC
+    try:
+        image = _open_store_group(image_path, 3, mode="a", storage_options=storage_options)
+    except (FileNotFoundError, ValueError, TypeError):
+        return
+    ome = dict(image.attrs.get("ome") or {})
+    mss = list(ome.get("multiscales") or [])
+    if str(ome.get("version")) != "0.6" or not mss:
+        return
+    target = f"labels/{name}"
+    ms = dict(mss[0])
+    cts = list(ms.get("coordinateTransformations") or [])
+    for t in cts:
+        for end in (t.get("input"), t.get("output")):
+            if isinstance(end, dict) and str(end.get("path", "")).strip("/") == target:
+                return
+    own = ((ms.get("datasets") or [{}])[0].get("coordinateTransformations") or [{}])[0]
+    intrinsic = (own.get("output") or {}).get("name") or INTRINSIC
+    cts.append({"type": "identity", "input": {"name": intrinsic},
+                "output": {"name": label_system or INTRINSIC, "path": target}})
+    ms["coordinateTransformations"] = cts
+    ome["multiscales"] = [ms] + mss[1:]
+    image.attrs["ome"] = ome
 
 
 def _read_label_names(labels_group: zarr.Group) -> list:
@@ -495,6 +533,59 @@ def _store_join(path, *parts):
     return p
 
 
+def _place_by_scene(pyramid, path, apply: bool, storage_options=None) -> None:
+    """For an image the scene form placed (``eubi:scene`` on its group, plan 5.5): with
+    `apply`, read the scene on the group it names and add the image's position to every
+    level (and its labels'), then drop the back-pointer (the image now holds its position,
+    the single-image form); without, warn once naming that group."""
+    import posixpath
+
+    from ome_zarr_pyramid.core import ngff06
+    from ome_zarr_pyramid.core.eubi_keys import SCENE_KEY
+    from ome_zarr_pyramid.core.spatial import SYSTEMS_KEY, system_from_json
+
+    pointer = (pyramid.meta.custom_blocks or {}).get(SCENE_KEY) if pyramid.meta else None
+    if not isinstance(pointer, str):
+        return
+    here = str(path).replace("\\", "/").rstrip("/")
+    owner = posixpath.normpath(posixpath.join(here, pointer))
+    if not apply:
+        warnings.warn(f"{path}: this image is placed by the NGFF 0.6 scene on {owner}; its "
+                      f"levels hold only their alignment. Read it with apply_scene=True, or "
+                      f"read {owner} with PyramidCollection.from_zarr", UserWarning,
+                      stacklevel=4)
+        return
+    group = _open_store_group(owner, 3, mode="r", storage_options=storage_options)
+    attrs = group.attrs.asdict()
+    rel = posixpath.relpath(here, owner)
+    key = (("image", 0),)
+    systems = {}
+    for obj in attrs.get(SYSTEMS_KEY) or []:
+        cs = system_from_json(obj)
+        systems[cs.id] = cs
+    _, _, positions, _, names = ngff06.graph_from_scenes({"": attrs}, {rel: key}, systems, {},
+                                                         str(owner))
+    if key not in positions:
+        warnings.warn(f"{path}: the scene on {owner} has no position for this image; its "
+                      f"levels are left as they are", UserWarning, stacklevel=4)
+        return
+    if not ngff06.check_intrinsic(pyramid, names.get(key), str(path)):
+        return
+    p = positions[key]
+    for pyr in [pyramid, *(getattr(pyramid, "_labels", None) or {}).values()]:
+        for level in pyr.meta.resolution_paths:
+            t = pyr.meta.get_translation(level) or [0.0] * len(p)
+            pyr.meta.update_translation(level, [float(a) + float(b) for a, b in zip(t, p)])
+    pyramid.meta.set_custom(SCENE_KEY, None)
+
+
+def _store_parent(path):
+    """The group above `path` in its store (the counterpart of `_store_join`)."""
+    if _is_remote_store(path):
+        return str(path).rstrip("/").rpartition("/")[0]
+    return Path(path).parent
+
+
 #: write_pyramid(windows=...)
 _WINDOW_MODES = ("keep", "dtype", "data", "none", "auto")
 #: windows="auto": the percentiles of the coarsest level that set start / end ...
@@ -665,7 +756,8 @@ def _existing_group_version(path, storage_options: Optional[dict] = None) -> Opt
     """The NGFF version a label written into the existing group at `path` must take, or
     None when no group is there. A zarr v2 group is 0.4 (ozp writes v2 only as 0.4); a
     v3 group is its ``ome.version``, 0.5 when it records none. A v3 group declaring
-    another version (0.6) raises :class:`UnsupportedNGFFVersion`: ozp writes 0.4 / 0.5."""
+    another version (0.7, say) raises :class:`UnsupportedNGFFVersion`: ozp writes 0.4,
+    0.5 and 0.6."""
     if _is_remote_store(path):
         try:
             group = _object_store_group(str(path), None, "r", storage_options)
@@ -684,11 +776,11 @@ def _existing_group_version(path, storage_options: Optional[dict] = None) -> Opt
     if zarr_format == 2:
         return "0.4"
     version = str(dict(attrs.get("ome") or {}).get("version", "0.5"))
-    if version != "0.5":
+    if version not in ("0.5", "0.6"):
         from ome_zarr_pyramid.core.nodes import UnsupportedNGFFVersion
         raise UnsupportedNGFFVersion(
-            f"{path}: an NGFF {version} group; ozp writes labels into NGFF 0.4 / 0.5 "
-            f"stores only (write the label to a store of its own, or convert the image "
+            f"{path}: an NGFF {version} group; ozp writes labels into NGFF 0.4 / 0.5 / "
+            f"0.6 stores only (write the label to a store of its own, or convert the image "
             f"to version='0.5' first)")
     return version
 
@@ -783,7 +875,8 @@ class PyramidIO:
     def read_pyramid(self,
                      path: Union[str, Path],
                      include_labels: bool = True,
-                     storage_options: Optional[dict] = None) -> Pyramid:
+                     storage_options: Optional[dict] = None,
+                     apply_scene: Optional[bool] = False) -> Pyramid:
         """Read a pyramid from an NGFF-compliant zarr store.
 
         Parameters
@@ -799,6 +892,14 @@ class PyramidIO:
             For a URL: obstore-style options (``endpoint``, ``region``,
             ``skip_signature``, ``client_options``, ...), the same names the writer and
             dyna use. Credentials come from the standard environment variables.
+        apply_scene : bool or None
+            For an image an NGFF 0.6 scene places (the scene form, plan 5.5: its group
+            carries ``eubi:scene``, the path of the group holding the scene): its own
+            levels hold only their alignment, its position is in the scene. True reads
+            the scene (one more request) and adds the position to the levels; False
+            (the default) leaves the levels as they are, with a warning naming the
+            scene's group; None does neither (``PyramidCollection.from_zarr`` places
+            its images itself).
 
         Returns
         -------
@@ -808,7 +909,7 @@ class PyramidIO:
         Raises
         ------
         UnsupportedNGFFVersion
-            The store declares an NGFF version ozp does not read (0.6, say); raised
+            The store declares an NGFF version ozp does not read (0.7, say); raised
             from its attributes, before any array or label is opened.
         """
         remote = _is_remote_store(path) and not _is_legacy_https(path)
@@ -839,6 +940,8 @@ class PyramidIO:
 
             if include_labels:
                 self._discover_labels(pyramid, path)
+            if apply_scene is not None:
+                _place_by_scene(pyramid, path, apply_scene, storage_options)
 
             if self.verbose:
                 logger.info(f"[PyramidIO] Loaded {pyramid.nlayers} layers, axes: {pyramid.axes}")
@@ -864,7 +967,8 @@ class PyramidIO:
         if name is not None:
             path = _store_join(path, "labels", name)    # URL-safe for remote stores
         # a label image has no nested labels/; skip discovery
-        return self.read_pyramid(path, include_labels=False, storage_options=storage_options)
+        return self.read_pyramid(path, include_labels=False, storage_options=storage_options,
+                                 apply_scene=None)
 
     def _discover_labels(self, pyramid: Pyramid, path: Path) -> None:
         """Populate ``pyramid._labels`` from the image's NGFF ``labels/`` group, if
@@ -890,6 +994,7 @@ class PyramidIO:
                               f"reading {labels_dir / nm}: {exc}", UserWarning,
                               stacklevel=3)
 
+    @validating
     def write_pyramid(self,
                       pyramid: Pyramid,
                       path: Union[str, Path],
@@ -1135,7 +1240,11 @@ class PyramidIO:
         if layers is None and labels_group_path is not None and label_name is not None:
             lg = _open_store_group(labels_group_path, label_zarr_format, mode="a",
                                    storage_options=storage_options)
-            _register_label_name(lg, label_name, label_version)
+            from ome_zarr_pyramid.core.ngff06 import intrinsic_of
+            _register_label_name(lg, label_name, label_version,
+                                 image_path=_store_parent(labels_group_path),
+                                 label_system=intrinsic_of(pyramid.meta.multiscales),
+                                 storage_options=storage_options)
         side = dict(label_block=label_block, label_version=label_version,
                     label_zarr_format=label_zarr_format, attached_labels=attached_labels,
                     overwrite=overwrite, backend=backend, compressor=compressor,
@@ -1206,8 +1315,8 @@ class PyramidIO:
         else:
             group = zarr.open_group(str(path), mode="r", zarr_format=zarr_format)
         attrs = group.attrs.asdict()
-        holder = attrs.get('ome') if isinstance(attrs.get('ome'), dict) else attrs
-        multiscale = holder['multiscales'][0]
+        from ome_zarr_pyramid.core.ngff06 import ozp_multiscales
+        multiscale = ozp_multiscales(attrs, str(path))[1][0]
         axes = [a['name'] if isinstance(a, dict) else a for a in multiscale['axes']]
         coarsest = group[multiscale['datasets'][-1]['path']]
         found = _auto_window_limits(coarsest, axes, path)
@@ -1248,7 +1357,7 @@ class PyramidIO:
             raise ValueError(f"update_metadata: windows={windows!r}: one of "
                              f"{_UPDATE_WINDOW_MODES}")
         pyramid = self.read_pyramid(path, include_labels=False,
-                                    storage_options=storage_options)
+                                    storage_options=storage_options, apply_scene=None)
         order = pyramid.meta.axis_order
         if "c" in order and pyramid.meta.unit_list[order.index("c")]:
             # NGFF gives a channel axis no unit, and some viewers (Neuroglancer) reject
@@ -1669,7 +1778,7 @@ class PyramidIO:
         # 2) re-read the on-disk base (zarr-backed -> downscaling reads from DISK)
         storage_options = write_kwargs.get('storage_options')
         disk = self.read_pyramid(str(path), include_labels=False,
-                                 storage_options=storage_options)
+                                 storage_options=storage_options, apply_scene=None)
 
         # 3) expand the plan for the level count / shapes / scales (metadata only)
         full = disk.downscale(defer=False, **dk)
@@ -2154,12 +2263,15 @@ class IO:
     ``IO(...)``, on the instance, never on the class."""
 
     def read_pyramid(self, path: Union[str, Path], include_labels: bool = True,
-                     storage_options: Optional[dict] = None) -> Pyramid:
+                     storage_options: Optional[dict] = None,
+                     apply_scene: Optional[bool] = False) -> Pyramid:
         """Read a pyramid from a path or object-store URL. `include_labels` also loads
-        the image's NGFF ``labels/`` collection into `Pyramid.labels` (lazy). See
-        :meth:`PyramidIO.read_pyramid`."""
+        the image's NGFF ``labels/`` collection into `Pyramid.labels` (lazy);
+        `apply_scene=True` adds the position an NGFF 0.6 scene gives the image to its
+        levels. See :meth:`PyramidIO.read_pyramid`."""
         return PyramidIO().read_pyramid(path, include_labels=include_labels,
-                                        storage_options=storage_options)
+                                        storage_options=storage_options,
+                                        apply_scene=apply_scene)
 
     def update_metadata(self, path: Union[str, Path], **kwargs) -> Pyramid:
         """Edit the metadata of the OME-Zarr image at `path` in place (scales, units,

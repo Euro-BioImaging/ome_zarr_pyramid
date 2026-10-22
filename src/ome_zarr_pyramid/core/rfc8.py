@@ -198,7 +198,7 @@ def open_image(location: str, storage_options: Optional[dict] = None):
         pyr = pyramid_from_rfc8(ome, base, storage_options)
         _restore_side_blocks(pyr, others)
         return pyr
-    return IO().read_pyramid(location, storage_options=storage_options)
+    return IO().read_pyramid(location, storage_options=storage_options, apply_scene=None)
 
 
 def read_rfc8(path, *, storage_options: Optional[dict] = None) -> Node:
@@ -272,10 +272,12 @@ def pyramid_from_rfc8(ome: Dict[str, Any], base: str, storage_options: Optional[
         output = None
         for t in transforms:
             output = output or ref_id(t.get("output"))
-            if t.get("type") == "scale":
-                scale = [float(v) for v in t["scale"]]
-            elif t.get("type") == "translation":
-                translation = [float(v) for v in t["translation"]]
+            # one sequence[scale, translation] (what ozp writes, plan 5.4), or the two apart
+            for step in (t.get("transformations") or []) if t.get("type") == "sequence" else [t]:
+                if step.get("type") == "scale":
+                    scale = [float(v) for v in step["scale"]]
+                elif step.get("type") == "translation":
+                    translation = [float(v) for v in step["translation"]]
         if scale is None:
             raise InvalidCollection(f"multiscale {ome.get('name')!r}: level "
                                     f"{level.get('name')!r} has no scale transformation")
@@ -324,24 +326,27 @@ def _restore_side_blocks(pyr, others: Dict[str, Any]) -> None:
 
 def multiscale_json(pyr, *, name: str, id: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """(the RFC 8 multiscale node of `pyr`, the blocks written beside it): its levels
-    inline as singlescale nodes at ``./<level path>``, each with a scale (and a
-    translation, when the level has one) into the ``physical`` coordinate system."""
+    inline as singlescale nodes at ``./<level path>``, each with one transformation into
+    the ``physical`` coordinate system: a scale, or ``sequence[scale, translation]`` when
+    the level has a translation (plan 5.4)."""
     meta = pyr.meta
     ms = (meta.metadata.get("multiscales") or [{}])[0]
     axes = copy.deepcopy(ms.get("axes") or [])
     datasets = {str(d.get("path")): d for d in ms.get("datasets") or []}
     levels = []
     for path in meta.resolution_paths:
-        transforms = [{"type": "scale", "scale": [float(v) for v in meta.get_scale(path)],
-                       "input": {"id": str(path)}, "output": {"id": "physical"}}]
+        scale = {"type": "scale", "scale": [float(v) for v in meta.get_scale(path)]}
         stored = datasets.get(str(path), {}).get("coordinateTransformations") or []
         if any(t.get("type") == "translation" for t in stored):
-            transforms.append({"type": "translation",
-                               "translation": [float(v) for v in meta.get_translation(path)],
-                               "input": {"id": str(path)}, "output": {"id": "physical"}})
+            transform = {"type": "sequence", "transformations": [scale, {
+                "type": "translation",
+                "translation": [float(v) for v in meta.get_translation(path)]}]}
+        else:
+            transform = scale
+        transform.update({"input": {"id": str(path)}, "output": {"id": "physical"}})
         levels.append({"type": "singlescale", "id": str(path), "name": str(path),
                        "path": {"type": "zarr", "path": f"./{path}"},
-                       "attributes": {"coordinateTransformations": transforms}})
+                       "attributes": {"coordinateTransformations": [transform]}})
     node: Dict[str, Any] = {"type": "multiscale"}
     if id is not None:
         node["id"] = id
@@ -371,6 +376,29 @@ def _label_attributes(label) -> List[Dict[str, Any]]:
     return list(by_value.values())
 
 
+class RFC8Warning(UserWarning):
+    """Writing NGFF RFC 8, a draft: its form may change before it is adopted (8.21)."""
+
+
+class Where:
+    """Where :func:`write_rfc8` puts the nodes it writes, for the attribute values that
+    name them (``to_rfc8(where)``): each image node's path in the collection (``image``,
+    by ``id(node)``), each attached label's (``label``, by ``(id(image node), label
+    name)``) and each collection's folder (``prefix``, by ``id(node)``)."""
+
+    def __init__(self):
+        self.image: Dict[int, str] = {}
+        self.label: Dict[Tuple[int, str], str] = {}
+        self.prefix: Dict[int, str] = {}
+
+    def json(self, attributes: Dict[str, Any]) -> Dict[str, Any]:
+        """Node attributes as RFC 8 JSON, placeholders resolved."""
+        return {key: (value.to_rfc8(self) if hasattr(value, "to_rfc8")
+                      else value.to_json() if hasattr(value, "to_json")
+                      else copy.deepcopy(value))
+                for key, value in attributes.items()}
+
+
 def _safe_id(text: str, taken: set) -> str:
     stem = re.sub(r"[^A-Za-z0-9\-_.]", "_", text) or "node"
     candidate, n = stem, 1
@@ -395,7 +423,15 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
     collections and images share one counter (``0`` a series collection, ``1`` the
     image next to it). Two images at one path, or an image group inside another, are
     refused before anything is written. An existing `path` is refused unless
-    `overwrite` (which clears it first); the collection document is written last."""
+    `overwrite` (which clears it first); the collection document is written last.
+
+    One pyramid met twice in the tree (an image with two parents, plan 3.11) is written
+    once; the later node is written as an alias, a node with the same path. An attribute
+    value with a ``to_rfc8(where)`` method (the coordinate-system graph a collection puts
+    on its nodes, :mod:`ome_zarr_pyramid.core.rfc8_keys`) is written as what it returns,
+    once every image's path is known. RFC 8 is a draft: writing it warns (8.21)."""
+    import warnings
+
     from zarr.errors import ContainsArrayError, ContainsGroupError
 
     from ome_zarr_pyramid.core.io import IO, _store_join
@@ -403,9 +439,14 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
 
     if not isinstance(node, CollectionNode):
         raise ValueError(f"{node!r}: write_rfc8 writes a collection")
+    warnings.warn("RFC 8 output is experimental: RFC 8 is a draft (status D1) with no NGFF "
+                  "version yet, and its form may change before it is adopted",
+                  RFC8Warning, stacklevel=2)
     taken = {n.id for n in node.walk() if n.id is not None}
     jobs: List[Tuple[str, Any, str, Optional[str]]] = []   # (rel path, pyramid, name, id)
     label_of: Dict[str, str] = {}                          # label path -> its image's path
+    where = Where()                                        # what placeholders resolve against
+    written_at: Dict[int, Tuple[str, Optional[str]]] = {}  # id(pyramid) -> (rel, id)
 
     def own_part(parent: CollectionNode, child: Node) -> Optional[str]:
         if isinstance(child, CollectionNode):
@@ -444,27 +485,44 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
         if coll.id is not None:
             out["id"] = coll.id
         out["name"] = coll.name
+        where.prefix[id(coll)] = prefix
         children = []
         parts = parts_of(coll)
         for child in coll.nodes:
             if isinstance(child, CollectionNode):
                 children.append(build(child, join(prefix, parts[id(child)]), False))
             elif isinstance(child, MultiscaleNode):
-                rel = join(prefix, parts[id(child)])
                 pyr = child.pyramid
+                own = own_part(coll, child)
+                if id(pyr) in written_at and (getattr(child, "_alias", False) or own is None
+                                              or join(prefix, own) == written_at[id(pyr)][0]):
+                    # a second parent of the same image: an alias (3.11); a node with a
+                    # path of its own elsewhere is a copy, written there
+                    rel, ident = written_at[id(pyr)]
+                    where.image[id(child)] = rel
+                    entry = {"type": "multiscale", "name": child.name,
+                             "path": {"type": "zarr", "path": f"./{rel}"}}
+                    if child.attributes:
+                        entry["attributes"] = where.json(child.attributes)
+                    children.append(entry)
+                    continue
+                rel = join(prefix, parts[id(child)])
+                where.image[id(child)] = rel
                 labels = dict(getattr(pyr, "_labels", {}) or {})
                 ident = child.id if child.id is not None or not labels else _safe_id(child.name, taken)
+                written_at[id(pyr)] = (rel, ident)
                 jobs.append((rel, pyr, child.name, ident))
                 entry: Dict[str, Any] = {"type": "multiscale"}
                 if ident is not None:
                     entry["id"] = ident
                 entry.update({"name": child.name, "path": {"type": "zarr", "path": f"./{rel}"}})
                 if child.attributes:
-                    entry["attributes"] = attributes_to_json(child.attributes)
+                    entry["attributes"] = where.json(child.attributes)
                 entry.update(copy.deepcopy(child.extra))
                 children.append(entry)
                 for label_name, label in labels.items():
                     label_rel = f"{rel}/labels/{label_name}"
+                    where.label[(id(child), label_name)] = label_rel
                     jobs.append((label_rel, label, label_name, None))
                     label_of[label_rel] = rel
                     attributes: Dict[str, Any] = {"labels": LabelsAttribute(
@@ -482,7 +540,8 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
                       if not (root and k not in _RFC8_ATTRIBUTES and ":" not in k)}
         attributes.pop("bioformats2raw.layout", None)     # replaced by the collection itself
         if attributes:
-            out["attributes"] = attributes_to_json(attributes)
+            # after the children: every image below has its path now
+            out["attributes"] = where.json(attributes)
         out.update(copy.deepcopy(coll.extra))
         return out
 
@@ -542,17 +601,22 @@ def _check_paths(name: str, jobs, label_of: Dict[str, str]) -> None:
 
 def _relative(doc: Dict[str, Any], offset: str) -> Dict[str, Any]:
     """`doc` with its image paths made relative to a document `offset` away from the
-    images' root (``""``: the document is in the root group)."""
+    images' root (``""``: the document is in the root group): every ``./`` zarr path of
+    the document, the nodes' and those in attributes (a scene's references) alike."""
     if not offset:
         return doc
     out = copy.deepcopy(doc)
 
-    def walk(node):
-        for child in node.get("nodes") or []:
-            path = child.get("path")
-            if isinstance(path, dict) and path.get("type") == "zarr" and path["path"].startswith("./"):
-                path["path"] = "./" + posixpath.normpath(posixpath.join(offset, path["path"][2:]))
-            walk(child)
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("type") == "zarr" and isinstance(value.get("path"), str) \
+                    and value["path"].startswith("./"):
+                value["path"] = "./" + posixpath.normpath(posixpath.join(offset, value["path"][2:]))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
     walk(out)
     return out
 

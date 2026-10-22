@@ -36,9 +36,14 @@ def test_tiles_of_a_series_become_further_series_with_one_warning(tmp_path, vers
     message = str(caught[0].message)
     assert "1 of the collection's series holds several images" in message
     assert "['tile']" in message and "key order (4 series)" in message
+    # written in key order (series 0's tiles, then 1); each group's eubi:index gives the
+    # keys back, and the tree its series level (plan 3.18)
     back = PyramidCollection.from_zarr(out)
-    values = [int(np.asarray(back[{SERIES_INDEX: i}].layers["0"])[0, 0, 0]) for i in range(4)]
-    assert values == [0, 1, 2, 9]                       # key order: series 0's tiles, then 1
+    assert list(back) == list(entries)
+    values = [int(np.asarray(back[k].layers["0"])[0, 0, 0]) for k in back]
+    assert values == [0, 1, 2, 9]
+    assert [n.name for n in back.tree] == ["series0", "series1"]
+    assert [n.name for n in back.tree["series0"]] == ["tile0", "tile1", "tile2"]
 
 
 def test_one_image_per_series_writes_without_a_warning(tmp_path):
