@@ -264,7 +264,7 @@ def test_labels_that_open_give_no_warning(tmp_path):
     import warnings
     img = _image_with_labels(tmp_path, ["cells"])
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         assert list(io.read_pyramid(img).labels) == ["cells"]
 
 

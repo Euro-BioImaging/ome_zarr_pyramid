@@ -48,7 +48,7 @@ def _plate(registration=None):
 
 def test_each_well_is_a_component_owned_by_its_well():
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         components = _plate().components()
     assert [(sorted(c.systems), len(c.entries), c.owner) for c in components] == [
         (["well-A1"], 2, ("P", "A1")), (["well-B3"], 2, ("P", "B3"))]

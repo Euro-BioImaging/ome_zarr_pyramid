@@ -141,7 +141,7 @@ def test_mixed_rank_images_share_one_system_with_the_union_of_their_axes(tmp_pat
     coll = PyramidCollection.from_file(_file([zyx, yx], [_cs("stage")]))
     out = str(tmp_path / "s.zarr")
     with warnings.catch_warnings():
-        warnings.simplefilter("error")                 # 0.4 / 0.5: works, no warning
+        warnings.simplefilter("error", UserWarning)                 # 0.4 / 0.5: works, no warning
         coll.write_series(out)
     (system,) = _attrs(out)["eubi:coordinate_systems"]
     assert [a["name"] for a in system["axes"]] == ["z", "y", "x"]

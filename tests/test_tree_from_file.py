@@ -260,8 +260,9 @@ def test_a_field_select_only_filters():
 
 def _real(rel, **kwargs):
     mr = pytest.importorskip("micro_reader")
-    if not str(getattr(mr, "__version__", "0")).startswith("0.1"):
-        pytest.skip("needs micro-reader 0.1 (the series index)")
+    version = tuple(int(p) for p in str(getattr(mr, "__version__", "0.0")).split(".")[:2])
+    if version < (0, 1):
+        pytest.skip("needs micro-reader 0.1 or newer (the series index)")
     path = os.path.join(DATA, rel)
     if not os.path.exists(path):
         pytest.skip(f"sample not found: {path}")

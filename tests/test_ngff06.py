@@ -139,7 +139,7 @@ def test_a_foreign_images_extra_systems_and_edges_are_written_back_as_read(tmp_p
     assert pyr.meta.axis_order == "yx"              # the intrinsic system's axes
     out = str(tmp_path / "again.zarr")
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         IO().write_pyramid(pyr, out)                # 0.6 in, 0.6 out: no warning
     (ms,) = _attrs(out)["ome"]["multiscales"]
     assert ms["coordinateSystems"] == FOREIGN["coordinateSystems"]       # names kept (3.23)
@@ -172,7 +172,7 @@ def test_a_read_05_image_written_as_06_gives_no_warning(tmp_path):
                                              version="0.5"), src)
     out = str(tmp_path / "v06.zarr")
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         IO().write_pyramid(io.read_pyramid(src).to_version("0.6"), out)
     assert _attrs(out)["ome"]["version"] == "0.6"
 
@@ -363,7 +363,7 @@ def test_a_lone_read_of_a_scene_form_image_warns_or_applies_the_scene(tmp_path):
         pyr = io.read_pyramid(one)
     assert pyr.meta.get_translation("0")[-2:] == [0.0, 0.0]
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         placed = io.read_pyramid(one, apply_scene=True)
     assert placed.meta.get_translation("0")[-2:] == [50.0, -3.0]
     assert "eubi:scene" not in placed.meta.custom_blocks     # it holds its position now

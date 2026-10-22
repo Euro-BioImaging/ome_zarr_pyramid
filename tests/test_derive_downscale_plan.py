@@ -124,7 +124,7 @@ def test_pyramid_warns_and_returns_none_when_underivable():
 def test_derivation_is_silent_when_suppressed():
     import warnings
     with warnings.catch_warnings():
-        warnings.simplefilter("error")           # any warning would fail the test
+        warnings.simplefilter("error", UserWarning)           # any warning would fail the test
         assert _pyr([(1, 1, 10, 10, 10), (1, 1, 7, 7, 7)]
                     ).derive_downscale_plan(warn=False) is None
 

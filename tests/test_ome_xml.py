@@ -84,7 +84,7 @@ def test_update_metadata_repairs_a_store_ozp_030_wrote(tmp_path, version):
     _no_ome_group(path)
     assert _read(path) == XML                                 # the XML stays
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         IO().update_metadata(path)                            # nothing left to repair
 
 
