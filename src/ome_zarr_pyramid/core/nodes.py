@@ -38,11 +38,17 @@ class InvalidCollection(ValueError):
 
 #: the NGFF versions ozp reads (images, plates, wells, series layouts); the one list
 #: every reader checks against (``NGFFMetadataHandler.SUPPORTED_VERSIONS`` is this)
-READ_VERSIONS = ("0.4", "0.5")
+READ_VERSIONS = ("0.4", "0.5", "0.6")
+
+
+def nests_in_ome(version) -> bool:
+    """True for the NGFF versions that keep their metadata under ``ome`` in a zarr v3
+    group (0.5 and later); False for 0.4 (top-level attributes, zarr v2)."""
+    return str(version) != "0.4"
 
 
 class UnsupportedNGFFVersion(InvalidCollection):
-    """A store declares an NGFF version ozp cannot read (e.g. 0.6). Raised from the
+    """A store declares an NGFF version ozp cannot read (e.g. 0.7). Raised from the
     group's attributes, before any array is opened. A subclass of
     :class:`InvalidCollection` (and so of ``ValueError``): the plate and well readers
     raised that for a version they did not read, and still catch the same way."""
@@ -60,12 +66,8 @@ def check_read_version(version, what: str) -> None:
         raise UnsupportedNGFFVersion(f"{what}: no NGFF version is declared; ozp reads NGFF "
                                      f"{READ_VERSIONS} (write the store with a tool that "
                                      f"records its version)")
-    if version == "0.6":
-        hint = (f"0.6 support is planned; until then read this store with a 0.6-capable "
-                f"tool, or write it as {newest}")
-    else:
-        hint = (f"read this store with a tool that reads NGFF {version}, or write it as "
-                f"{newest}")
+    hint = (f"read this store with a tool that reads NGFF {version}, or write it as "
+            f"{newest}")
     raise UnsupportedNGFFVersion(f"{what}: NGFF version {version!r}; ozp reads NGFF "
                                  f"{READ_VERSIONS} ({hint})")
 

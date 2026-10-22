@@ -213,25 +213,30 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
     """The node tree of an opened file (micro-reader ``File``, or anything with
     ``images``), built from its images' keys (`entries`, ``{key: Pyramid}``) and, when
     the file has ``plates``, their rows, columns and acquisitions. The keys are not
-    changed.
+    changed. The same rule as micro-reader's ``File.collection`` (plan 3.17; a test
+    compares the two).
 
-    - The root is a collection (kind ``None``) named `name`, the file's stem.
+    - The root is a collection (kind ``None``) named `name`, the file's stem. Its
+      children are in the order of the images: the plates (in the file's order) where
+      the first plate image is, a series where its first image is.
     - Each plate is a collection (kind ``"plate"``) under the root, holding one
-      collection per well (kind ``"well"``). A field (the images that agree in
-      acquisition and field) holding several images (tiles, views) is a collection
-      (kind ``"field"``) in its well; a field of one image sits in the well as that
-      image.
+      collection per well (kind ``"well"``). A field holding several images (tiles,
+      views, acquisitions) is a collection (kind ``"field"``, named ``field<n>``) in its
+      well; a field of one image sits in the well as that image. Each image of a plate
+      keeps its acquisition as an attribute.
     - Outside the plates, the images of one series form a collection (kind
       ``"series"``, named ``series<i>``) under the root when it holds several images;
       a series of one image sits under the root as that image.
     - An image outside the plates without a series index sits under the root.
     - An image is named by its index values that no collection above it holds
-      (``series2``, ``tile3``, ``view1_illumination0``; ``image`` when none). Tile,
-      part, view and every other index never make a collection, and an index name ozp
-      does not know (the old series name eubi-bridge 0.2.x uses) is one of those: it
-      is kept as it is, never renamed."""
+      (``series2``, ``tile3``, ``view1_illumination0``, ``acquisition0_tile3``;
+      ``image`` when none). Acquisition, tile, part, view and every other index never
+      make a collection, and an index name ozp does not know (the old series name
+      eubi-bridge 0.2.x uses) is one of those: it is kept as it is, never renamed."""
     plates = list(getattr(file, "plates", None) or [])
-    by_well: Dict[Tuple[int, int], Dict[Tuple, List]] = {}
+    # per well, its images by field (None: an image with no field index, in the well
+    # itself); acquisition, like tile or view, makes no collection
+    by_well: Dict[Tuple[int, int], Dict[Optional[int], List]] = {}
     placed = set()
     for key in entries:
         index = dict(key)
@@ -239,11 +244,10 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
             continue
         p, w = index.get("plate", 0), index["well"]
         if 0 <= p < len(plates) and 0 <= w < len(plates[p].wells):
-            field = (index.get("acquisition"), index.get("field", 0))
-            by_well.setdefault((p, w), {}).setdefault(field, []).append(key)
+            by_well.setdefault((p, w), {}).setdefault(index.get("field"), []).append(key)
             placed.add(key)
     root = CollectionNode(name or "file")
-    top: List[Node] = []                        # the root's children, in order
+    plate_nodes_: List[Node] = []
     for p, plate in enumerate(plates):
         attr = PlateAttribute(
             rows=[_item(r, i, "row") for i, r in enumerate(plate.rows)],
@@ -266,45 +270,56 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
             well_node = node.add(CollectionNode(well.name, attributes={"well": WellAttribute(
                 Ref(attr.rows[well.row].id), Ref(attr.columns[well.column].id))},
                 kind="well", index=w))
+            def acquisition(key):
+                a = dict(key).get("acquisition")
+                return ({"acquisition": Ref(attr.acquisitions[a].id)}
+                        if a is not None and 0 <= a < len(attr.acquisitions) else {})
+
             children: List[Node] = []
-            for (a, f), keys in by_well.get((p, w), {}).items():
-                attributes = ({"acquisition": Ref(attr.acquisitions[a].id)}
-                              if a is not None and a < len(attr.acquisitions) else {})
-                if len(keys) == 1:              # a field of one image: the image itself
-                    children.append(MultiscaleNode(_image_name(keys[0]), entries[keys[0]],
-                                                   attributes=attributes))
+            for f, keys in by_well.get((p, w), {}).items():
+                if f is None or len(keys) == 1:  # a field of one image: the image itself
+                    children += [MultiscaleNode(_image_name(key), entries[key],
+                                                attributes=acquisition(key)) for key in keys]
                     continue
-                held = ("plate", "well", "acquisition", "field")
-                place = tuple((n, v) for n, v in keys[0] if n in held)
+                held = ("plate", "well", "field")
                 children.append(_fill(
-                    CollectionNode(_image_name(place), kind="field", index=f),
+                    CollectionNode(f"field{f}", kind="field", index=f),
                     [MultiscaleNode(_image_name(key, held), entries[key],
-                                    attributes=dict(attributes)) for key in keys]))
+                                    attributes=acquisition(key)) for key in keys]))
             _fill(well_node, children)
-        top.append(node)
-    # outside the plates: by series, in the order of each series' first key
+        plate_nodes_.append(node)
+    # the root's children in the order of the images (micro-reader's rule): the plates
+    # (kept in the file's order, as their index says) where the first plate image is,
+    # each series where its first image is
     series: Dict[int, List] = {}
-    order: List[Tuple[Optional[int], Optional[Tuple]]] = []
+    order: List[Tuple[str, Any]] = []
     for key in entries:
         if key in placed:
+            if ("plates", None) not in order:
+                order.append(("plates", None))
             continue
         s = dict(key).get(SERIES_INDEX)
         if s is None:                           # no series index: an image of its own
-            order.append((None, key))
+            order.append(("image", key))
         else:
             if s not in series:
                 series[s] = []
-                order.append((s, None))
+                order.append(("series", s))
             series[s].append(key)
-    for s, key in order:
-        if key is not None:
-            top.append(MultiscaleNode(_image_name(key, ()), entries[key]))
-        elif len(series[s]) == 1:               # a series of one image: the image itself
-            only = series[s][0]
+    if ("plates", None) not in order:           # plates without images: first
+        order.insert(0, ("plates", None))
+    top: List[Node] = []
+    for what, value in order:
+        if what == "plates":
+            top += plate_nodes_
+        elif what == "image":
+            top.append(MultiscaleNode(_image_name(value, ()), entries[value]))
+        elif len(series[value]) == 1:           # a series of one image: the image itself
+            only = series[value][0]
             top.append(MultiscaleNode(_image_name(only, ()), entries[only]))
         else:
             top.append(_fill(
-                CollectionNode(f"{SERIES_INDEX}{s}", kind=SERIES_INDEX, index=s),
+                CollectionNode(f"{SERIES_INDEX}{value}", kind=SERIES_INDEX, index=value),
                 [MultiscaleNode(_image_name(key, (SERIES_INDEX,)), entries[key])
-                 for key in series[s]]))
+                 for key in series[value]]))
     return _fill(root, top)

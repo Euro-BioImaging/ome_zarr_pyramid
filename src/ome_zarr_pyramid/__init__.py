@@ -21,6 +21,9 @@ from ome_zarr_pyramid.core.concatenate import concatenate
 from ome_zarr_pyramid.core.nodes import UnsupportedNGFFVersion
 from ome_zarr_pyramid.core.ngff_plate import PlateFieldError
 from ome_zarr_pyramid.core.ngff_series import OMEXMLError
+from ome_zarr_pyramid.core.rfc8 import RFC8Warning
+from ome_zarr_pyramid.core.spatial import InvariantError, TransformError
+from ome_zarr_pyramid.core.validation import NGFFValidationError, NGFFValidationWarning, validate
 
 #: The package's reader/writer, shared by everyone in this process. It holds no state:
 #: settings go in the call (or in your own ``IO(...)``), never on this object, since
@@ -28,4 +31,5 @@ from ome_zarr_pyramid.core.ngff_series import OMEXMLError
 io = IO()
 
 __all__ = ["Pyramid", "PyramidCollection", "concatenate", "IO", "io", "UnsupportedNGFFVersion",
-           "PositionUnitError", "PlateFieldError", "OMEXMLError"]
+           "PositionUnitError", "PlateFieldError", "OMEXMLError", "RFC8Warning", "InvariantError",
+           "TransformError", "validate", "NGFFValidationError", "NGFFValidationWarning"]

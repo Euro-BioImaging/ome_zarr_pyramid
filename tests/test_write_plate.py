@@ -68,7 +68,7 @@ def test_a_file_plate_round_trips(tmp_path, version):
     back = PyramidCollection.from_zarr(out)
     assert back.plates == coll.plates                     # name, rows, columns, wells
     for p_mine, p_back in zip(coll.plates[0].wells, back.plates[0].wells):
-        assert [f.index for f in p_back.fields] == [0, 1][:len(p_mine.fields)]
+        assert [f.index for f in p_back.fields] == [f.index for f in p_mine.fields]
         for mine, theirs in zip(p_mine.fields, p_back.fields):
             np.testing.assert_array_equal(_pixels(mine.image), _pixels(theirs.image))
             assert _meta(mine.image) == _meta(theirs.image)
@@ -81,14 +81,15 @@ def test_a_file_plate_round_trips(tmp_path, version):
     assert grid is None or grid[-2:] == (2 * 8, 3 * 12)    # 2 rows x 3 columns of 8 x 12
 
 
-def test_field_numbers_are_renumbered_but_nothing_else(tmp_path):
+def test_gapped_field_numbers_survive(tmp_path):
     # micro-reader numbers the fields present (0, 2); NGFF lists a well's images in
-    # order, so the second field present reads back as field 1, with the same pixels
+    # order, and the well's eubi:images keeps their numbers (plan 8.4)
     coll = PyramidCollection.from_file(_file())
     coll.write_plate(str(tmp_path / "p.zarr"))
     back = PyramidCollection.from_zarr(str(tmp_path / "p.zarr"))
     assert [f.index for f in coll.plates[0].wells[0].fields] == [0, 2]
-    assert [f.index for f in back.plates[0].wells[0].fields] == [0, 1]
+    assert [f.index for f in back.plates[0].wells[0].fields] == [0, 2]
+    assert list(back) == list(coll)
 
 
 def test_a_field_with_several_images_raises_but_rfc8_keeps_them(tmp_path):
@@ -106,7 +107,9 @@ def test_an_ngff_plate_is_copied(tmp_path):
     src, data = _plate(tmp_path, "0.4")
     out = str(tmp_path / "copy.zarr")
     PyramidCollection.from_zarr(src).write_plate(out)
-    assert zarr.open_group(out, mode="r").attrs.asdict() == zarr.open_group(src, mode="r").attrs.asdict()
+    copied = zarr.open_group(out, mode="r").attrs.asdict()
+    assert {k: v for k, v in copied.items() if not k.startswith("eubi:")} ==         zarr.open_group(src, mode="r").attrs.asdict()
+    assert copied["eubi:version"] == 1 and copied["eubi:kind"] == "plate"
     back = PyramidCollection.from_zarr(out)
     for (w, a), expected in data.items():
         key = {"plate": 0, "acquisition": a, "well": w, "field": 0}

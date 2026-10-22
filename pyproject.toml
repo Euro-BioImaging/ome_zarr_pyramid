@@ -68,6 +68,10 @@ s3 = ["obstore>=0.11"]
 dask = ["dask"]
 # Kept for compatibility: dyna-zarr is a required dependency now.
 dyna = []
+# Checking stores against the official NGFF schemas (vendored in the package):
+# ozp.validate(path) and the writers' validate=True. The semantic check that runs on
+# every write needs nothing extra.
+validate = ["jsonschema>=4.18", "referencing"]
 dev = [
     "pytest>=7.0",
     # The suite exercises the dask paths too; CI also runs it WITHOUT dask installed.
@@ -75,6 +79,9 @@ dev = [
     # tests/test_write_remote.py: an in-process S3 emulator + the remote extra
     "moto[server]>=5",
     "obstore>=0.11",
+    # the store checks of the test suite (the validate extra)
+    "jsonschema>=4.18",
+    "referencing",
 ]
 
 [project.urls]
@@ -83,3 +90,7 @@ Homepage = "https://github.com/Euro-BioImaging/ome_zarr_pyramid"
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+# the official NGFF schemas, per version (core/validation.py)
+ome_zarr_pyramid = ["schemas/*/*.schema", "schemas/README.md"]

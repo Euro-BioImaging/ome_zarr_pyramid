@@ -32,7 +32,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ome_zarr_pyramid.core.nodes import (
     READ_VERSIONS, CollectionNode, InvalidCollection, MultiscaleNode, Node, NodePath,
-    PlateAttribute, PlateItem, Ref, TYPED_ATTRIBUTES, WellAttribute, check_read_version)
+    PlateAttribute, PlateItem, Ref, TYPED_ATTRIBUTES, WellAttribute, check_read_version,
+    nests_in_ome)
 
 #: the NGFF versions whose plate layout this module reads and writes (the readers'
 #: one list, ``nodes.READ_VERSIONS``)
@@ -40,12 +41,12 @@ VERSIONS = READ_VERSIONS
 #: the version a plate or a series layout is written in when nothing else decides
 DEFAULT_VERSION = "0.5"
 #: the zarr format each NGFF version this module writes is stored in
-_ZARR_FORMATS = {"0.4": 2, "0.5": 3}
+_ZARR_FORMATS = {"0.4": 2, "0.5": 3, "0.6": 3}
 
 
 def zarr_format_of(version) -> int:
-    """The zarr format an NGFF `version` is stored in: 0.4 -> 2, 0.5 -> 3. Any other
-    version raises (ozp writes 0.4 and 0.5 only)."""
+    """The zarr format an NGFF `version` is stored in: 0.4 -> 2, 0.5 and 0.6 -> 3. Any
+    other version raises (ozp writes 0.4, 0.5 and 0.6 only)."""
     try:
         return _ZARR_FORMATS[str(version)]
     except KeyError:
@@ -136,7 +137,7 @@ def _split(attrs: Mapping[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Dic
 
 
 def _join(version: str, ngff: Dict[str, Any], custom: Dict[str, Any]) -> Dict[str, Any]:
-    if version == "0.5":
+    if nests_in_ome(version):
         return {"ome": {"version": version, **ngff}, **custom}
     return {**ngff, **custom}
 
@@ -315,7 +316,9 @@ class ImageOpener:
 
     def __call__(self, node: Node):
         from ome_zarr_pyramid.core.io import IO
-        return IO().read_pyramid(self.path_of(node), storage_options=self.storage_options)
+        # positions a 0.6 scene gives are folded by the collection reader
+        return IO().read_pyramid(self.path_of(node), storage_options=self.storage_options,
+                                 apply_scene=None)
 
     def __repr__(self) -> str:
         return f"ImageOpener({self.base!r})"
@@ -462,9 +465,10 @@ def plate_to_attrs(node: CollectionNode, version: Optional[str] = None
                         **copy.deepcopy(well.ngff_fields.get("entry", {}))})
         wells[path] = _well_to_attrs(well, version)
         field_count = max(field_count, len(wells[path]["ome"]["well"]["images"]
-                                           if version == "0.5" else
+                                           if nests_in_ome(version) else
                                            wells[path]["well"]["images"]))
     plate["wells"] = entries
+    _fill_maximumfieldcount(plate, wells, version)
 
     read = node.ngff_fields.get("plate")
     renamed = node.name != node.ngff_fields.get("node_name")
@@ -481,6 +485,32 @@ def plate_to_attrs(node: CollectionNode, version: Optional[str] = None
         plate["version"] = version
     ngff, custom = _attributes_out(node, "plate")
     return _join(version, {**ngff, "plate": plate}, custom), wells
+
+
+def _fill_maximumfieldcount(plate: Dict[str, Any], wells: Dict[str, Dict[str, Any]],
+                            version: str) -> None:
+    """Give each acquisition without one its ``maximumfieldcount`` (NGFF SHOULD; the strict
+    plate schema requires it, decision 9.12-S): the most fields of that acquisition in one
+    well, counted from the wells written. A value the source gives is kept. With several
+    acquisitions only fields that name theirs count; with one, every field does."""
+    acquisitions = plate.get("acquisitions") or []
+    if not acquisitions:
+        return
+    most: Dict[Any, int] = {}
+    for attrs in wells.values():
+        images = (attrs["ome"] if nests_in_ome(version) else attrs)["well"]["images"]
+        if len(acquisitions) == 1:
+            per = {acquisitions[0]["id"]: len(images)}
+        else:
+            per = {}
+            for image in images:
+                if "acquisition" in image:
+                    per[image["acquisition"]] = per.get(image["acquisition"], 0) + 1
+        for ident, n in per.items():
+            most[ident] = max(most.get(ident, 0), n)
+    for a in acquisitions:
+        if "maximumfieldcount" not in a and most.get(a["id"]):
+            a["maximumfieldcount"] = most[a["id"]]
 
 
 def well_path(attr: PlateAttribute, well: Node) -> str:

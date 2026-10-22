@@ -90,7 +90,7 @@ def test_a_plate_and_an_image_outside_it():
         {"series": 0}, plates=[PLATE]))
     assert _shape(coll.tree) == ("sample", None, None, [
         ("P", "plate", 0, [("A2", "well", 0, [
-            "acquisition0_field0", ("acquisition0_field1", "field", 1, ["tile0", "tile1"])])]),
+            "acquisition0_field0", ("field1", "field", 1, ["acquisition0_tile0", "acquisition0_tile1"])])]),
         "series0"])                              # the label: under the root, not in the plate
     assert len(coll) == 4 and (("series", 0),) in coll
     assert [len(f.keys) for f in coll.plates[0].wells[0].fields] == [1, 2]
@@ -138,10 +138,12 @@ def test_a_tree_from_file_is_written_and_read_back(tmp_path):
         coll.select(series=0).write_collection(str(tmp_path / "part.zarr"))
 
 
-def test_a_concatenated_collection_without_a_tree_still_writes(tmp_path):
+def test_a_concatenated_collection_gets_a_tree_of_its_keys_and_writes(tmp_path):
+    # plan 3.25: concatenate carries the tree (built from the joined keys)
     coll = PyramidCollection.from_file(_file({"series": 0, "view": 0}, {"series": 0, "view": 1}))
     joined = coll.concatenate("view")
-    assert joined.tree is None
+    assert _shape(joined.tree) == ("sample", None, None, ["series0"])
+    assert joined.tree["series0"].pyramid is joined[{"series": 0}]
     assert list(joined.write_series(str(tmp_path / "s.zarr"))) == ["0"]
     assert len(joined.write(tmp_path, "j", overwrite=True)) == 1
 
@@ -191,7 +193,8 @@ def test_a_plate_and_an_image_outside_it_are_written_apart(tmp_path):
     coll.write_collection(str(tmp_path / "c.zarr"))
     groups = _image_groups(str(tmp_path / "c.zarr"))
     assert len(groups) == 4 and _no_nesting(groups) == []
-    assert groups == ["0/A/2/0", "0/A/2/1/0", "0/A/2/1/1", "1"]
+    # a plate with a field of several images has every field as a sub-collection (8.3)
+    assert groups == ["0/A/2/0/0", "0/A/2/1/0", "0/A/2/1/1", "1"]
 
 
 def test_write_rfc8_refuses_an_image_inside_another_before_writing(tmp_path):

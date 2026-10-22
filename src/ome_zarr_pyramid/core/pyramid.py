@@ -19,7 +19,11 @@ from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple
 import numpy as np
 import zarr
 
-from ome_zarr_pyramid.core.nodes import READ_VERSIONS, check_read_version
+from ome_zarr_pyramid.core.nodes import READ_VERSIONS, check_read_version, nests_in_ome
+from ome_zarr_pyramid.core.validation import VERSIONS as NGFF_VERSIONS
+from ome_zarr_pyramid.core.validation import check_multiscales, raise_for_metadata
+#: where ngff06 keeps a 0.6 multiscale's foreign parts (core.ngff06.STASH)
+STASH_KEY = "eubi:ngff06"
 from ome_zarr_pyramid.utils import defaults
 from ome_zarr_pyramid.utils.compressor_config import CompressorConfig
 from ome_zarr_pyramid.utils.json_utils import make_json_safe
@@ -378,7 +382,7 @@ class NGFFMetadataHandler:
     #: reserves ``ome`` for NGFF) and at the top level in 0.4, like everything else there.
     NGFF_KEYS: ClassVar[frozenset] = frozenset({
         'version', 'multiscales', 'omero', 'image-label', 'labels', 'plate', 'well',
-        'bioformats2raw.layout'})
+        'bioformats2raw.layout', 'scene'})
 
     def __init__(self) -> None:
         """Initialize an empty metadata handler."""
@@ -463,8 +467,8 @@ class NGFFMetadataHandler:
             raise ValueError(f"Unsupported version {version}. Supported versions: {self.SUPPORTED_VERSIONS}")
         if zarr_format not in (2, 3):
             raise ValueError(f"Unsupported Zarr format: {zarr_format}")
-        if version == "0.5" and zarr_format != 3:
-            raise ValueError("NGFF version 0.5 requires Zarr format 3")
+        if nests_in_ome(version) and zarr_format != 3:
+            raise ValueError(f"NGFF version {version} requires Zarr format 3")
 
     def _validate_axis_inputs(self, axis_order: str, units: Optional[List[str]]) -> None:
         """Validate axis order and units inputs."""
@@ -527,7 +531,7 @@ class NGFFMetadataHandler:
     def create_new(self, version: str = "0.5", name: Optional[str] = "unnamed") -> 'NGFFMetadataHandler':
         """Create a new metadata handler with empty metadata of specified version.
         ``name=None`` leaves the multiscales ``name`` out (it is optional in NGFF)."""
-        self._validate_version_and_format(version, 3 if version == "0.5" else 2)
+        self._validate_version_and_format(version, 3 if nests_in_ome(version) else 2)
 
         multiscale_metadata = {
             'name': name,
@@ -538,7 +542,7 @@ class NGFFMetadataHandler:
         if name is None:
             del multiscale_metadata['name']
 
-        if version == "0.5":
+        if nests_in_ome(version):
             self.metadata = {
                 'version': version,
                 'multiscales': [multiscale_metadata],
@@ -566,7 +570,7 @@ class NGFFMetadataHandler:
             }
 
         self.version = version
-        self.zarr_format = 3 if version == "0.5" else 2
+        self.zarr_format = 3 if nests_in_ome(version) else 2
         self._pending_changes = True
         return self
 
@@ -586,8 +590,16 @@ class NGFFMetadataHandler:
         # Update handler's format to match the created store
         store_format = self.zarr_group.info._zarr_format
         self.zarr_format = store_format
-        # Update version based on zarr_format
-        self.version = "0.5" if store_format == 3 else "0.4"
+        # the version the metadata declares, when the store's format can hold it (0.6 is
+        # zarr v3 too); else the one the format implies
+        md = self.metadata or {}
+        declared = md.get('version') or next(
+            (ms.get('version') for ms in md.get('multiscales') or [] if isinstance(ms, dict)), None)
+        if declared is not None and str(declared) in self.SUPPORTED_VERSIONS \
+                and nests_in_ome(declared) == (store_format == 3):
+            self.version = str(declared)
+        else:
+            self.version = "0.5" if store_format == 3 else "0.4"
         self._validate_version_and_format(self.version, store_format)
 
     @staticmethod
@@ -622,6 +634,13 @@ class NGFFMetadataHandler:
                 # an RFC 8 node ("0.x") is let through as it is: it is read by node
                 # type (rfc8.open_image, PyramidCollection.from_zarr), not as NGFF 0.4/0.5
                 check_read_version(self.version, where)
+            if str(self.version) == "0.6" and self.metadata is not None:
+                # 0.6 multiscales into ozp's one form (ngff06's docstring); what that form
+                # has no place for waits in the stash, to be written back
+                from ome_zarr_pyramid.core.ngff06 import from_06
+                self.metadata = dict(self.metadata)
+                self.metadata['multiscales'] = [from_06(ms, where)
+                                                for ms in self.metadata.get('multiscales') or []]
         elif 'multiscales' in self.zarr_group.attrs:
             multiscales_attr = self.zarr_group.attrs['multiscales']
             self.metadata = {'multiscales': multiscales_attr if isinstance(multiscales_attr, list) else [multiscales_attr]}
@@ -650,7 +669,7 @@ class NGFFMetadataHandler:
                 if key != 'ome' and key not in self.NGFF_KEYS:
                     self.metadata[key] = value  # type: ignore
         self._fold_multiscale_transforms()
-        self.zarr_format = 3 if self.version == "0.5" else 2
+        self.zarr_format = 3 if nests_in_ome(self.version) else 2
         self._pending_changes = False
         return self
 
@@ -722,6 +741,63 @@ class NGFFMetadataHandler:
         self._pending_changes = True
         return self
 
+    def _label_systems(self) -> Dict[str, str]:
+        """``{label name: its intrinsic system's 0.6 name}`` of the labels under the
+        connected group (none when it has no ``labels`` group)."""
+        from ome_zarr_pyramid.core.ngff06 import INTRINSIC, ozp_multiscales
+        try:
+            labels = self.zarr_group['labels']
+        except (KeyError, TypeError, AttributeError):
+            return {}
+        ome = dict(labels.attrs.get('ome') or {})
+        out = {}
+        for name in ome.get('labels') or labels.attrs.get('labels') or []:
+            try:
+                attrs = labels[name].attrs.asdict()
+                ms = (attrs.get('ome') or {}).get('multiscales') or [{}]
+                out[name] = next(iter(ms[0].get('coordinateSystems') or []), {}).get('name') \
+                    or INTRINSIC
+            except (KeyError, AttributeError, IndexError):
+                out[name] = INTRINSIC
+        return out
+
+    def _multiscales_for(self, version: str, metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """`metadata_dict` with its multiscales in `version`'s form: 0.6 converted from
+        ozp's form (ngff06.to_06, with the labels' links); any other version without the
+        0.6 stash, whose foreign parts go to a custom block with a warning (3.10)."""
+        from ome_zarr_pyramid.core import ngff06
+        mss = metadata_dict.get('multiscales')
+        if not isinstance(mss, list):
+            return metadata_dict
+        out = dict(metadata_dict)
+        if version == '0.6':
+            # parts kept aside by an earlier 0.4 / 0.5 write go back to their place
+            kept = out.pop(ngff06.FOREIGN_KEY, None)
+            kept = kept if isinstance(kept, list) else [kept] if isinstance(kept, dict) else []
+            mss = [dict(ms) for ms in mss]
+            for ms, parts in zip(mss, kept):
+                stash = dict(ms.get(ngff06.STASH) or {})
+                for k, v in (parts or {}).items():
+                    stash.setdefault(k, v)
+                ms[ngff06.STASH] = stash
+            labels = self._label_systems() if self.zarr_group is not None else {}
+            out['multiscales'] = [ngff06.to_06(ms, labels if i == 0 else None)
+                                  for i, ms in enumerate(mss)]
+            return out
+        where = str(self.zarr_group.store_path) if self.zarr_group is not None else ''
+        foreign = []
+        clean = []
+        for ms in mss:
+            ms = dict(ms)
+            kept = ngff06.strip_stash(ms, version, where)
+            if kept:
+                foreign.append(kept)
+            clean.append(ms)
+        out['multiscales'] = clean
+        if foreign:
+            out[ngff06.FOREIGN_KEY] = foreign if len(foreign) > 1 else foreign[0]
+        return out
+
     def save_changes(self) -> None:
         """Save current metadata to connected zarr group."""
         if not self._pending_changes:
@@ -732,21 +808,36 @@ class NGFFMetadataHandler:
             raise RuntimeError("No metadata to save")
 
         meta_dict = cast_to_dict(self.metadata)
+        version = str(meta_dict.get('version', ''))
+        for ms in meta_dict.get('multiscales') or []:
+            # NGFF: a multiscale SHOULD name its downscaling `type` (the strict schemas
+            # require it): the method ozp made the levels with, the one read with the
+            # image, else "unknown" (levels given as they are, a single level)
+            if isinstance(ms, dict) and not ms.get('type'):
+                ms['type'] = (ms.get(STASH_KEY) or {}).get('type') or 'unknown'
+            # SHOULD too (strict_image requires it, decision 9.12-S): an empty `metadata`
+            # where the image has none (0.6's writer adds the same)
+            if isinstance(ms, dict) and 'metadata' not in ms:
+                ms['metadata'] = {}
+        metadata_dict = cast_to_dict(make_json_safe(self.metadata))
+        metadata_dict = self._multiscales_for(version, metadata_dict)
+        # the semantic check (plan 5.23), before anything of this group is written
+        if version in NGFF_VERSIONS:
+            problems = check_multiscales(metadata_dict, version)
+            if problems:
+                raise_for_metadata(str(self.zarr_group.store_path), problems, version)
         attrs = self.zarr_group.attrs
         for name in self._removed_custom:
             if name in attrs:
                 del attrs[name]
         self._removed_custom = set()
-        if meta_dict.get('version', '') == '0.5':
-            metadata_dict = cast_to_dict(make_json_safe(self.metadata))
+        if version in ('0.5', '0.6'):
             # the NGFF keys under `ome`, custom blocks beside it (the spec's placement)
             attrs['ome'] = {k: v for k, v in metadata_dict.items() if k in self.NGFF_KEYS}
             for key, value in metadata_dict.items():
                 if key not in self.NGFF_KEYS:
                     attrs[key] = value
         else:
-            metadata = make_json_safe(self.metadata)
-            metadata_dict = cast_to_dict(metadata)
             # 0.4 keeps everything at the top level: multiscales, omero, image-label and
             # any attribute NGFF does not define (an application's namespaced block, e.g.
             # 'eubi_bridge'). Only those were written before, so custom blocks were lost.
@@ -935,7 +1026,7 @@ class NGFFMetadataHandler:
             return False
 
         try:
-            if self.version == "0.5":
+            if nests_in_ome(self.version):
                 if not all(key in self.metadata for key in {'version', 'multiscales'}):
                     return False
             else:  # version == "0.4"
@@ -1256,10 +1347,21 @@ class Pyramid:
 
             image = micro_reader.open("x.czi", samples="channels").images[0]
             pyr = Pyramid.from_image(image, acquisition_block="my_app")
+
+        An image whose ``metadata.coordinate_system`` names a system keeps it (plan 3.26),
+        written as the custom metadata ``eubi:coordinate_system`` with a minimal definition
+        (``eubi:coordinate_systems``: the id, as its name too, and the image's own axes);
+        see :func:`ome_zarr_pyramid.core.spatial.pyramid_system`. The file's own definition
+        comes with :meth:`PyramidCollection.from_file` and ``coll.pyramid(key)``.
         """
         from ome_zarr_pyramid.core.collection import pyramid_from_image
-        return pyramid_from_image(image, version=version, name=name,
-                                  acquisition_block=acquisition_block, resolutions=resolutions)
+        from ome_zarr_pyramid.core.spatial import minimal_system, stamp_system
+        pyr = pyramid_from_image(image, version=version, name=name,
+                                 acquisition_block=acquisition_block, resolutions=resolutions)
+        sid = getattr(getattr(image, "metadata", None), "coordinate_system", None)
+        if sid is not None:
+            stamp_system(pyr, minimal_system(str(sid), pyr))
+        return pyr
 
     def from_arrays(self,
                     arrays: List[Union[np.ndarray, da.Array, zarr.Array]],
@@ -1708,6 +1810,10 @@ class Pyramid:
                         trans[0]['translation'], base_scale, new_pyr.meta.get_scale(path),
                         method)
                     ds['coordinateTransformations'] = cts + [entry]
+            if len(new_ms.get('datasets') or []) > 1:
+                # the downscale method that made the levels (NGFF: multiscales `type`;
+                # the strict schemas require it; ozp 0.3.1)
+                new_ms['type'] = getattr(self.downscaler, 'downscale_method', 'simple')
             new_pyr.meta._pending_changes = True
         return new_pyr
 
@@ -2812,9 +2918,9 @@ class Pyramid:
         return new
 
     def to_version(self, version: str) -> 'Pyramid':
-        """Return a NEW `Pyramid` in OME-Zarr `version` (``"0.4"`` or ``"0.5"``): the same
-        pixels and metadata, laid out for that version, and written as zarr v2 (0.4) or
-        v3 (0.5). Attached label images are converted too.
+        """Return a NEW `Pyramid` in OME-Zarr `version` (``"0.4"``, ``"0.5"`` or ``"0.6"``):
+        the same pixels and metadata, laid out for that version, and written as zarr v2
+        (0.4) or v3 (0.5, 0.6). Attached label images are converted too.
 
         Only the layout changes: where ``version`` is recorded, the zarr format, and the
         labels' ``image-label`` version. Axes, scales, translations, omero and custom
@@ -2841,13 +2947,13 @@ class Pyramid:
                 ms.pop('version', None)
                 if version == "0.4":
                     ms['version'] = version
-            if version == "0.5":
+            if nests_in_ome(version):
                 meta.metadata = md = {'version': version, **md}   # type: ignore[union-attr]
             label = md.get('image-label')
             if isinstance(label, dict) and 'version' in label:
                 label['version'] = version
         meta.version = version                                  # type: ignore[union-attr]
-        meta.zarr_format = 3 if version == "0.5" else 2         # type: ignore[union-attr]
+        meta.zarr_format = 3 if nests_in_ome(version) else 2    # type: ignore[union-attr]
         meta._pending_changes = True                            # type: ignore[union-attr]
         new._labels = {name: label.to_version(version) for name, label in self._labels.items()}
         return new

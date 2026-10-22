@@ -243,12 +243,12 @@ def test_write_labels_into_a_new_store_keeps_the_labels_version(tmp_path):
     assert _ngff_version(os.path.join(labels, "nuc")) == "0.5"
 
 
-def test_write_labels_into_an_06_store_is_refused(tmp_path):
+def test_write_labels_into_a_store_of_an_unknown_version_is_refused(tmp_path):
     from ome_zarr_pyramid import UnsupportedNGFFVersion
-    src = tmp_path / "img06.ome.zarr"
-    zarr.open_group(str(src), mode="w", zarr_format=3).attrs["ome"] = {"version": "0.6"}
+    src = tmp_path / "img07.ome.zarr"
+    zarr.open_group(str(src), mode="w", zarr_format=3).attrs["ome"] = {"version": "0.7"}
     labels = str(src / "labels")
-    with pytest.raises(UnsupportedNGFFVersion, match="0.6"):
+    with pytest.raises(UnsupportedNGFFVersion, match="0.7"):
         io.write_labels(Pyramid().from_label_arrays([LABEL], axis_order="yx"),
                         os.path.join(labels, "nuc"), labels_group_path=labels,
                         label_name="nuc")

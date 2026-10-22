@@ -122,8 +122,7 @@ def test_the_ome_xml_from_the_updated_pyramid(tmp_path):
     IO().update_metadata(str(path), channels={0: {"label": "Hoechst"}}, ome_xml=xml)
     assert seen == ["Hoechst"]
     assert (path / "OME" / "METADATA.ome.xml").read_bytes().startswith(b"<OME")
-    assert json.loads((path / "OME" / "zarr.json").read_text())["attributes"]["ome"][
-        "series"] == ["0"]
+    assert not (path / "OME" / "zarr.json").exists()          # a plain file (ozp 0.3.1)
 
 
 def test_a_channel_axis_unit_is_removed(tmp_path):

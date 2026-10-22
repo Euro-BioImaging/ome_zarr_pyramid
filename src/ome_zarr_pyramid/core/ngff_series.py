@@ -303,5 +303,6 @@ def write_series(node: CollectionNode, path, *, version: Optional[str] = None,
         written[series_path] = target
     layout = node.attributes.get(LAYOUT_KEY, LAYOUT_VERSION)
     root.attrs.put(_join(version, {LAYOUT_KEY: copy.deepcopy(layout), **ngff}, custom))
-    _write_ome_xml(str(path), xml, [p for p, _ in images], version, storage_options)
+    _write_ome_xml(str(path), xml, [p for p, _ in images], version, storage_options,
+                   layout=True)
     return written

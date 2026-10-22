@@ -1,8 +1,10 @@
-"""ozp refuses an NGFF version it cannot read (0.6 today) with UnsupportedNGFFVersion,
-from the group's declared version, at open, before any array is read (plan 9.3, 5.17).
+"""ozp refuses an NGFF version it cannot read with UnsupportedNGFFVersion, from the
+group's declared version, at open, before any array is read (plan 9.3, 5.17). Built for
+0.6 (9.3); since 0.6 is read (9.11), the fixtures declare 0.7, a version ozp does not
+know, and the names ending in "06" stand for "a version ozp does not read".
 
-The 0.6 fixtures are attributes only (no arrays at all), so a refusal proves nothing
-past the root's attributes was read: reading further would fail differently. 0.4 / 0.5
+The fixtures are attributes only (no arrays at all), so a refusal proves nothing past
+the root's attributes was read: reading further would fail differently. 0.4 / 0.5 / 0.6
 stores and RFC 8 ("0.x") collections still open."""
 import json
 import os
@@ -24,7 +26,7 @@ MULTISCALE = {"name": "img",
 
 def _group(path, ome):
     g = zarr.open_group(str(path), mode="w", zarr_format=3)
-    g.attrs.put({"ome": {"version": "0.6", **ome}})
+    g.attrs.put({"ome": {"version": "0.7", **ome}})
     return str(path)
 
 
@@ -60,13 +62,13 @@ def _write(tmp_path, version, name):
 
 
 def _relabelled(tmp_path):
-    """A real 0.5 image written by ozp whose zarr.json then says 0.6."""
+    """A real 0.5 image written by ozp whose zarr.json then says 0.7."""
     path, _ = _write(tmp_path, "0.5", "relabelled")
     meta = os.path.join(path, "zarr.json")
     with open(meta, encoding="utf-8") as f:
         doc = json.load(f)
     assert doc["attributes"]["ome"]["version"] == "0.5"
-    doc["attributes"]["ome"]["version"] = "0.6"
+    doc["attributes"]["ome"]["version"] = "0.7"
     with open(meta, "w", encoding="utf-8") as f:
         json.dump(doc, f)
     return path
@@ -81,7 +83,7 @@ OPENERS = {"io.read_pyramid": io.read_pyramid,
 
 def _check(exc):
     text = str(exc.value)
-    for part in ("'0.6'", "0.4", "0.5"):
+    for part in ("'0.7'", "0.4", "0.5"):
         assert part in text, text
     assert isinstance(exc.value, ValueError)
 
@@ -117,9 +119,9 @@ def test_the_error_is_exported_typed_and_names_the_way_out(tmp_path):
     # read: callers catching that still catch this
     assert issubclass(UnsupportedNGFFVersion, InvalidCollection)
     assert issubclass(UnsupportedNGFFVersion, ValueError)
-    assert READ_VERSIONS == ("0.4", "0.5")
+    assert READ_VERSIONS == ("0.4", "0.5", "0.6")
     text = str(exc.value)
-    assert "img.zarr" in text and "write it as 0.5" in text
+    assert "img.zarr" in text and "write it as 0.6" in text
 
 
 def test_a_04_layout_declaring_an_older_version_is_refused(tmp_path):
@@ -197,9 +199,9 @@ def test_a_06_well_in_a_05_plate_is_refused_at_open(tmp_path):
         "rows": [{"name": "A"}], "columns": [{"name": "1"}],
         "wells": [{"path": "A/1", "rowIndex": 0, "columnIndex": 0}]}}})
     _v3(tmp_path / "pl.zarr" / "A", {})
-    _v3(tmp_path / "pl.zarr" / "A" / "1", {"ome": {"version": "0.6", "well": {
+    _v3(tmp_path / "pl.zarr" / "A" / "1", {"ome": {"version": "0.7", "well": {
         "images": [{"path": "0"}]}}})
-    with pytest.raises(UnsupportedNGFFVersion, match=r"well 'A/1'.*0\.6"):
+    with pytest.raises(UnsupportedNGFFVersion, match=r"well 'A/1'.*0\.7"):
         PyramidCollection.from_zarr(plate)
 
 
@@ -215,11 +217,11 @@ def test_a_06_label_in_a_05_image_is_left_out_with_a_warning(tmp_path):
     assert list(io.read_pyramid(img).labels) == ["cells"]
     with open(os.path.join(label, "zarr.json")) as f:
         doc = json.load(f)
-    doc["attributes"]["ome"]["version"] = "0.6"
+    doc["attributes"]["ome"]["version"] = "0.7"
     with open(os.path.join(label, "zarr.json"), "w") as f:
         json.dump(doc, f)
     with pytest.warns(UserWarning, match=r"label 'cells' of .* is left out: "
-                                         r"UnsupportedNGFFVersion reading .*cells.*0\.6"):
+                                         r"UnsupportedNGFFVersion reading .*cells.*0\.7"):
         assert list(io.read_pyramid(img).labels) == []
     with pytest.raises(UnsupportedNGFFVersion):
         io.read_labels(img, "cells")

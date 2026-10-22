@@ -78,5 +78,5 @@ def test_a_sharded_pyramid_goes_to_04_without_shards(tmp_path):
 
 def test_only_known_versions():
     pyr, _ = _pyramid("0.5")
-    with pytest.raises(ValueError, match="'0.6' is not one of"):
-        pyr.to_version("0.6")
+    with pytest.raises(ValueError, match="'0.7' is not one of"):
+        pyr.to_version("0.7")

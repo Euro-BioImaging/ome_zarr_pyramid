@@ -158,8 +158,10 @@ def _labelled_plate(tmp_path):
 
 
 def _shape(node):
-    """A tree as (type, name, attributes, children), without paths and generated ids."""
-    attrs = {k: v.to_json() if hasattr(v, "to_json") else v for k, v in node.attributes.items()}
+    """A tree as (type, name, attributes, children), without paths and generated ids,
+    and without the eubi: keys RFC 8 output adds (tested in test_rfc8_graph.py)."""
+    attrs = {k: v.to_json() if hasattr(v, "to_json") else v for k, v in node.attributes.items()
+             if not k.startswith("eubi:")}
     kids = node.children if isinstance(node, CollectionNode) else []
     return (node.type, node.name, json.dumps(attrs, sort_keys=True), [_shape(c) for c in kids])
 
@@ -169,7 +171,7 @@ def _meta(pyr):
     return (pyr.axes, [m.get_scale(p) for p in m.resolution_paths],
             [m.get_translation(p) for p in m.resolution_paths], m.unit_list,
             [(c.get("label"), c.get("color")) for c in m.metadata["omero"]["channels"]],
-            pyr.custom_metadata)
+            {k: v for k, v in pyr.custom_metadata.items() if not k.startswith("eubi:")})
 
 
 @pytest.mark.parametrize("standalone", [False, True], ids=["in-the-group", "standalone-json"])

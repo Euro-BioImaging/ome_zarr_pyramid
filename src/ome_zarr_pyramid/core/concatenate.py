@@ -11,6 +11,7 @@ import copy
 import math
 from typing import Any, List, Sequence
 
+from ome_zarr_pyramid.core.spatial import SYSTEM_KEY
 from ome_zarr_pyramid.utils.optional_deps import is_dask_array
 
 #: how far two scales or positions may differ, relative to their size, and still agree
@@ -45,8 +46,9 @@ def concatenate(pyramids: Sequence[Any], axis: str = "c"):
     levels, each level's shape on the other axes, data type, every level's scale and
     units, and the position on the other axes. Otherwise a ``ValueError`` names what
     differs (joining images of different pixel sizes or places into one would misplace
-    them). Label images and pyramids with a pending ``downscale(defer=True)`` plan are
-    refused: concatenate first, then downscale.
+    them), as do inputs placed in different coordinate systems (or some placed, some not;
+    see ``ome_zarr_pyramid.core.spatial.pyramid_system``). Label images and pyramids with a
+    pending ``downscale(defer=True)`` plan are refused: concatenate first, then downscale.
 
     - Along ``c``: the channels are the inputs' channels in order, each with its label,
       colour and window (an input without channel metadata gets ozp's defaults).
@@ -86,6 +88,11 @@ def concatenate(pyramids: Sequence[Any], axis: str = "c"):
         if list(p.meta.unit_list) != list(first.meta.unit_list):
             raise ValueError(f"{where} has units {p.meta.unit_list}, input 0 "
                              f"{first.meta.unit_list}")
+        system, system0 = (q.meta.custom_blocks.get(SYSTEM_KEY) for q in (p, first))
+        if system != system0:
+            raise ValueError(f"{where} is placed in coordinate system {system!r}, input 0 in "
+                             f"{system0!r} (None: unplaced): a joined image has one position, "
+                             f"in one system")
         for level, (q, q0) in enumerate(zip(paths, paths0)):
             a, a0 = p.layers[q], first.layers[q0]
             if a.dtype != a0.dtype:
