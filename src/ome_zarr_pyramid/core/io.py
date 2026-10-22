@@ -304,6 +304,10 @@ def _full_pyramid(pyramid, full, arrays, rechunked, method):
             new_md['multiscales'] = ms
         full_dask.meta.metadata = new_md
         full_dask.meta._pending_changes = True
+    if full_dask.meta is not None and full_dask.meta.metadata and len(fpaths) > 1:
+        # the downscale method that made the levels (NGFF: multiscales `type`; the
+        # strict schemas require it)
+        full_dask.meta.multiscales['type'] = method
     return full_dask
 
 
@@ -567,12 +571,19 @@ _UPDATE_WINDOW_MODES = ("keep", "dtype", "data", "auto", "none")
 
 
 def _write_ome_xml(path, xml: str, series, version: str,
-                   storage_options: Optional[dict] = None) -> None:
-    """``<path>/OME/METADATA.ome.xml`` and its ``OME`` group, as bioformats2raw lays
-    them out (and eubi-bridge wrote them), in the output's NGFF `version`: the group's
-    attributes list *series* (default ``["0"]``; 0.4: ``series``, later versions:
-    ``ome.series`` beside ``ome.version``). Written through the zarr store of the
-    output, so local and object-store outputs are written alike."""
+                   storage_options: Optional[dict] = None, *, layout: bool = False) -> None:
+    """``<path>/OME/METADATA.ome.xml``, in the output's NGFF `version`, written through
+    the zarr store of the output (local and object-store outputs alike).
+
+    - `layout` True (a bioformats2raw layout, ``write_series``): ``OME`` is a zarr group
+      whose attributes list the image groups, *series* (0.4: ``series``, later versions:
+      ``ome.series`` beside ``ome.version``), as bioformats2raw lays it out.
+    - `layout` False (a single image, ``write_pyramid`` / ``update_metadata``): the XML
+      is a plain file and ``OME`` no group. NGFF has an ``OME`` group only in a
+      bioformats2raw layout, whose root carries ``bioformats2raw.layout``; a group with
+      ``series`` under an image root (what ozp 0.3.0 wrote, its ``series`` naming the
+      level-0 array) is rejected by validators that walk the hierarchy. Such a group is
+      removed (:func:`_drop_stray_ome_group`), the XML kept."""
     from ome_zarr_pyramid.core.ngff_plate import zarr_format_of
     from ome_zarr_pyramid.core.pyramid import _run_coroutine
     from zarr.core.buffer import default_buffer_prototype
@@ -580,14 +591,18 @@ def _write_ome_xml(path, xml: str, series, version: str,
         raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
     version = str(version)
     zarr_format = zarr_format_of(version)          # raises for a version ozp does not write
-    series = [str(s) for s in (series if series is not None else [0])]
     root = _open_store_group(path, zarr_format, mode="a", storage_options=storage_options)
-    ome = root.require_group("OME")
-    if version == "0.4":
-        ome.attrs["series"] = series
+    if layout:
+        series = [str(s) for s in (series if series is not None else [0])]
+        ome = root.require_group("OME")
+        if version == "0.4":
+            ome.attrs["series"] = series
+        else:
+            ome.attrs["ome"] = {"version": version, "series": series}
+        store_path = ome.store_path
     else:
-        ome.attrs["ome"] = {"version": version, "series": series}
-    store_path = ome.store_path
+        _drop_stray_ome_group(root, path)
+        store_path = root.store_path / "OME"
     key = f"{store_path.path}/METADATA.ome.xml" if store_path.path else "METADATA.ome.xml"
     root = getattr(store_path.store, "root", None)
     if root is not None:
@@ -600,6 +615,34 @@ def _write_ome_xml(path, xml: str, series, version: str,
         return
     data = default_buffer_prototype().buffer.from_bytes(xml.encode("utf-8"))
     _run_coroutine(store_path.store.set(key, data))
+
+
+def _drop_stray_ome_group(root: zarr.Group, path) -> bool:
+    """Remove the ``OME`` group's metadata (``zarr.json``; zarr v2: ``.zgroup`` and
+    ``.zattrs``) under an image root that is no bioformats2raw layout, keeping
+    ``METADATA.ome.xml``: the stray group ozp 0.3.0 wrote with an image's OME-XML. True
+    when one was removed (with a warning naming the store)."""
+    from ome_zarr_pyramid.core.pyramid import _run_coroutine
+    attrs = root.attrs.asdict()
+    ome = attrs.get("ome") if isinstance(attrs.get("ome"), dict) else attrs
+    if "bioformats2raw.layout" in ome or "plate" in ome:
+        return False
+    store, prefix = root.store_path.store, root.store_path.path
+    names = ("zarr.json",) if root.metadata.zarr_format == 3 else (".zgroup", ".zattrs")
+    keys = ["/".join(p for p in (prefix, "OME", n) if p) for n in names]
+
+    async def drop():
+        found = [k for k in keys if await store.exists(k)]
+        for k in found:
+            await store.delete(k)
+        return found
+    removed = _run_coroutine(drop())
+    if removed:
+        warnings.warn(f"{path}: removed the OME group's metadata ({', '.join(removed)}): an "
+                      f"image root that is no bioformats2raw layout holds its OME-XML as a "
+                      f"plain file, OME/METADATA.ome.xml (ozp 0.3.0 also wrote a group, "
+                      f"which validators reject)", UserWarning, stacklevel=3)
+    return bool(removed)
 
 
 def _open_store_group(path, zarr_format: int, mode: str = "a",
@@ -982,11 +1025,14 @@ class PyramidIO:
             uses ``pyramid.compressor`` (the input's own codec, or blosc for
             non-zarr-backed pyramids).
         ome_xml : str, optional
-            An OME-XML document written with the pyramid, as ``OME/METADATA.ome.xml``
-            in an ``OME`` group whose attributes list ``ome_series`` (default ``["0"]``),
-            as bioformats2raw lays it out: in the same write, local or remote, so the
-            output is not opened again afterwards. ozp writes it as given; building it is
-            the caller's.
+            An OME-XML document written with the pyramid, as the plain file
+            ``OME/METADATA.ome.xml`` (no ``OME`` group: NGFF has one only in a
+            bioformats2raw layout, see ``PyramidCollection.write_series``): in the same
+            write, local or remote, so the output is not opened again afterwards. ozp
+            writes it as given; building it is the caller's.
+        ome_series : sequence, optional
+            Deprecated, no effect (a single image gets no ``OME`` group since ozp
+            0.3.1); a warning says so.
 
         Notes
         -----
@@ -1001,6 +1047,12 @@ class PyramidIO:
         _refuse_removed_settings(removed)
         if ome_xml is not None and (not isinstance(ome_xml, str) or not ome_xml.strip()):
             raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
+        if ome_series is not None:
+            warnings.warn("write_pyramid(ome_series=...) has no effect since ozp 0.3.1: a "
+                          "single image's OME-XML is a plain file, OME/METADATA.ome.xml, with "
+                          "no OME group (NGFF has one only in a bioformats2raw layout; "
+                          "write_series writes that)", DeprecationWarning, stacklevel=2)
+            ome_series = None
         if windows not in _WINDOW_MODES:
             raise ValueError(f"windows={windows!r}: one of {_WINDOW_MODES}")
         if window_from_data:
@@ -1185,7 +1237,11 @@ class PyramidIO:
           ``write_pyramid(windows="auto")``; ``"none"`` removes them.
         - `ome_xml`: an OME-XML document (a string, or a function of the updated
           pyramid returning one) written to ``OME/METADATA.ome.xml``, as by
-          ``write_pyramid``; `ome_series` as there.
+          ``write_pyramid``; `ome_series` as there (no effect).
+
+        A store ozp 0.3.0 wrote with an OME-XML holds a stray ``OME`` group under the
+        image root, which validators reject; this repairs it, removing the group's
+        metadata and keeping ``OME/METADATA.ome.xml`` (with a warning).
 
         Local stores and object-store URLs (with `storage_options`)."""
         if windows not in _UPDATE_WINDOW_MODES:
@@ -1225,6 +1281,7 @@ class PyramidIO:
         pyramid.meta.zarr_group = group
         pyramid.meta._pending_changes = True
         pyramid.meta.save_changes()
+        _drop_stray_ome_group(group, path)
         if ome_xml is not None:
             xml = ome_xml(pyramid) if callable(ome_xml) else ome_xml
             _write_ome_xml(path, xml, ome_series, pyramid.meta.version, storage_options)

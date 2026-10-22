@@ -1,8 +1,10 @@
-"""write_pyramid(ome_xml=...): the OME-XML written with the pyramid (roadmap D5), as
-bioformats2raw lays it out and eubi-bridge wrote it, in the same write: the output is not
-opened again afterwards. Remote: tests/test_write_remote.py."""
+"""write_pyramid(ome_xml=...): the OME-XML written with the pyramid (roadmap D5), in the
+same write (the output is not opened again afterwards): a plain file OME/METADATA.ome.xml
+for a single image, an OME group listing the series for a bioformats2raw layout
+(write_series). Remote: tests/test_write_remote.py."""
 import json
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -25,21 +27,34 @@ def _read(path):
         return fh.read()
 
 
+def _no_ome_group(path):
+    """NGFF has an OME group only in a bioformats2raw layout: a single image's OME-XML is
+    a plain file, and OME holds no zarr metadata (ozp 0.3.1)."""
+    for name in ("zarr.json", ".zgroup", ".zattrs"):
+        assert not os.path.exists(os.path.join(path, "OME", name)), name
+
+
 @pytest.mark.parametrize("version", ["0.4", "0.5"])
-def test_written_beside_the_levels_with_its_series(tmp_path, version):
+def test_written_as_a_plain_file_beside_the_levels(tmp_path, version):
     path = str(tmp_path / "img.ome.zarr")
-    IO().write_pyramid(_pyr(version), path, overwrite=True, ome_xml=XML, ome_series=[2])
+    IO().write_pyramid(_pyr(version), path, overwrite=True, ome_xml=XML)
     assert _read(path) == XML                                 # as given, UTF-8
-    attrs = dict(zarr.open_group(os.path.join(path, "OME"), mode="r").attrs)
-    if version == "0.4":
-        assert attrs == {"series": ["2"]}
-    else:
-        assert attrs == {"ome": {"version": "0.5", "series": ["2"]}}
+    _no_ome_group(path)
+    root = zarr.open_group(path, mode="r")
+    assert list(root.group_keys()) == []                      # OME is no group
     back = IO().read_pyramid(path)                            # the image reads as before
     assert back.meta.resolution_paths == ["0"]
 
 
-def test_the_default_series_and_every_write_route(tmp_path):
+def test_ome_series_has_no_effect_and_says_so(tmp_path):
+    path = str(tmp_path / "img.ome.zarr")
+    with pytest.warns(DeprecationWarning, match="ome_series=...\\) has no effect"):
+        IO().write_pyramid(_pyr(), path, overwrite=True, ome_xml=XML, ome_series=[2])
+    assert _read(path) == XML
+    _no_ome_group(path)
+
+
+def test_every_write_route_writes_the_plain_file(tmp_path):
     for name, pyr, kw in (
             ("plain", _pyr(), {}),
             ("windows", _pyr(), {"window_from_data": True}),
@@ -47,8 +62,43 @@ def test_the_default_series_and_every_write_route(tmp_path):
         path = str(tmp_path / f"{name}.ome.zarr")
         IO().write_pyramid(pyr, path, overwrite=True, ome_xml=XML, **kw)
         assert _read(path) == XML, name
-        meta = json.load(open(os.path.join(path, "OME", "zarr.json"), encoding="utf-8"))
-        assert meta["attributes"]["ome"]["series"] == ["0"], name
+        _no_ome_group(path)
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_update_metadata_repairs_a_store_ozp_030_wrote(tmp_path, version):
+    """ozp 0.3.0 put an OME group with series ["0"] (the level-0 array) under the image
+    root; update_metadata removes the group's metadata and keeps the XML."""
+    path = str(tmp_path / "old.ome.zarr")
+    IO().write_pyramid(_pyr(version), path, overwrite=True, ome_xml=XML)
+    ome = zarr.open_group(os.path.join(path, "OME"), mode="w",
+                          zarr_format=2 if version == "0.4" else 3)
+    if version == "0.4":
+        ome.attrs["series"] = ["0"]
+    else:
+        ome.attrs["ome"] = {"version": "0.5", "series": ["0"]}
+    with open(os.path.join(path, "OME", "METADATA.ome.xml"), "w", encoding="utf-8") as fh:
+        fh.write(XML)
+    with pytest.warns(UserWarning, match="removed the OME group's metadata"):
+        IO().update_metadata(path)
+    _no_ome_group(path)
+    assert _read(path) == XML                                 # the XML stays
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        IO().update_metadata(path)                            # nothing left to repair
+
+
+def test_the_multiscale_type_names_the_downscale_method(tmp_path):
+    for name, pyr, want in (
+            ("deferred", _pyr().downscale(n_layers=2, scale_factor=(1, 2, 2, 2),
+                                          downscale_method="mean"), "mean"),
+            ("in-memory", _pyr().downscale(n_layers=2, scale_factor=(1, 2, 2, 2),
+                                           defer=False), "simple"),
+            ("one level", _pyr(), "unknown")):     # levels ozp did not make
+        path = str(tmp_path / f"{name}.ome.zarr")
+        IO().write_pyramid(pyr, path, overwrite=True)
+        ms = zarr.open_group(path, mode="r").attrs["ome"]["multiscales"][0]
+        assert ms.get("type") == want, name
 
 
 def test_without_ome_xml_nothing_is_written(tmp_path):

@@ -197,14 +197,13 @@ def test_the_ome_xml_is_written_with_a_remote_pyramid(bucket, data):
     xml = '<?xml version="1.0" encoding="UTF-8"?><OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"/>'
     pyr = Pyramid().from_arrays([data], axis_order=AXES, version="0.5")
     IO().write_pyramid(pyr, f"s3://{name}/img.ome.zarr", overwrite=True, storage_options=opts,
-                       ome_xml=xml, ome_series=[3])
-    import json
-
+                       ome_xml=xml)
     import obstore
     store = obstore.store.from_url(f"s3://{name}/img.ome.zarr", **opts)
     assert bytes(obstore.get(store, "OME/METADATA.ome.xml").bytes()).decode() == xml
-    meta = json.loads(bytes(obstore.get(store, "OME/zarr.json").bytes()))
-    assert meta["attributes"]["ome"] == {"version": "0.5", "series": ["3"]}
+    # a plain file: no OME group under a single image (ozp 0.3.1)
+    with pytest.raises(FileNotFoundError):
+        obstore.get(store, "OME/zarr.json")
 
 
 def test_auto_windows_read_the_remote_coarsest_level(bucket, data):

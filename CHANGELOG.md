@@ -1,6 +1,43 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.1 (2026-10-21)
+
+### Fixes
+
+- A single image written with an OME-XML (`write_pyramid(ome_xml=...)`,
+  `update_metadata(ome_xml=...)`, and so eubi-bridge 0.3.0's outputs) still gets its
+  OME-XML, at the same place, `OME/METADATA.ome.xml`. What changes: the `OME` folder
+  holding it is no longer a zarr group (no `OME/zarr.json`; zarr v2: no `.zgroup`,
+  `.zattrs`), just a folder with the XML file. 0.3.0 made it a group with
+  `series: ["0"]`, copied from the bioformats2raw layout: NGFF has an `OME` group only
+  under a bioformats2raw root, and its `series` named the level-0 array instead of an
+  image group. Each group still validated on its own, so ome-zarr-models, ome-zarr-py and
+  the schemas passed the stores, but a validator that walks the whole hierarchy rejects
+  them. Pixels and the image's own metadata were never affected. `write_series` (a
+  bioformats2raw layout) keeps its `OME` group, as the spec has it.
+- `update_metadata(path)` repairs a store 0.3.0 wrote that way: it removes only the
+  group metadata, `OME/zarr.json` (zarr v2: `.zgroup`, `.zattrs`), keeps
+  `OME/METADATA.ome.xml`, and warns. No pixel is read or rewritten.
+- Every written multiscale names its downscaling `type` (NGFF SHOULD; the strict schemas
+  require it): the downscale method when ozp made the levels (`"simple"`, `"mean"`, ...),
+  the one read with the image, else `"unknown"` (levels given as they are, a single level).
+
+### Deprecated
+
+- `write_pyramid(ome_series=...)` / `update_metadata(ome_series=...)` have no effect
+  (they set the `series` of the `OME` group, which a single image no longer has; its
+  OME-XML is written as before) and give a `DeprecationWarning`.
+
+### Tests
+
+- `tests/ngff_validation.py` checks every kind of written store as a whole: each group
+  against the official NGFF 0.4 / 0.5 schemas of every role it has, strict ones included
+  (vendored in `tests/ngff_schemas`), and the hierarchy no schema checks (an `OME` group
+  only under a bioformats2raw root with `series` naming image groups, datasets are arrays,
+  labels, wells and fields where their parents list them). Known gap it reports: a label
+  written without `colors` fails `strict_label` only.
+
+## 0.3.0 (2026-10-21)
 
 ### Breaking changes
 
