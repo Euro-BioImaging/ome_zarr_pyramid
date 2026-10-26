@@ -1,17 +1,45 @@
 name: Publish to PyPI
 
-# Runs when you publish a GitHub Release (Releases -> Draft a new release -> Publish),
-# OR manually via the "Run workflow" button on the Actions tab (workflow_dispatch).
-# Builds the sdist + wheel and uploads them to PyPI via Trusted Publishing (OIDC) -
-# no API token/secret required (configure the trusted publisher on PyPI once, see README).
+# Runs when you publish a GitHub Release (Releases -> Draft a new release -> Publish):
+#
+#   1. the release tag must equal the version in pyproject.toml (vX.Y.Z);
+#   2. the full test suite runs on the release's commit (tests.yml); nothing is
+#      published unless it passes;
+#   3. the sdist + wheel are built and uploaded to PyPI via Trusted Publishing (OIDC),
+#      no API token/secret required.
+#
+# If only the upload failed, "Re-run failed jobs" on the run retries it. If the tests
+# failed: fix, delete the release and its tag, and release again.
+#
+# Keep this file's name: the PyPI trusted publisher is registered for publish.yml
+# with environment pypi.
 on:
   release:
     types: [published]
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  checks:
+    name: Tag matches the version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release tag equals pyproject.toml's version
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          test "v$version" = "${{ github.event.release.tag_name }}" \
+            || { echo "::error::release tag ${{ github.event.release.tag_name }} != v$version (pyproject.toml)"; exit 1; }
+
+  tests:
+    needs: checks
+    uses: ./.github/workflows/tests.yml
+
   build:
     name: Build distributions
+    needs: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
