@@ -133,9 +133,9 @@ def test_a_tree_from_file_is_written_and_read_back(tmp_path):
     assert [n.name for n in back.tree] == ["series0", "series1"]
     # the RFC 8 attribute keeps its own name
     assert "scene" in rfc8._RFC8_ATTRIBUTES
-    # a selection of the tree is refused, as for a collection read from a store
-    with pytest.raises(ValueError, match="selection of its tree"):
-        coll.select(series=0).write_collection(str(tmp_path / "part.zarr"))
+    # a selection of the tree is written with its part of the tree
+    part = PyramidCollection.from_zarr(coll.select(series=1).write_collection(str(tmp_path / "part.zarr")))
+    assert [n.name for n in part.tree] == ["series1"]
 
 
 def test_a_concatenated_collection_gets_a_tree_of_its_keys_and_writes(tmp_path):
@@ -144,7 +144,7 @@ def test_a_concatenated_collection_gets_a_tree_of_its_keys_and_writes(tmp_path):
     joined = coll.concatenate("view")
     assert _shape(joined.tree) == ("sample", None, None, ["series0"])
     assert joined.tree["series0"].pyramid is joined[{"series": 0}]
-    assert list(joined.write_series(str(tmp_path / "s.zarr"))) == ["0"]
+    assert joined.write_series(str(tmp_path / "s.zarr")) == str(tmp_path / "s.zarr")
     assert len(joined.write(tmp_path, "j", overwrite=True)) == 1
 
 
@@ -226,9 +226,9 @@ def test_a_folder_keeps_its_whole_name(tmp_path):
 
 # -- select -------------------------------------------------------------------------
 
-def test_select_raises_on_an_index_the_collection_does_not_have():
+def test_select_raises_on_an_unknown_index_as_micro_reader_does():
     coll = PyramidCollection.from_file(_file({"series": 0, "view": 0}, {"series": 1, "view": 1}))
-    with pytest.raises(KeyError, match=r"no index 'nothing'; its indices are \['series', 'view'\]"):
+    with pytest.raises(KeyError, match=r"unknown indices \['nothing'\]"):
         coll.select(nothing=1)
     with pytest.raises(KeyError, match=r"'scene' is now called 'series' \(micro-reader 0.1.0\)"):
         coll.select(scene=0)
@@ -237,16 +237,15 @@ def test_select_raises_on_an_index_the_collection_does_not_have():
     assert len(empty) == 0
     # ... which still knows the names it was selected by
     assert len(empty.select(series=0)) == 0
-    with pytest.raises(KeyError, match="no index 'tile'"):
-        empty.select(tile=0)
+    # an index of micro-reader's the images do not have selects nothing, as there
+    assert len(empty.select(tile=0)) == 0 and len(coll.select(tile=0)) == 0
     assert len(coll.select(series=0)) == 1
 
 
-def test_select_names_no_series_hint_without_series():
+def test_select_names_the_series_rename_as_micro_reader_does():
     coll = PyramidCollection.from_file(_file({"tile": 0}, {"tile": 1}))
-    with pytest.raises(KeyError) as err:
+    with pytest.raises(KeyError, match="'scene' is now called 'series'"):
         coll.select(scene=0)
-    assert "now called" not in str(err.value) and "['tile']" in str(err.value)
 
 
 def test_a_field_select_only_filters():

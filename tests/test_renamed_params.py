@@ -55,8 +55,7 @@ def test_one_process_means_this_process(pyr, tmp_path):
 
 
 @pytest.mark.parametrize("kw", [dict(queue_size=8), dict(max_concurrency=2),
-                                dict(num_readers=2), dict(max_concurrent_layers=1),
-                                dict(gc_interval=5.0)])
+                                dict(max_concurrent_layers=1)])
 def test_removed_engine_settings_are_refused(pyr, tmp_path, kw):
     # they belonged to the engines removed in 0.1.0; ignoring them would hide a mistake
     with pytest.raises(ValueError, match="removed in ome_zarr_pyramid 0.1.0"):

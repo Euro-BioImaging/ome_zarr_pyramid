@@ -20,7 +20,7 @@ import time
 import warnings
 from pathlib import Path
 from queue import Queue, Empty
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorstore as ts
@@ -189,24 +189,53 @@ def _object_store_group(url: str, zarr_format: int, mode: str,
     return zarr.open_group(store, mode=mode, zarr_format=zarr_format)
 
 
+#: ``write_pyramid(backend=...)``: the storage backend, as dyna-zarr names it (decision
+#: C-14, 0.5.0; ``io_backend=`` is its old name)
+_STORAGE_BACKENDS = ('tensorstore', 'zarrista')
+#: ``write_pyramid(engine=...)``: dyna-zarr's execution loop
+_DYNA_ENGINES = ('fused', 'pipeline')
+#: what ``backend=`` named before 0.5.0: ozp's write engine, which is always dyna
 _ENGINES = ('auto', 'dyna')
 # Removed in 0.1.0. Their code stays in this module for reference
 # (`PyramidIO.write_pyramid_tensorstore`, `PyramidIO._write_all_layers_unified`) but
 # write_pyramid no longer calls it: the dyna engine was faster, used less memory, and
-# was the only one with shards and a memory budget.
-_REMOVED_ENGINES = ('sync', 'tensorstore')
-_REMOVED_SETTINGS = ('max_concurrency', 'num_readers', 'queue_size',
-                     'max_concurrent_layers', 'gc_interval')
+# was the only one with shards and a memory budget. ('tensorstore' was one too: since
+# 0.5.0 backend='tensorstore' is the storage backend, as in dyna-zarr.)
+_REMOVED_ENGINES = ('sync',)
+_REMOVED_SETTINGS = ('max_concurrency', 'queue_size', 'max_concurrent_layers')
+
+
+def _storage_backend(backend, io_backend) -> str:
+    """The storage backend of ``write_pyramid(backend=..., io_backend=...)``: ``backend=``
+    names it as dyna-zarr does (``'tensorstore'``, the default, or ``'zarrista'``);
+    ``io_backend=`` is its old name and still works. The engine words ``backend=`` took
+    before 0.5.0 (``'auto'``, ``'dyna'``: one engine, dyna) warn and are ignored; a removed
+    engine raises."""
+    if backend in _REMOVED_ENGINES:
+        raise ValueError(
+            f"backend={backend!r} was a write engine removed in ome_zarr_pyramid 0.1.0. The "
+            f"default engine writes the same output, faster and with less memory: drop it. "
+            f"(backend= names the storage backend now: 'tensorstore' or 'zarrista'.)")
+    if backend in _ENGINES:
+        warnings.warn(
+            f"write_pyramid(backend={backend!r}): backend= names the storage backend since "
+            f"ome_zarr_pyramid 0.5.0 ('tensorstore' or 'zarrista', as in dyna-zarr); the write "
+            f"engine is always dyna, so drop backend={backend!r} (dyna's own loop is "
+            f"engine='fused' or 'pipeline')", FutureWarning, stacklevel=4)
+        backend = None
+    for name, value in (("backend", backend), ("io_backend", io_backend)):
+        if value is not None and value not in _STORAGE_BACKENDS:
+            raise ValueError(f"{name}={value!r}: the storage backend is one of "
+                             f"{_STORAGE_BACKENDS}, as in dyna-zarr")
+    if backend is not None and io_backend is not None and backend != io_backend:
+        raise ValueError(f"backend={backend!r} and io_backend={io_backend!r} disagree: "
+                         f"io_backend is the old name of backend; give one")
+    return backend or io_backend or 'tensorstore'
 
 
 def _resolve_engine(pyramid, backend, *, max_downscale_processes) -> str:
-    """The write engine for ``write_pyramid(backend=...)``: always dyna. A removed engine
-    is refused, never swapped for dyna (fail loudly)."""
-    if backend in _REMOVED_ENGINES:
-        raise ValueError(
-            f"backend={backend!r} was removed in ome_zarr_pyramid 0.1.0. The default "
-            f"engine writes the same output, faster and with less memory: drop backend= "
-            f"(or pass backend='auto').")
+    """ozp's write engine: always dyna. (`backend` is a word ``backend=`` took before 0.5.0,
+    'auto' or 'dyna'.)"""
     if backend not in _ENGINES:
         raise ValueError(f"backend must be one of {_ENGINES}, got {backend!r}")
     if max_downscale_processes and pyramid._has_dask_layer():
@@ -366,10 +395,12 @@ def _ts_level_reducer(block, factors, method):
 
 def _dyna_level_kwargs(pyramid, lvl, p, arr, *, zf, max_threads, io_backend, region_size_mb,
                        chunk_shape, chunk_size_mb, recorded, storage, codecs,
-                       shard_coefficients, remote, storage_options) -> dict:
+                       shard_coefficients, remote, storage_options, loop=None) -> dict:
     """``dyna_zarr.io.write`` options for one level: the dyna engine's rules, shared by
-    the per-level writes and the one-pass level writer."""
+    the per-level writes and the one-pass level writer. `loop`: dyna's ``engine``,
+    ``num_readers`` and ``gc_interval``, those given (per-level writes only)."""
     kw = dict(zarr_format=zf, max_threads=max_threads, backend=io_backend, overwrite=False)
+    kw.update(loop or {})
     if not is_dask_array(arr):
         # dyna writes a dask level with dask's own scheduler (the pump), which has no
         # read regions and refuses region options
@@ -424,6 +455,21 @@ def _resolve_compressor(pyramid, compressor, compressor_params):
         return pyramid.compressor
     if isinstance(compressor, CompressorConfig):
         return compressor
+    if type(compressor).__name__ == "Codecs" and \
+            type(compressor).__module__.split(".")[0] == "dyna_zarr":
+        # dyna-zarr's own form (decision C-14): its codec, level and blosc settings
+        if compressor_params:
+            raise ValueError("compressor_params go with a codec name; a dyna Codecs holds "
+                             "its own settings")
+        name = compressor.compressor or "none"
+        if name == "blosc":
+            params = {"cname": compressor.cname, "clevel": int(compressor.clevel),
+                      "shuffle": int(compressor.shuffle)}
+        elif name in ("zstd", "gzip", "bz2"):
+            params = {"level": int(compressor.clevel)}
+        else:
+            params = {}
+        return CompressorConfig(name=str(name), params=params)
     return CompressorConfig(name=compressor, params=dict(compressor_params or {}))
 
 
@@ -1003,7 +1049,7 @@ class PyramidIO:
                       max_threads: Optional[int] = None,
                       region_size_mb: float = 8.0,
                       max_downscale_processes: Optional[int] = None,
-                      backend: str = 'auto',
+                      backend: Optional[str] = None,
                       compressor: Optional[str] = None,
                       compressor_params: Optional[dict] = None,
                       chunk_shape=None,
@@ -1013,7 +1059,7 @@ class PyramidIO:
                       label_name: Optional[str] = None,
                       storage_options: Optional[dict] = None,
                       shard_coefficients=None,
-                      io_backend: str = 'tensorstore',
+                      io_backend: Optional[str] = None,
                       dtype=None,
                       window_from_data: bool = False,
                       memory_budget_mb: Optional[float] = None,
@@ -1022,26 +1068,46 @@ class PyramidIO:
                       ome_series: Optional[Sequence] = None,
                       max_workers: Optional[int] = None,
                       use_multiprocessing: Optional[bool] = None,
+                      chunks=None,
+                      engine: Optional[str] = None,
+                      num_readers: Optional[int] = None,
+                      gc_interval: Optional[float] = None,
+                      fill_derived: Optional[bool] = None,
+                      levels: Optional[List[str]] = None,
                       **removed) -> None:
         """Write a pyramid using region-wise processing.
+
+        ``chunks`` is ``chunk_shape`` under dyna-zarr's name (``io.write(chunks=...)``);
+        give one of the two.
 
         ``dyna_zarr.io.write`` writes every level, local or remote (``s3://`` and the
         other object-store URLs, with ``storage_options``). numpy, zarr, TensorStore and
         DynamicArray levels are pulled region by region (memory-bounded); dask levels are
         run by dask's own scheduler on threads and pushed into the same kind of output.
-        ``backend`` is ``'auto'`` (default) or ``'dyna'``, the same engine; the older
-        ``'sync'`` and ``'tensorstore'`` engines were removed in 0.1.0 and are refused,
-        as are their settings (``max_concurrency``, ``num_readers``, ``queue_size``,
-        ``max_concurrent_layers``, ``gc_interval``).
+        The options are dyna-zarr's words (decision C-14, 0.5.0): ``backend`` is the
+        storage backend, ``'tensorstore'`` (default) or ``'zarrista'`` (``io_backend`` is
+        its old name and still works); ``engine`` is dyna's execution loop, ``'fused'``
+        (dyna's default) or ``'pipeline'``, with ``num_readers`` (pipeline only) and
+        ``gc_interval``; they apply to levels written one by one (a deferred downscale's
+        one-pass write has dyna's own loop and refuses them). ``backend='auto'`` /
+        ``'dyna'``, what ``backend`` named before 0.5.0 (ozp's engine, always dyna), warn
+        and are ignored; the ``'sync'`` engine, removed in 0.1.0, is refused, as are its
+        settings (``max_concurrency``, ``queue_size``, ``max_concurrent_layers``).
 
         A legacy ``https://host/bucket/key`` target is written as ``s3://bucket/key``
         with ``endpoint='https://host'``; its s3fs option names (``anon``, ``key``,
         ``secret``, ``token``, ``client_kwargs``) are translated.
 
-        ``compressor`` / ``compressor_params`` (a name + params, or a
-        ``CompressorConfig``) override the pyramid's codec.
+        ``compressor`` / ``compressor_params`` (a name + params, a ``CompressorConfig``,
+        or dyna-zarr's ``Codecs``) override the pyramid's codec.
+
+        ``fill_derived`` (default True; decision 9.12-S): fill the NGFF SHOULD fields ozp
+        derives exactly where the source lacks them - a multiscale's empty ``metadata`` and
+        its ``type`` ``"unknown"`` when nothing names the method (and, in ``write_plate``,
+        each acquisition's ``maximumfieldcount``). False writes them only as the source
+        has them; the strict schemas then report them (``validate=True`` warns).
         ``shard_coefficients`` (a per-axis tuple, or ``{level: tuple}``; shard =
-        coefficients x chunks, zarr v3 only) shards the levels, and ``io_backend``
+        coefficients x chunks, zarr v3 only) shards the levels, and ``backend``
         picks dyna's byte backend (``'tensorstore'`` or ``'zarrista'``). Without
         ``shard_coefficients`` a sharded base level's sharding is kept and applied to
         every level.
@@ -1088,7 +1154,8 @@ class PyramidIO:
         path : str or Path
             Output path for the zarr store
         layers : list of str, optional
-            Specific layer indices to write. If None, writes all layers.
+            Specific level paths to write. If None, writes all levels. ``levels`` is the
+            same, by the name the docs and dyna-zarr use.
         overwrite : bool, optional
             If True, overwrite existing store. Default is False.
         max_threads : int, optional
@@ -1099,7 +1166,11 @@ class PyramidIO:
             Levels written at once in separate processes. Default None (off). Rarely
             useful; to be deprecated (see above).
         backend : str, optional
-            ``'auto'`` (default) or ``'dyna'`` - see above.
+            The storage backend: ``'tensorstore'`` (default) or ``'zarrista'``, as in
+            dyna-zarr (``io_backend`` is its old name) - see above.
+        engine, num_readers, gc_interval : optional
+            dyna-zarr's execution loop and its settings, passed to ``dyna_zarr.io.write``
+            for each level - see above.
         dtype : optional
             Write every level as this dtype, saturating instead of wrapping
             (``Pyramid.saturate_cast``: uint16 4000 -> uint8 255, floats rounded,
@@ -1150,6 +1221,28 @@ class PyramidIO:
         if pyramid.meta is None:
             raise ValueError("Pyramid not initialized")
         _refuse_removed_settings(removed)
+        if levels is not None:            # the level paths to write, by dyna's name (C-16)
+            if layers is not None:
+                raise ValueError("write_pyramid: give levels= or layers=, not both "
+                                 "(levels is the name of layers since 0.5.0)")
+            layers = levels
+        if fill_derived is not None:
+            from ome_zarr_pyramid.core.validation import filling
+            with filling(fill_derived):
+                return self.write_pyramid(
+                    pyramid, path, layers=layers, overwrite=overwrite, max_threads=max_threads,
+                    region_size_mb=region_size_mb,
+                    max_downscale_processes=max_downscale_processes, backend=backend,
+                    compressor=compressor, compressor_params=compressor_params,
+                    chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb,
+                    include_labels=include_labels, labels_group_path=labels_group_path,
+                    label_name=label_name, storage_options=storage_options,
+                    shard_coefficients=shard_coefficients, io_backend=io_backend, dtype=dtype,
+                    window_from_data=window_from_data, memory_budget_mb=memory_budget_mb,
+                    windows=windows, ome_xml=ome_xml, ome_series=ome_series,
+                    max_workers=max_workers, use_multiprocessing=use_multiprocessing,
+                    chunks=chunks, engine=engine, num_readers=num_readers,
+                    gc_interval=gc_interval)
         if ome_xml is not None and (not isinstance(ome_xml, str) or not ome_xml.strip()):
             raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
         if ome_series is not None:
@@ -1168,12 +1261,22 @@ class PyramidIO:
         if windows != "keep" and layers is None and pyramid.meta.is_label:
             raise ValueError(f"windows={windows!r} sets omero channel windows; a label "
                              f"image has none.")
+        if chunks is not None:
+            if chunk_shape is not None:
+                raise ValueError("write_pyramid: give chunks= or chunk_shape=, not both "
+                                 "(chunks is dyna-zarr's name for chunk_shape)")
+            chunk_shape = chunks
         max_threads = renamed(max_threads, max_workers, new="max_threads",
                               old="max_workers", where="write_pyramid", default=4)
         max_downscale_processes = downscale_processes(max_downscale_processes, use_multiprocessing,
                                                       where="write_pyramid")
-        engine = _resolve_engine(pyramid, backend,
-                                 max_downscale_processes=max_downscale_processes)
+        io_backend = _storage_backend(backend, io_backend)
+        backend = None                   # the storage backend travels as io_backend below
+        if engine is not None and engine not in _DYNA_ENGINES:
+            raise ValueError(f"engine={engine!r}: dyna-zarr's loop is one of {_DYNA_ENGINES}")
+        loop = {k: v for k, v in (("engine", engine), ("num_readers", num_readers),
+                                  ("gc_interval", gc_interval)) if v is not None}
+        _resolve_engine(pyramid, 'auto', max_downscale_processes=max_downscale_processes)
         # the legacy https://host/bucket/key form becomes s3://bucket/key + endpoint
         if _is_legacy_https(path):
             if labels_group_path is not None and _is_legacy_https(labels_group_path):
@@ -1190,7 +1293,8 @@ class PyramidIO:
                 include_labels=include_labels, labels_group_path=labels_group_path,
                 label_name=label_name, storage_options=storage_options,
                 shard_coefficients=shard_coefficients, io_backend=io_backend, dtype=dtype,
-                memory_budget_mb=memory_budget_mb, ome_xml=ome_xml, ome_series=ome_series)
+                memory_budget_mb=memory_budget_mb, ome_xml=ome_xml, ome_series=ome_series,
+                **loop)
         if windows == "data" and layers is None:
             return self._write_measuring_windows(
                 pyramid, path, overwrite=overwrite, max_threads=max_threads,
@@ -1201,7 +1305,8 @@ class PyramidIO:
                 include_labels=include_labels, labels_group_path=labels_group_path,
                 label_name=label_name, storage_options=storage_options,
                 shard_coefficients=shard_coefficients, io_backend=io_backend, dtype=dtype,
-                memory_budget_mb=memory_budget_mb, ome_xml=ome_xml, ome_series=ome_series)
+                memory_budget_mb=memory_budget_mb, ome_xml=ome_xml, ome_series=ome_series,
+                **loop)
         if dtype is not None:
             pyramid = pyramid.saturate_cast(dtype)
         if windows in ("dtype", "none") and layers is None:
@@ -1247,7 +1352,7 @@ class PyramidIO:
                                  storage_options=storage_options)
         side = dict(label_block=label_block, label_version=label_version,
                     label_zarr_format=label_zarr_format, attached_labels=attached_labels,
-                    overwrite=overwrite, backend=backend, compressor=compressor,
+                    overwrite=overwrite, backend=io_backend, compressor=compressor,
                     compressor_params=compressor_params, storage_options=storage_options,
                     ome_xml=ome_xml, ome_series=ome_series)
 
@@ -1271,13 +1376,17 @@ class PyramidIO:
         if plan is not None and not getattr(pyramid, '_downscale_plan_active', False):
             plan = None
         if plan is not None and layers is None:
+            if engine not in (None, 'fused') or loop.get("num_readers") is not None:
+                raise ValueError(
+                    f"engine={engine!r} / num_readers apply to levels written one by one; "
+                    f"this pyramid's levels are computed in one pass from level 0 (a "
+                    f"deferred downscale), which has dyna's own loop: drop them")
             self._write_with_plan(
                 pyramid, path, plan, overwrite=overwrite,
                 chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb,
                 max_threads=max_threads, region_size_mb=region_size_mb,
                 max_downscale_processes=max_downscale_processes,
-                backend=engine, compressor=compressor,
-                compressor_params=compressor_params,
+                compressor=compressor, compressor_params=compressor_params,
                 shard_coefficients=shard_coefficients, io_backend=io_backend,
                 storage_options=storage_options, memory_budget_mb=memory_budget_mb,
             )
@@ -1295,7 +1404,7 @@ class PyramidIO:
             compressor_params=compressor_params, region_size_mb=region_size_mb,
             max_threads=max_threads, io_backend=io_backend,
             max_downscale_processes=max_downscale_processes, storage_options=storage_options,
-            memory_budget_mb=memory_budget_mb)
+            memory_budget_mb=memory_budget_mb, loop=loop)
         if layers is not None:
             return    # internal sub-write: the caller writes the side metadata
         self._write_side_metadata(path, **side)
@@ -1330,7 +1439,8 @@ class PyramidIO:
                         units: Optional[dict] = None,
                         channels: Optional[dict] = None, windows: str = "keep",
                         ome_xml=None, ome_series=None,
-                        storage_options: Optional[dict] = None) -> Pyramid:
+                        storage_options: Optional[dict] = None,
+                        fill_derived: Optional[bool] = None) -> Pyramid:
         """Edit the metadata of the OME-Zarr image at `path` in place; its pixels are
         never touched (read, not rewritten). Returns the updated `Pyramid`.
 
@@ -1356,6 +1466,13 @@ class PyramidIO:
         if windows not in _UPDATE_WINDOW_MODES:
             raise ValueError(f"update_metadata: windows={windows!r}: one of "
                              f"{_UPDATE_WINDOW_MODES}")
+        if fill_derived is not None:
+            from ome_zarr_pyramid.core.validation import filling
+            with filling(fill_derived):
+                return self.update_metadata(path, scales=scales, units=units,
+                                            channels=channels, windows=windows,
+                                            ome_xml=ome_xml, ome_series=ome_series,
+                                            storage_options=storage_options)
         pyramid = self.read_pyramid(path, include_labels=False,
                                     storage_options=storage_options, apply_scene=None)
         order = pyramid.meta.axis_order
@@ -1448,7 +1565,7 @@ class PyramidIO:
                             chunk_size_mb, shard_coefficients, compressor, compressor_params,
                             region_size_mb, max_threads, io_backend,
                             max_downscale_processes=None, storage_options=None,
-                            memory_budget_mb=None):
+                            memory_budget_mb=None, loop=None):
         """The dyna engine: every level streamed through ``dyna_zarr.io.write``
         (memory-bounded), then the NGFF group metadata. Local or object store (s3://,
         gs://, az://): the arrays through dyna, the group through obstore, both with the
@@ -1500,7 +1617,7 @@ class PyramidIO:
                 region_size_mb=region_size_mb, chunk_shape=chunk_shape,
                 chunk_size_mb=chunk_size_mb, recorded=recorded, storage=storage,
                 codecs=codecs, shard_coefficients=shard_coefficients, remote=remote,
-                storage_options=storage_options)
+                storage_options=storage_options, loop=loop)
             if lvl == 0 and getattr(self, '_level0_observer', None) is not None:
                 kw['observe'] = self._level0_observer
             if memory_budget_mb is not None:
@@ -1530,7 +1647,7 @@ class PyramidIO:
         pyramid.meta.save_changes()
 
     def _write_side_metadata(self, path, *, label_block, label_version, label_zarr_format,
-                             attached_labels: dict, overwrite: bool, backend: str = 'auto',
+                             attached_labels: dict, overwrite: bool, backend: Optional[str] = None,
                              compressor=None, compressor_params=None,
                              storage_options=None, ome_xml=None, ome_series=None) -> None:
         """Post-array-write side metadata, shared by every write_pyramid exit:
@@ -1550,7 +1667,7 @@ class PyramidIO:
             _write_ome_xml(path, ome_xml, ome_series, label_version, storage_options)
 
     def _write_attached_labels(self, labels: dict, path, *, overwrite: bool,
-                               backend: str = 'auto', compressor=None,
+                               backend: Optional[str] = None, compressor=None,
                                compressor_params=None, storage_options=None) -> None:
         """Write each entry of a pyramid's `labels` collection as an OME-Zarr label
         image under ``<path>/labels/<name>`` (registering it in the ``labels/`` group),
@@ -2268,16 +2385,47 @@ class IO:
         """Read a pyramid from a path or object-store URL. `include_labels` also loads
         the image's NGFF ``labels/`` collection into `Pyramid.labels` (lazy);
         `apply_scene=True` adds the position an NGFF 0.6 scene gives the image to its
-        levels. See :meth:`PyramidIO.read_pyramid`."""
+        levels. See :meth:`PyramidIO.read_pyramid`.
+
+        `path` may also be an open ``zarr.Group`` (what ``Pyramid().from_ngff`` takes);
+        its labels are not looked up and the other options do not apply."""
+        if isinstance(path, zarr.Group):
+            return Pyramid().from_ngff(path)
         return PyramidIO().read_pyramid(path, include_labels=include_labels,
                                         storage_options=storage_options,
                                         apply_scene=apply_scene)
 
-    def update_metadata(self, path: Union[str, Path], **kwargs) -> Pyramid:
-        """Edit the metadata of the OME-Zarr image at `path` in place (scales, units,
-        channels, windows, OME-XML); the pixels are never rewritten. See
-        :meth:`PyramidIO.update_metadata`."""
-        return PyramidIO().update_metadata(path, **kwargs)
+    def update_metadata(self, path: Union[str, Path], **kwargs):
+        """Edit the metadata of what is stored at `path` in place (scales, units, channels,
+        windows, OME-XML); the pixels are never rewritten. See
+        :meth:`PyramidIO.update_metadata` for the options.
+
+        An image: returns the updated `Pyramid`. A plate, a well or a bioformats2raw
+        layout: every image gets the same edit, and the collection read again is returned
+        (``ome_xml`` is refused there: it describes one image, or a whole series layout,
+        which ``write_series(ome_xml=...)`` writes)."""
+        from ome_zarr_pyramid.core.collection import PyramidCollection
+
+        storage_options = kwargs.get("storage_options")
+        coll = PyramidCollection._from_zarr(path, storage_options=storage_options)
+        if list(coll) == [()]:
+            return PyramidIO().update_metadata(path, **kwargs)
+        if kwargs.get("ome_xml") is not None:
+            raise ValueError(f"update_metadata: {path} holds {len(coll)} images; ome_xml "
+                             f"describes one image (or a series layout: write_series(ome_xml=...))")
+        locations = []
+        for key in coll:
+            node = coll._pyramids[key]
+            loader = getattr(node, "loader", None)
+            path_of = getattr(loader, "path_of", None)
+            if path_of is None or getattr(node, "path", None) is None:
+                raise ValueError(f"update_metadata: cannot tell where image {dict(key)} of "
+                                 f"{path} is stored (an RFC 8 collection?); edit its images "
+                                 f"one by one with io.update_metadata(image_path, ...)")
+            locations.append(path_of(node))
+        for location in locations:
+            PyramidIO().update_metadata(location, **kwargs)
+        return PyramidCollection._from_zarr(path, storage_options=storage_options)
 
     def read_labels(self, path: Union[str, Path], name: Optional[str] = None,
                     storage_options: Optional[dict] = None) -> Pyramid:
@@ -2293,13 +2441,16 @@ class IO:
                       max_threads: Optional[int] = None,
                       region_size_mb: float = 8.0,
                       max_downscale_processes: Optional[int] = None,
-                      backend: str = 'auto',
-                      **kwargs) -> None:
-        """Write a pyramid to a path or object-store URL. Extra ``**kwargs``
-        (``compressor``, ``chunk_shape``, ``shard_coefficients``, ...) are forwarded.
-        See :meth:`PyramidIO.write_pyramid`.
+                      backend: Optional[str] = None,
+                      **kwargs) -> str:
+        """Write a pyramid to a path or object-store URL and return `path`. The options are
+        dyna-zarr's words: ``backend`` the storage backend (``'tensorstore'`` or
+        ``'zarrista'``; ``io_backend`` is its old name), ``engine`` / ``num_readers`` /
+        ``gc_interval`` dyna's loop, ``chunks`` the chunk shape, ``compressor`` a name,
+        ``CompressorConfig`` or dyna ``Codecs``. Extra ``**kwargs`` (``chunk_shape``,
+        ``shard_coefficients``, ...) are forwarded. See :meth:`PyramidIO.write_pyramid`.
         """
-        return PyramidIO().write_pyramid(
+        PyramidIO().write_pyramid(
             pyramid=pyramid,
             path=path,
             layers=layers,
@@ -2310,6 +2461,7 @@ class IO:
             backend=backend,
             **kwargs,
         )
+        return str(path)
 
     def write_labels(self,
                      label_pyramid: Pyramid,
@@ -2318,11 +2470,13 @@ class IO:
                      labels_group_path: Optional[Union[str, Path]] = None,
                      label_name: Optional[str] = None,
                      overwrite: bool = False,
-                     **kwargs) -> None:
+                     **kwargs) -> str:
         """Write a label pyramid as an OME-Zarr label image (image-label metadata
-        + optional registration in a parent `labels` group). See
+        + optional registration in a parent `labels` group) and return `path`. The usual
+        route is ``pyr = pyr.add_image_label(label_pyr, name)`` then ``pyr.write(path)``, which writes
+        the label under its image. See
         :meth:`PyramidIO.write_labels`."""
-        return PyramidIO().write_labels(
+        PyramidIO().write_labels(
             label_pyramid=label_pyramid,
             path=path,
             image_label=image_label,
@@ -2331,3 +2485,87 @@ class IO:
             overwrite=overwrite,
             **kwargs,
         )
+        return str(path)
+
+    def write(self, obj, path, **options):
+        """Write a `Pyramid` or a `PyramidCollection` to `path`, as dyna-zarr's ``io.write``
+        writes an array: a pyramid with :meth:`write_pyramid` (returns `path`), a
+        collection with ``PyramidCollection.write`` (the structure follows the collection,
+        ``version`` picks the format: 0.4 / 0.5 / 0.6 or ``"rfc8"``). Returns where to read
+        it back, so ``io.read(io.write(obj, path))`` is what was written.
+        ``pyr.write`` and ``coll.write`` are the shortcuts."""
+        from ome_zarr_pyramid.core.collection import PyramidCollection
+        if isinstance(obj, PyramidCollection):
+            return obj._write(path, **options)
+        if isinstance(obj, Pyramid):
+            return self.write_pyramid(obj, path, **options)
+        raise TypeError(f"io.write: a Pyramid or a PyramidCollection, not {type(obj).__name__}")
+
+    def read(self, path, *, storage_options: Optional[dict] = None, include_labels: bool = True,
+             apply_scene: Optional[bool] = False, add_missing_translation: bool = False):
+        """What is stored at `path`, as :meth:`write` takes it back: a `Pyramid` for an
+        image, a `PyramidCollection` for a plate, a well, a bioformats2raw layout or an RFC 8
+        collection (also when it holds one image). `include_labels` and `apply_scene` are
+        :meth:`read_pyramid`'s, for an image; `add_missing_translation` is
+        :meth:`read_collection`'s, for a collection. :meth:`read_pyramid` and
+        :meth:`read_collection` give one type whatever the store holds."""
+        if isinstance(path, zarr.Group):
+            return Pyramid().from_ngff(path)
+        if isinstance(path, dict):
+            raise TypeError("io.read reads one store; this looks like what "
+                            "coll.write(directory, stem) returns, {key: path} of one store "
+                            "per image: read each path")
+        try:
+            coll = self.read_collection(path, storage_options=storage_options,
+                                        add_missing_translation=add_missing_translation)
+        except zarr.errors.GroupNotFoundError as exc:
+            raise FileNotFoundError(f"io.read: {path} is no OME-Zarr store (no zarr group at "
+                                    f"its root); a directory of stores is read one store at "
+                                    f"a time") from exc
+        if list(coll) != [()]:
+            return coll
+        return self.read_pyramid(path, include_labels=include_labels,
+                                 storage_options=storage_options, apply_scene=apply_scene)
+
+    # -- collections (the class methods of PyramidCollection are shortcuts to these) ----
+    def read_collection(self, path, *, storage_options: Optional[dict] = None,
+                        add_missing_translation: bool = False):
+        """The `PyramidCollection` stored at `path`: an NGFF 0.4 / 0.5 / 0.6 plate (keyed
+        ``plate``, ``acquisition``, ``well``, ``field``, as micro-reader keys plate
+        images), a well on its own, a bioformats2raw layout (``series``), an RFC 8
+        collection (also a standalone ``.json`` document), or a single image (the one key
+        ``()``). The plate and well metadata are read now; each image when it is first
+        used. `storage_options` as for :meth:`read_pyramid`. A store declaring an NGFF
+        version ozp does not read raises ``UnsupportedNGFFVersion``; an image placed in a
+        coordinate system without a level-0 translation raises ``InvariantError`` when it
+        opens, unless ``add_missing_translation=True`` places it at the system's origin.
+        ``PyramidCollection.from_zarr`` is the shortcut."""
+        from ome_zarr_pyramid.core.collection import PyramidCollection
+        return PyramidCollection._from_zarr(path, storage_options=storage_options,
+                                            add_missing_translation=add_missing_translation)
+
+    def write_collection(self, collection, path, **options) -> str:
+        """Write `collection` as NGFF RFC 8: each image as an RFC 8 multiscale under
+        `path`, then the collection document. Options: ``document`` (a standalone
+        ``.json``), ``overwrite``, ``storage_options``, ``writer`` and the options of
+        :meth:`write_pyramid`. Returns `path` (the standalone `document`, when
+        given): ``io.read`` reads it back.
+        ``PyramidCollection.write_collection`` is the shortcut."""
+        return collection._write_collection(path, **options)
+
+    def write_plate(self, collection, path, **options) -> str:
+        """Write a plate of `collection` as an NGFF plate (``version`` 0.4 / 0.5 / 0.6, or
+        ``"rfc8"``): each image, then the plate and well metadata. Options: ``plate`` (its
+        number, default 0), ``version``, ``overwrite``, ``storage_options``, ``writer``,
+        ``document``, ``validate`` and the options of :meth:`write_pyramid`. Returns
+        `path` (`document`, when given). ``PyramidCollection.write_plate`` is the shortcut."""
+        return collection._write_plate(path, **options)
+
+    def write_series(self, collection, path, **options) -> str:
+        """Write every image of `collection` as one series of a bioformats2raw layout,
+        then the root metadata and the OME-XML. Options: ``version``, ``overwrite``,
+        ``ome_xml``, ``storage_options``, ``writer``, ``document``, ``validate`` and the
+        options of :meth:`write_pyramid`. Returns `path` (the standalone `document`, when
+        given): ``io.read`` reads it back.
+        ``PyramidCollection.write_series`` is the shortcut."""
+        return collection._write_series(path, **options)

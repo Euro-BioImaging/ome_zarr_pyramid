@@ -122,10 +122,17 @@ def test_described_channels_without_a_name_or_colour():
     meta = SimpleNamespace(pixel_sizes={}, position={}, channels=[named, unknown, unknown])
     pyr = Pyramid.from_image(FakeImage(np.zeros((3, 8, 8), "u2"), "cyx", meta))
     chans = pyr.meta.metadata["omero"]["channels"]
-    # by position, counted from 0; no colour of their own: white (OME's default)
+    # by position, counted from 0; no colour of their own: ozp's distinct colours (C13)
     assert [(c["label"], c["color"]) for c in chans] == [
-        ("DAPI", "FFFFFF"), ("Channel 1", "FFFFFF"), ("Channel 2", "FFFFFF")]
-    # one channel without a c axis, as a single-channel file
+        ("DAPI", "FF0000"), ("Channel 1", "00FF00"), ("Channel 2", "0000FF")]
+    # a colour the file gives is kept, and not given to another channel
+    green = SimpleNamespace(name="GFP", color="00FF00", emission_wavelength=None,
+                            excitation_wavelength=None)
+    meta.channels = [unknown, green, unknown]
+    pyr = Pyramid.from_image(FakeImage(np.zeros((3, 8, 8), "u2"), "cyx", meta))
+    assert [c["color"] for c in pyr.meta.metadata["omero"]["channels"]] == [
+        "FF0000", "00FF00", "0000FF"]
+    # one channel without a c axis, as a single-channel file: white (shown as grey)
     meta.channels = [unknown]
     pyr = Pyramid.from_image(FakeImage(np.zeros((8, 8), "u2"), "yx", meta))
     assert [(c["label"], c["color"]) for c in pyr.meta.metadata["omero"]["channels"]] == [

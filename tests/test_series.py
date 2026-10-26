@@ -9,6 +9,7 @@ import zarr
 
 from ome_zarr_pyramid import IO, Pyramid, PyramidCollection
 from ome_zarr_pyramid.core.nodes import InvalidCollection, MultiscaleNode
+from conftest import written_images
 
 XML = ('<?xml version="1.0" encoding="UTF-8"?>\n<OME xmlns="http://www.openmicroscopy.org/'
        'Schemas/OME/2016-06"><Image ID="Image:0" Name="first"/><Image ID="Image:1" '
@@ -70,7 +71,7 @@ def test_a_layout_round_trips(tmp_path, version):
     np.testing.assert_array_equal(np.asarray(coll[{"series": 1}].layers["0"]), data[1])
     assert _opened(coll) == ["1"]
     out = str(tmp_path / "copy.ome.zarr")
-    assert sorted(coll.write_series(out)) == ["0", "1"]
+    assert written_images(coll.write_series(out), out) == ["0", "1"]
     for group in ("", "OME"):
         a = zarr.open_group(os.path.join(src, group), mode="r").attrs.asdict()
         b = zarr.open_group(os.path.join(out, group), mode="r").attrs.asdict()

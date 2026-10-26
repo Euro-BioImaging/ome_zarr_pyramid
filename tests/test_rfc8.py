@@ -16,6 +16,7 @@ from ome_zarr_pyramid.core.nodes import CollectionNode, LabelsAttribute, Multisc
 from ome_zarr_pyramid.core.rfc8 import RFC8_VERSION, read_rfc8
 
 from test_collection_zarr import _opened, _plate
+from conftest import written_images
 
 AXES = [{"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
@@ -182,7 +183,10 @@ def test_a_plate_written_as_rfc8_reads_back_the_same(tmp_path, standalone):
     if document:
         os.makedirs(os.path.dirname(document))
     written = coll.write_plate(out, version="rfc8", document=document)
-    assert sorted(written) == ["A/2/0", "A/2/0/labels/nuclei", "A/2/1", "B/1/0", "B/1/1"]
+    assert written_images(written if not document else out, out) == [
+        "A/2/0", "A/2/1", "B/1/0", "B/1/1"]
+    assert written == (document or out)                     # where io.read reads it back
+    assert os.path.isdir(os.path.join(out, "A", "2", "0", "labels", "nuclei"))
     doc = json.load(open(document)) if document else zarr.open_group(out, mode="r").attrs.asdict()
     assert doc["ome"]["version"] == RFC8_VERSION and doc["ome"]["type"] == "collection"
     image = zarr.open_group(os.path.join(out, "A", "2", "0"), mode="r").attrs.asdict()
@@ -234,11 +238,39 @@ def test_write_collection_refuses(tmp_path):
     coll, _ = _labelled_plate(tmp_path)
     with pytest.raises(ValueError, match="writes version='rfc8'"):
         coll.write_collection(str(tmp_path / "a.zarr"), version="0.5")
-    with pytest.raises(ValueError, match="selection of its tree"):
-        coll.select(acquisition=0).write_collection(str(tmp_path / "b.zarr"))
     coll.write_collection(str(tmp_path / "c.zarr"))
     with pytest.raises(FileExistsError, match="overwrite=True"):
         coll.write_collection(str(tmp_path / "c.zarr"))
+
+
+def test_a_selection_is_written_with_its_part_of_the_tree(tmp_path):
+    coll, data = _labelled_plate(tmp_path)
+    well = coll.plates[0].well_index("A2")
+    part = coll.select(plate=0, well=well)
+    out = part.write(str(tmp_path / "part.zarr"), version="rfc8")
+    back = PyramidCollection.from_zarr(out)
+    assert sorted(back) == sorted(part)
+    # the plate keeps its wells (B1 empty), so every key reads back as it was
+    assert [w.name for w in back.plates[0].wells] == ["A2", "B1"]
+    assert [len(w.fields) for w in back.plates[0].wells] == [len(coll.plates[0].wells[0].fields), 0]
+    assert back.plates[0].rows == coll.plates[0].rows                # rows / columns as read
+    for key in part:
+        np.testing.assert_array_equal(np.asarray(back[key].layers["0"]),
+                                      np.asarray(coll[key].layers["0"]))
+    assert os.path.isdir(os.path.join(out, "A", "2", "0", "labels", "nuclei"))
+    assert len(coll.plates[0].wells) == 2                             # the collection's tree is untouched
+    # by acquisition: each well keeps the images of that acquisition
+    first = coll.select(acquisition=0)
+    again = PyramidCollection.from_zarr(first.write(str(tmp_path / "acq.zarr"), version="rfc8"))
+    assert sorted(again) == sorted(first)
+
+
+def test_a_label_whose_image_is_left_out_is_left_out_too(tmp_path):
+    coll, _ = _labelled_plate(tmp_path)
+    other = coll.select(well=coll.plates[0].well_index("B1"))
+    out = other.write(str(tmp_path / "b1.zarr"), version="rfc8")
+    assert not os.path.exists(os.path.join(out, "A", "2"))
+    assert sorted(PyramidCollection.from_zarr(out)) == sorted(other)
 
 
 EXAMPLES = os.environ.get("RFC8_EXAMPLES")

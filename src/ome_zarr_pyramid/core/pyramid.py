@@ -9,7 +9,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import asyncio
+import contextvars
 import copy
+import functools
+import inspect
 import warnings
 import operator
 from collections.abc import Mapping
@@ -20,7 +23,7 @@ import numpy as np
 import zarr
 
 from ome_zarr_pyramid.core.nodes import READ_VERSIONS, check_read_version, nests_in_ome
-from ome_zarr_pyramid.core.validation import VERSIONS as NGFF_VERSIONS
+from ome_zarr_pyramid.core.validation import FILL_DERIVED, VERSIONS as NGFF_VERSIONS
 from ome_zarr_pyramid.core.validation import check_multiscales, raise_for_metadata
 #: where ngff06 keeps a 0.6 multiscale's foreign parts (core.ngff06.STASH)
 STASH_KEY = "eubi:ngff06"
@@ -208,6 +211,13 @@ def calculate_n_layers(shape: Tuple[int, ...],
     return max(1, n_layers)
 
 
+def _io():
+    """The IO a shortcut delegates to (imported here: io.py imports this module at load
+    time). IO holds no state, so a fresh one is the shared ``ome_zarr_pyramid.io``."""
+    from ome_zarr_pyramid.core.io import IO
+    return IO()
+
+
 #: downscale methods that keep one pixel per window (a stride): a level's first pixel
 #: centre is level 0's, so its translation is level 0's. Every other method reduces a
 #: window, whose centre lies (F - 1) / 2 level-0 pixels in.
@@ -284,6 +294,103 @@ def normalize_color(value: Union[str, Tuple, List]) -> str:
         f"colour: unrecognised {value!r}; use a standard name (e.g. 'red'), a "
         f"6-digit hex ('FF0000' or '#FF0000'), 3-digit shorthand ('F00') or an (r,g,b) triple"
     )
+
+
+class LabelMismatchError(ValueError):
+    """A geometry operation whose attached label image cannot follow its image (another
+    level-0 size along an indexed axis, other levels): nothing is done (decision C-2), the
+    error names the label."""
+
+
+#: set while a geometry operation applies the label rule, so operations it calls inside
+#: (select_levels resolves a plan with downscale) do not apply it a second time
+_IN_LABEL_RULE = contextvars.ContextVar("ozp_in_label_rule", default=False)
+_AXIS_ALIASES_PYR = {"channels": "c", "channel": "c", "time": "t"}
+
+
+def _labels_follow(method):
+    """Decision C-2: the labels attached to a pyramid follow its geometry operations (isel,
+    squeeze, select_levels, downscale), on the axes they have, never the channel axis; a
+    label that cannot follow raises :class:`LabelMismatchError`. Without this they were
+    dropped. Applied at the outermost call only."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        labels = dict(getattr(self, "_labels", None) or {})
+        if _IN_LABEL_RULE.get() or not labels:
+            return method(self, *args, **kwargs)
+        token = _IN_LABEL_RULE.set(True)
+        try:
+            new = method(self, *args, **kwargs)
+            if new is self:
+                return new
+            new._labels = {name: _label_after(self, new, label, name, method, args, kwargs)
+                           for name, label in labels.items()}
+            return new
+        finally:
+            _IN_LABEL_RULE.reset(token)
+    return wrapper
+
+
+def _level_sizes(pyr) -> List[Dict[str, int]]:
+    """``{axis: size}`` of every level. A deferred downscale plan is already expanded
+    into visible lazy levels (`_materialize_plan`), so the levels are what it writes."""
+    axes = pyr.meta.axis_order
+    return [dict(zip(axes, pyr.layers[p].shape)) for p in pyr.meta.resolution_paths]
+
+
+def _label_after(image, result, label, name, method, args, kwargs):
+    """`label` after `method` (a geometry operation) took `image` to `result`."""
+    op = method.__name__
+
+    def refuse(why):
+        raise LabelMismatchError(
+            f"{op}: the label image {name!r} cannot follow its image ({why}), so nothing is "
+            f"done (decision C-2). Drop or fix the label first.")
+
+    image_axes, label_axes = image.meta.axis_order, label.meta.axis_order
+    image0 = dict(zip(image_axes, image.layers[image.meta.resolution_paths[0]].shape))
+    label0 = dict(zip(label_axes, label.layers[label.meta.resolution_paths[0]].shape))
+    shared = [a for a in label_axes if a in image_axes and a != "c"]
+    if op == "isel":
+        indexers = {_AXIS_ALIASES_PYR.get(a, a): v for a, v in kwargs.items()}
+        mine = {a: v for a, v in indexers.items() if a in label_axes and a != "c"}
+        for a in mine:
+            if label0[a] != image0.get(a):
+                refuse(f"{label0[a]} along {a}, the image {image0.get(a)}")
+        return label.isel(**mine) if mine else label
+    if op == "squeeze":
+        dropped = [a for a in image_axes if a not in result.meta.axis_order]
+        mine = [a for a in dropped if a in label_axes and a != "c"]
+        for a in mine:
+            if label0[a] != 1:
+                refuse(f"{label0[a]} along {a}, which the image drops (size 1)")
+        return label.squeeze("".join(mine)) if mine else label
+    if op == "select_levels":
+        image_levels, label_levels = _level_sizes(image), _level_sizes(label)
+        chosen = Pyramid._resolve_level_indices(args, len(image_levels))
+        for i in chosen:
+            if i >= len(label_levels):
+                refuse(f"{len(label_levels)} level(s), no level {i}")
+            if any(label_levels[i][a] != image_levels[i].get(a) for a in shared):
+                refuse(f"level {i} is {label_levels[i]}, the image's {image_levels[i]}")
+        return label.select_levels(*chosen)
+    if op == "downscale":
+        bound = inspect.signature(method).bind(image, *args, **kwargs).arguments
+        bound.pop("self", None)
+        options = {**bound.pop("kwargs", {}), **bound}
+        options["downscale_method"] = "simple"         # labels: nearest, never averaged
+        for a in shared:
+            if label0[a] != image0.get(a):
+                refuse(f"{label0[a]} along {a}, the image {image0.get(a)}")
+        followed = label.downscale(**options)
+        image_levels, label_levels = _level_sizes(result), _level_sizes(followed)
+        if len(label_levels) != len(image_levels) or any(
+                label_levels[i][a] != image_levels[i].get(a)
+                for i in range(len(image_levels)) for a in shared):
+            refuse(f"its levels would be {[tuple(l.values()) for l in label_levels]}, the "
+                   f"image's {[tuple(l.values()) for l in image_levels]}")
+        return followed
+    return label
 
 
 #: the first channels' colours: red, green, blue, magenta, cyan, yellow, white
@@ -807,19 +914,25 @@ class NGFFMetadataHandler:
         if self.metadata is None:
             raise RuntimeError("No metadata to save")
 
-        meta_dict = cast_to_dict(self.metadata)
-        version = str(meta_dict.get('version', ''))
-        for ms in meta_dict.get('multiscales') or []:
+        # what is written: a copy, so the fills below reach the store, not the pyramid
+        # (a later write with fill_derived=False writes the pyramid as it is)
+        metadata_dict = copy.deepcopy(cast_to_dict(make_json_safe(self.metadata)))
+        version = str(metadata_dict.get('version', ''))
+        for ms in metadata_dict.get('multiscales') or []:
             # NGFF: a multiscale SHOULD name its downscaling `type` (the strict schemas
             # require it): the method ozp made the levels with, the one read with the
             # image, else "unknown" (levels given as they are, a single level)
+            # ("unknown", and the empty `metadata` below, only where the write fills what
+            # it can derive: write_pyramid(fill_derived=False) leaves them out)
+            fill = FILL_DERIVED.get()
             if isinstance(ms, dict) and not ms.get('type'):
-                ms['type'] = (ms.get(STASH_KEY) or {}).get('type') or 'unknown'
+                kind = (ms.get(STASH_KEY) or {}).get('type') or ('unknown' if fill else None)
+                if kind:
+                    ms['type'] = kind
             # SHOULD too (strict_image requires it, decision 9.12-S): an empty `metadata`
             # where the image has none (0.6's writer adds the same)
-            if isinstance(ms, dict) and 'metadata' not in ms:
+            if fill and isinstance(ms, dict) and 'metadata' not in ms:
                 ms['metadata'] = {}
-        metadata_dict = cast_to_dict(make_json_safe(self.metadata))
         metadata_dict = self._multiscales_for(version, metadata_dict)
         # the semantic check (plan 5.23), before anything of this group is written
         if version in NGFF_VERSIONS:
@@ -1285,6 +1398,70 @@ class Pyramid:
         self._compressor = CompressorConfig.from_array(self.layers[base_path])
         return self
 
+    # -- shortcuts to IO, the one read/write hub (PyramidCollection has the same names) --
+    @classmethod
+    def from_zarr(cls, path: Union[str, Path], **options) -> 'Pyramid':
+        """The pyramid stored at `path`; a shortcut for ``io.read_pyramid``,
+        which takes the `options` (``include_labels``, ``storage_options``,
+        ``apply_scene``). ``Pyramid().from_ngff(group)`` opens a zarr group directly."""
+        return _io().read_pyramid(path, **options)
+
+    def write(self, path: Union[str, Path], **options) -> str:
+        """Write the pyramid to `path` (a local path or an object-store URL) and return
+        `path`; a shortcut for ``io.write_pyramid``, which takes the
+        `options` (``overwrite``, ``max_threads``, ``compressor``, ``chunk_shape``,
+        ``validate``, ...)."""
+        _io().write_pyramid(self, path, **options)
+        return str(path)
+
+    def update_metadata(self, *, path: Optional[Union[str, Path]] = None,
+                        **options) -> 'Pyramid':
+        """Edit the metadata of the store this pyramid was read from, in place (pixels are
+        never rewritten), and return the updated pyramid; a shortcut for
+        ``io.update_metadata``, which takes the `options` (``scales``,
+        ``units``, ``channels``, ``windows``, ``ome_xml``, ``storage_options``). `path`
+        names the store when the pyramid does not know it (built in memory, or read from
+        an object store)."""
+        if path is None and self.gr is not None:
+            from ome_zarr_pyramid.core.io import PyramidIO
+            path = PyramidIO._get_store_path(self.gr)
+        if path is None:
+            raise ValueError("update_metadata: this pyramid does not know the store it was "
+                             "read from (built in memory, or read from an object store); "
+                             "pass path=, or call IO().update_metadata(path, ...)")
+        return _io().update_metadata(path, **options)
+
+    def as_collection(self, name: Optional[str] = None):
+        """A `PyramidCollection` holding this pyramid alone, under the key ``()`` (as
+        ``PyramidCollection.from_zarr`` keys a single image); it keeps the coordinate
+        system the pyramid names. ``coll.only()`` gives the pyramid back."""
+        from ome_zarr_pyramid.core.collection import PyramidCollection
+        tag = name if name is not None else (self.meta.tag if self.meta is not None else None)
+        return PyramidCollection({(): self}, name=tag)
+
+    @property
+    def table(self):
+        """The pyramid as a one-row table, with the image columns of
+        ``PyramidCollection.table`` (axes, shape, dtype, levels, chunks, codec, scale,
+        units, channels, ...). Metadata only."""
+        from ome_zarr_pyramid.core.query import CollectionTable, row_from_pyramid
+        return CollectionTable([()], [row_from_pyramid(self)])
+
+    @property
+    def coordinate_systems(self) -> Dict[str, Any]:
+        """The coordinate system the pyramid is placed in, as ``{id: system}`` (the shape
+        of ``PyramidCollection.coordinate_systems``), or ``{}`` when it names none. Its
+        position is its level-0 translation."""
+        from ome_zarr_pyramid.core.spatial import pyramid_system
+        sid, cs = pyramid_system(self)
+        return {} if sid is None else {sid: cs}
+
+    @property
+    def coordinate_transformations(self) -> List[Any]:
+        """The edges other than its position: always ``[]`` for a lone pyramid (affine
+        edges and registrations live in a collection's graph, which keeps them)."""
+        return []
+
     @property
     def compressor(self) -> Optional[CompressorConfig]:
         """Compressor configuration associated with this pyramid's arrays.
@@ -1532,6 +1709,18 @@ class Pyramid:
         return self.meta.nlayers
 
     @property
+    def nlevels(self) -> int:
+        """The number of resolution levels: ``nlayers``, by the name the docs, the
+        collection table and dyna-zarr use (decision C-16)."""
+        return self.nlayers
+
+    @property
+    def levels(self) -> Dict[str, Union[da.Array, zarr.Array]]:
+        """The resolution levels, ``{path: array}``: ``layers``, by the name the docs and
+        dyna-zarr use (decision C-16)."""
+        return self.layers
+
+    @property
     def layers(self) -> Dict[str, Union[da.Array, zarr.Array]]:
         """Get all array layers across all resolutions."""
         if self.gr is None:
@@ -1539,7 +1728,17 @@ class Pyramid:
         # Return zarr arrays from persistent storage
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
-        return {path: self.gr[path] for path in self.meta.resolution_paths}  # type: ignore
+        # each level's zarr array is opened once per group and set of level paths: opening
+        # reads its metadata from the store, and an operation reaches `layers` many times
+        # (an isel of a 3-level image opened 24 arrays). A new group (from_ngff) or other
+        # level paths open them again; a dict copy, so callers cannot change the cache. A
+        # store overwritten after it was read is read again: io.read_pyramid(path).
+        paths = tuple(self.meta.resolution_paths)
+        cached = getattr(self, "_layer_cache", None)
+        if cached is None or cached[0] is not self.gr or cached[1] != paths:
+            cached = (self.gr, paths, {path: self.gr[path] for path in paths})  # type: ignore
+            self._layer_cache = cached
+        return dict(cached[2])
 
     @property
     def base_array(self) -> Union[da.Array, zarr.Array]:
@@ -1630,8 +1829,8 @@ class Pyramid:
         callers offering ``backend="auto"`` can probe it per call rather than guarding a
         heavy property with try/except.
 
-        The write engine uses the same rule: ``write_pyramid(backend='auto')`` streams
-        through dyna whenever no level is dask.
+        The writer uses the same rule: ``write_pyramid`` streams through dyna whenever no
+        level is dask.
         """
         if self.meta is None:
             return False
@@ -1872,6 +2071,7 @@ class Pyramid:
             )
         return plan
 
+    @_labels_follow
     def downscale(self,
                   n_layers: Optional[int] = None,
                   min_dimension_size: int = 64,
@@ -2101,7 +2301,9 @@ class Pyramid:
                 own = get_array_chunks(self.layers[self.meta.resolution_paths[0]])
             except Exception:
                 own = None
-            sc = tuple(int(c) for c in own) if own is not None else None
+            # an in-memory TensorStore view reports (None, ...): no grid to record
+            sc = tuple(int(c) for c in own) \
+                if own is not None and all(c is not None for c in own) else None
         if sc is not None:
             full._storage_chunks = sc
         return full
@@ -2207,6 +2409,8 @@ class Pyramid:
             new_pyr.meta._pending_changes = True
         new_pyr._storage_chunks = tuple(base_chunk) if base_chunk is not None else None
         new_pyr._level_chunks = level_chunks
+        # the same pixel grid: attached labels still match and stay (decision C-2)
+        new_pyr._labels = dict(getattr(self, '_labels', {}) or {})
         return new_pyr
 
     def _read_ct(self, path):
@@ -2224,6 +2428,7 @@ class Pyramid:
             scale = [1.0] * len(self.axes)
         return scale, trans
 
+    @_labels_follow
     def squeeze(self, axes: Optional[str] = None) -> 'Pyramid':
         """Drop size-1 axes on every level (or only those of `axes`, e.g. ``"tz"``),
         keeping the metadata of the axes that stay: scales, translations, channels.
@@ -2282,6 +2487,7 @@ class Pyramid:
         self.meta.update_unitlist([current[ax] for ax in order])
         return self
 
+    @_labels_follow
     def isel(self, **indexers) -> 'Pyramid':
         """Integer/positional selection along named axes (xarray-style), across
         ALL levels, returning a new sub-`Pyramid`.
@@ -2448,9 +2654,11 @@ class Pyramid:
     def _build_indexed(self, arrays, out_axes, scales, translations, channel_indices):
         src_units = dict(zip(self.meta.axis_order, self.meta.unit_list))  # type: ignore
         units = [src_units[a] for a in out_axes]
-        units_clean = [u for u in units if u is not None] or None
+        # one unit per axis, None for a unitless one (t, z of some files): dropping the
+        # Nones left fewer units than axes and every isel of such an image raised
+        units_given = units if any(u is not None for u in units) else None
         new = Pyramid().from_arrays(
-            arrays, axis_order=out_axes, unit_list=units_clean,  # type: ignore
+            arrays, axis_order=out_axes, unit_list=units_given,  # type: ignore
             scales=scales, version=self.meta.version, name=self.meta.tag,  # type: ignore
         )
         if self.meta.metadata and new.meta and new.meta.metadata:  # type: ignore
@@ -2497,6 +2705,7 @@ class Pyramid:
             indexers[axstr[i]] = k
         return self.isel(**indexers)
 
+    @_labels_follow
     def select_levels(self, *levels) -> 'Pyramid':
         """Return a new pyramid holding an arbitrary subset of resolution LEVELS
         (not necessarily contiguous). The FINEST selected level becomes level 0 of
@@ -3195,6 +3404,9 @@ class Pyramid:
         sc = getattr(self, '_storage_chunks', None)
         if sc is not None:
             new._storage_chunks = sc
+        # the pixel grid is the same: attached labels still match and stay (decision C-2;
+        # an elementwise op on the image is no op on its labels)
+        new._labels = dict(getattr(self, '_labels', {}) or {})
         return new
 
     def _binary_op(self, other, func, reflected: bool = False) -> 'Pyramid':

@@ -468,7 +468,9 @@ def plate_to_attrs(node: CollectionNode, version: Optional[str] = None
                                            if nests_in_ome(version) else
                                            wells[path]["well"]["images"]))
     plate["wells"] = entries
-    _fill_maximumfieldcount(plate, wells, version)
+    from ome_zarr_pyramid.core.validation import FILL_DERIVED
+    if FILL_DERIVED.get():                   # write_plate(fill_derived=False): as read
+        _fill_maximumfieldcount(plate, wells, version)
 
     read = node.ngff_fields.get("plate")
     renamed = node.name != node.ngff_fields.get("node_name")
@@ -647,5 +649,7 @@ def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
         else:
             write(pyr, target, **write_kwargs)
         written[f"{in_plate}/{image_path}"] = target
-    write_plate_metadata(node, path, version=version, storage_options=storage_options)
+    from ome_zarr_pyramid.core.validation import filling
+    with filling(write_kwargs.get("fill_derived")):        # the plate's own SHOULD fields too
+        write_plate_metadata(node, path, version=version, storage_options=storage_options)
     return written
