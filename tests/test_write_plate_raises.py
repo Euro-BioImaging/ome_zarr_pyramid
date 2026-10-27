@@ -16,6 +16,7 @@ from ome_zarr_pyramid.core.nodes import (
     CollectionNode, MultiscaleNode, PlateAttribute, PlateItem, Ref, WellAttribute)
 
 from test_plates import PLATE, FakeImage
+from conftest import written_images
 
 CZI = os.path.join(os.environ.get("MICROSCOPY_DATA", os.path.expanduser("~/Desktop/data/microscopy")),
                    "formats", "czi")
@@ -60,7 +61,7 @@ def test_a_field_with_two_tiles_raises_before_anything_is_written(tmp_path, vers
 def test_rfc8_keeps_every_tile(tmp_path):
     coll = PyramidCollection.from_file(_file(tiles=3))
     written = coll.write_plate(str(tmp_path / "p.zarr"), version="rfc8")
-    assert len(written) == 4                       # three tiles in B3, one image in A1
+    assert len(written_images(written, tmp_path / "p.zarr")) == 4   # three tiles in B3, one image in A1
 
 
 def test_one_image_per_field_writes_without_a_warning(tmp_path):
@@ -68,7 +69,7 @@ def test_one_image_per_field_writes_without_a_warning(tmp_path):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         written = coll.write_plate(str(tmp_path / "p.zarr"))
-    assert sorted(written) == ["A/1/0", "B/3/0"]
+    assert written_images(written, tmp_path / "p.zarr") == ["A/1/0", "B/3/0"]
     assert not [w for w in caught if issubclass(w.category, UserWarning)]
 
 
@@ -80,7 +81,7 @@ def test_images_outside_the_plate_are_left_out_without_a_warning(tmp_path):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         written = coll.write_plate(str(tmp_path / "p.zarr"))
-    assert sorted(written) == ["A/1/0", "B/3/0"]
+    assert written_images(written, tmp_path / "p.zarr") == ["A/1/0", "B/3/0"]
     assert not [w for w in caught if issubclass(w.category, UserWarning)]
 
 
@@ -145,7 +146,7 @@ def test_a_tiled_czi_plate_raises_and_writes_as_mosaic(tmp_path):
         assert _ways_out_in_order(str(err.value)) and "holds 45 images" in str(err.value)
     coll = PyramidCollection.from_file(micro_reader.open(TILED, tiles=mosaic, plates=True))
     out = str(tmp_path / "mosaic.zarr")
-    assert sorted(coll.write_plate(out, version="0.5")) == ["B/2/0", "B/4/0"]
+    assert written_images(coll.write_plate(out, version="0.5"), out) == ["B/2/0", "B/4/0"]
     back = PyramidCollection.from_zarr(out)
     assert sum(len(f.keys) for w in back.plates[0].wells for f in w.fields) == 2
 
@@ -158,6 +159,6 @@ def test_a_czi_plate_with_one_image_per_field_writes_without_a_warning(tmp_path)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         written = coll.write_plate(out)
-    assert sorted(written) == ["A/1/0", "A/2/0"]
+    assert written_images(written, out) == ["A/1/0", "A/2/0"]
     assert os.path.isdir(os.path.join(out, "A", "1", "0")) and os.path.isdir(os.path.join(out, "A", "2", "0"))
     assert not [w for w in caught if issubclass(w.category, UserWarning)]

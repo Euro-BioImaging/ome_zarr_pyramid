@@ -27,10 +27,14 @@ import numpy as np
 SIZE_AXES = ("t", "c", "z", "y", "x")
 #: the image columns, in display order (keys come first, plate columns last)
 IMAGE_COLUMNS = ("name", "axes", "shape") + tuple(f"size_{a}" for a in SIZE_AXES) + (
-    "dtype", "levels", "level_shapes", "chunks", "shards", "codec", "version", "scale",
+    "dtype", "nlevels", "level_shapes", "chunks", "shards", "codec", "version", "scale",
     "units", "translation") + tuple(f"{what}_{a}" for what in ("scale", "unit", "translation")
                                     for a in SIZE_AXES) + ("channels", "nbytes", "path")
 PLATE_COLUMNS = ("plate_name", "well_name", "row_name", "column_name", "acquisition_name")
+#: older column names that still read (decision C-16): ``levels`` is ``nlevels`` (the number
+#: of resolution levels; ``pyr.levels`` is the levels themselves). Each row holds both;
+#: listings show the new name only.
+COLUMN_ALIASES = {"levels": "nlevels"}
 
 
 # -- rows -----------------------------------------------------------------------------
@@ -96,11 +100,13 @@ def row_from_pyramid(pyr, path: Optional[str] = None) -> Dict[str, Any]:
     except Exception:                                  # noqa: BLE001
         codec = None
     shards = getattr(base, "shards", None)
+    if shards is not None and len(shards) != len(base.shape):
+        shards = None              # a stale source tuple (dyna-zarr 0.1.0 after an axis drop)
     channels = tuple(ch.get("label") for ch in
                      ((meta.metadata or {}).get("omero") or {}).get("channels") or [])
     row = {
         "name": meta.tag, "axes": pyr.axes, "shape": _tuple(base.shape),
-        "dtype": _dtype(base.dtype), "levels": len(paths),
+        "dtype": _dtype(base.dtype), "nlevels": len(paths), "levels": len(paths),
         "level_shapes": tuple(_tuple(pyr.layers[p].shape) for p in paths),
         "chunks": _tuple(chunks), "shards": _tuple(shards) if shards else None,
         "codec": codec, "version": str(meta.version),
@@ -172,7 +178,7 @@ def row_from_json(attrs: Dict[str, Any], headers: Sequence[Dict[str, Any]],
     channels = tuple(ch.get("label") for ch in (ome.get("omero") or {}).get("channels") or [])
     row = {
         "name": ms.get("name"), "axes": axes, "shape": base.get("shape"),
-        "dtype": base.get("dtype"), "levels": len(datasets),
+        "dtype": base.get("dtype"), "nlevels": len(datasets), "levels": len(datasets),
         "level_shapes": tuple(h.get("shape") for h in headers),
         "chunks": base.get("chunks"), "shards": base.get("shards"), "codec": base.get("codec"),
         "version": str(version) if version is not None else None,
@@ -310,6 +316,7 @@ class CollectionTable:
         return iter(self.rows)
 
     def __getitem__(self, column: str) -> list:
+        column = COLUMN_ALIASES.get(column, column)
         if column not in self.columns:
             raise KeyError(f"no column {column!r}; the columns are {list(self.columns)}")
         return [r.get(column) for r in self.rows]
@@ -321,7 +328,7 @@ class CollectionTable:
                             columns=list(self.columns))
 
     def __repr__(self) -> str:
-        shown = list(self.key_columns) + ["shape", "dtype", "levels", "codec"]
+        shown = list(self.key_columns) + ["shape", "dtype", "nlevels", "codec"]
         rows = [[str(r.get(c)) for c in shown] for r in self.rows[:12]]
         widths = [max([len(c)] + [len(x[i]) for x in rows]) for i, c in enumerate(shown)]
         line = lambda cells: "  ".join(s.ljust(w) for s, w in zip(cells, widths))  # noqa: E731

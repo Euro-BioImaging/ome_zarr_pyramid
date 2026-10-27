@@ -52,6 +52,8 @@ RFC 8 groups (version ``"0.x"``) have no published schema yet: the walk skips th
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import inspect
 import json
@@ -66,6 +68,27 @@ SCHEMAS = Path(__file__).resolve().parent.parent / "schemas"
 VERSIONS = ("0.4", "0.5", "0.6")
 EXTRA = "pip install 'ome_zarr_pyramid[validate]'"
 RFC8_VERSION = "0.x"
+
+
+#: whether a write fills the SHOULD fields ozp can derive exactly (decision 9.12-S): an
+#: acquisition's ``maximumfieldcount``, a multiscale's empty ``metadata`` and its ``type``
+#: "unknown" when nothing says the method. ``write_pyramid(fill_derived=False)`` (and every
+#: writer) writes them only when the source has them; a write sets it for its own duration.
+FILL_DERIVED = contextvars.ContextVar("ozp_fill_derived", default=True)
+
+
+@contextlib.contextmanager
+def filling(value: Optional[bool]):
+    """Writes inside fill the derivable SHOULD fields when `value` is True, not when False;
+    None keeps the setting around (a write inside another write)."""
+    if value is None:
+        yield
+        return
+    token = FILL_DERIVED.set(bool(value))
+    try:
+        yield
+    finally:
+        FILL_DERIVED.reset(token)
 
 
 class NGFFValidationWarning(UserWarning):
@@ -358,12 +381,15 @@ def _findings(path, schemas: bool, storage_options: Optional[dict]) -> Tuple[Lis
     should: List[str] = []
     if "" not in groups:
         return [f"{path}: no group at the root"], []
+    rfc8 = False
     for rel, (fmt, attrs) in sorted(groups.items()):
         where = rel or "the root"
         ngff = _ngff(fmt, attrs)
         version = _version(ngff)
-        if version == RFC8_VERSION:
-            continue                    # RFC 8: no published schema yet
+        if version == RFC8_VERSION:     # RFC 8: no published schema yet, its structure only
+            rfc8 = True
+            out += rfc8_problems(ngff, lambda p, rel=rel: _join(rel, p), groups, arrays, where)
+            continue
         parent = posixpath.dirname(rel) if rel else None
         parent_ngff = _ngff(*groups[parent]) if parent is not None and parent in groups else {}
         roles = []
@@ -427,7 +453,81 @@ def _findings(path, schemas: bool, storage_options: Optional[dict]) -> Tuple[Lis
             for role in roles:
                 found = [f"{where}: {e}" for e in _schema_errors(attrs, version, role)]
                 (should if role.startswith("strict_") else out).extend(found)
+    if rfc8:
+        _warn_rfc8(path)
     return out, should
+
+
+def _warn_rfc8(path) -> None:
+    from ome_zarr_pyramid.core.rfc8 import RFC8Warning
+    warnings.warn(f"{path}: RFC 8 has no published schema yet; only its structure is checked "
+                  f"(node types, each level an array, each referenced image a group, each "
+                  f"transformation into a declared coordinate system)", RFC8Warning,
+                  stacklevel=3)
+
+
+def rfc8_problems(node: Any, resolve, groups: Mapping, arrays: set, where: str) -> List[str]:
+    """The structural problems of RFC 8 node `node` (a document's ``ome``, or a node in
+    it): every node of an RFC 8 type, every singlescale level's path an array, every
+    multiscale or collection a path names a group of that kind, every level's
+    transformation output a coordinate system its multiscale declares. `resolve` turns a
+    path of the document into a store path (the keys of `groups` and `arrays`)."""
+    out: List[str] = []
+    if not isinstance(node, dict):
+        return [f"{where}: an RFC 8 node is no JSON object"]
+    kind = node.get("type")
+    name = node.get("name") or node.get("id") or kind
+    path = node.get("path")
+    target = resolve(str(path["path"])) if isinstance(path, dict) and \
+        path.get("type") == "zarr" and path.get("path") is not None else None
+    if kind not in ("collection", "multiscale", "singlescale"):
+        return [f"{where}: RFC 8 node {name!r} has type {kind!r}, not collection, "
+                f"multiscale or singlescale"]
+    if kind == "singlescale":
+        if target is None:
+            out.append(f"{where}: level {name!r} names no zarr path")
+        elif target not in arrays:
+            out.append(f"{where}: level {name!r} at {path['path']!r} is not an array")
+        return out
+    if target is not None and "nodes" not in node:      # a reference: the group says more
+        if target not in groups:
+            return [f"{where}: {kind} {name!r} at {path['path']!r} is no group"]
+        found = _ngff(*groups[target])
+        if kind == "multiscale" and not (found.get("type") == "multiscale"
+                                         or "multiscales" in found):
+            out.append(f"{where}: multiscale {name!r} at {path['path']!r} is no image group")
+        if kind == "collection" and found.get("type") != "collection":
+            out.append(f"{where}: collection {name!r} at {path['path']!r} is no collection")
+        return out
+    children = node.get("nodes")
+    if not isinstance(children, list) or (kind == "multiscale" and not children):
+        return [f"{where}: {kind} {name!r} lists no nodes"]
+    systems = {cs.get("id") for cs in ((node.get("attributes") or {}).get("coordinateSystems")
+                                       or []) if isinstance(cs, dict)}
+    for child in children:
+        out += rfc8_problems(child, resolve, groups, arrays, where)
+        if kind != "multiscale" or not isinstance(child, dict):
+            continue
+        for t in ((child.get("attributes") or {}).get("coordinateTransformations") or []):
+            output = (t.get("output") or {}).get("id") if isinstance(t, dict) else None
+            if output not in systems:
+                out.append(f"{where}: level {child.get('name')!r} of {name!r} transforms into "
+                           f"{output!r}, which its multiscale does not declare")
+    return out
+
+
+def rfc8_document_problems(document, root) -> List[str]:
+    """The structural problems of a standalone RFC 8 document (a ``.json`` file whose paths
+    are relative to it) describing the local store at `root`."""
+    with open(document, encoding="utf-8") as f:
+        ome = json.load(f).get("ome", {})
+    groups, arrays = _walk_local(Path(root))
+    base = os.path.dirname(os.path.abspath(str(document)))
+
+    def resolve(p: str) -> str:
+        rel = os.path.relpath(os.path.normpath(os.path.join(base, p)), os.path.abspath(str(root)))
+        return "" if rel == "." else rel.replace(os.sep, "/")
+    return rfc8_problems(ome, resolve, groups, arrays, str(document))
 
 
 def validating(write):
@@ -454,8 +554,11 @@ def validating(write):
             targets = [path]
         else:
             targets = list(result.values()) if isinstance(result, Mapping) else []
+        document = bound.get("document")
         for target in targets:
             errors, should = _findings(target, True, options)
+            if document is not None:         # a standalone RFC 8 document beside the store
+                errors += rfc8_document_problems(document, target)
             _raise(f"{target}: the written store is not valid NGFF", errors,
                    "The store is written; fix what is listed, or report it as an ozp bug "
                    "if ozp made it.")

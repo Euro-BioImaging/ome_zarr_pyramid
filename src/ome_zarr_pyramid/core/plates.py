@@ -35,6 +35,8 @@ class Field:
     index: int
     keys: Tuple = ()
     collection: Any = _field(default=None, repr=False)
+    #: its node in the collection's tree: a field collection, or its one image's node
+    node: Any = _field(default=None, compare=False, repr=False)
 
     @property
     def images(self) -> tuple:
@@ -70,11 +72,25 @@ class Field:
 
     def select(self, **index) -> "Field":
         """This field with only the images whose index matches, e.g.
-        ``select(acquisition=1)``. It only filters: a name no image has gives an empty
-        field (``PyramidCollection.select`` raises on one)."""
-        return replace(self, keys=tuple(
-            key for key in self.keys
-            if all(dict(key).get(name) == value for name, value in index.items())))
+        ``select(acquisition=1)`` or ``select(view=[0, 1])``, as micro-reader's
+        ``Field.select``: an unknown index name raises ``KeyError``, a known one no image
+        has gives an empty field. A field sits in one well: ``row`` / ``column`` are
+        ``PyramidCollection.select``'s."""
+        from ome_zarr_pyramid.core.collection import check_index_names, index_values
+
+        known = self.collection._index_names() if self.collection is not None else ()
+        check_index_names(index, known, "Field.select")
+        wanted = {name: index_values(name, value, "Field.select")
+                  for name, value in index.items()}
+        keys = tuple(key for key in self.keys
+                     if all(dict(key).get(name) in allowed for name, allowed in wanted.items()))
+        return replace(self, keys=keys, node=self.node if keys == self.keys else None)
+
+    def as_collection(self):
+        """The field's images as a `PyramidCollection` (same keys, the part of the
+        coordinate-system graph they keep), with the field's node as its tree (none after
+        a ``select`` that dropped images)."""
+        return self.collection._branch(self.keys, self.node, f"field{self.index}")
 
     def __repr__(self) -> str:
         return f"<Field {self.index}: {len(self.keys)} images>"
@@ -88,6 +104,16 @@ class Well:
     column: int
     name: str
     fields: Tuple[Field, ...] = _field(default=(), compare=False, repr=False)
+    node: Any = _field(default=None, compare=False, repr=False)
+
+    def as_collection(self):
+        """The well's images as a `PyramidCollection` (same keys, the part of the
+        coordinate-system graph they keep), its tree the well."""
+        keys = [key for f in self.fields for key in f.keys]
+        collection = self.fields[0].collection if self.fields else None
+        if collection is None:
+            raise ValueError(f"well {self.name} holds no image")
+        return collection._branch(keys, self.node, self.name)
 
 
 @dataclass(frozen=True)
@@ -108,6 +134,15 @@ class Plate:
     wells: Tuple[Well, ...]
     acquisitions: Tuple[Acquisition, ...] = ()
     node: Any = _field(default=None, compare=False, repr=False)
+    collection: Any = _field(default=None, compare=False, repr=False)
+
+    def as_collection(self):
+        """The plate as a `PyramidCollection` of its own: its images (same keys), the part
+        of the coordinate-system graph they keep, and the plate as its tree, so
+        ``coll.plates[1].as_collection().write(path)`` writes that plate (the navigation
+        stays micro-reader's; this is ozp's step from it to a collection)."""
+        keys = [key for well in self.wells for f in well.fields for key in f.keys]
+        return self.collection._branch(keys, self.node, self.name or None)
 
     def well_index(self, name: str) -> int:
         """The index of the well called `name` (``"B2"``), for ``select(well=...)`` and
@@ -146,15 +181,28 @@ def plates_of(collection) -> List[Plate]:
             groups.setdefault((index.get("plate", 0), index["well"], index.get("field", 0)),
                               []).append(key)
     out = []
-    for p, node in enumerate(plate_nodes(collection.tree)):
+    nodes = plate_nodes(collection.tree)
+    numbers_of_plates = range(len(nodes))
+    if is_plate(collection.tree):
+        # one plate (a plate store, or coll.plates[p].as_collection()): its keys say which
+        values = {p for p, _, _ in groups}
+        numbers_of_plates = [values.pop() if len(values) == 1 else 0]
+    key_of = collection._key_of_nodes()
+    for p, node in zip(numbers_of_plates, nodes):
         attr: PlateAttribute = node.attributes["plate"]
         wells = []
         for w, well in enumerate(node.nodes):
             ref = well.attributes["well"]
             numbers = sorted(f for (pp, ww, f) in groups if pp == p and ww == w)
+            child_of = _child_of_key(well, key_of)
+            fields = []
+            for f in numbers:
+                keys = tuple(groups[(p, w, f)])
+                found = {id(child_of.get(k)) for k in keys}
+                field_node = child_of.get(keys[0]) if len(found) == 1 else None
+                fields.append(Field(f, keys, collection, field_node))
             wells.append(Well(attr.index_of("rows", ref.row), attr.index_of("columns", ref.column),
-                              well.name, tuple(Field(f, tuple(groups[(p, w, f)]), collection)
-                                               for f in numbers)))
+                              well.name, tuple(fields), well))
         acquisitions = tuple(
             Acquisition(int(a.id) if a.id.isdigit() else i, a.name or "")
             for i, a in enumerate(attr.acquisitions))
@@ -162,7 +210,20 @@ def plates_of(collection) -> List[Plate]:
         out.append(Plate(name if isinstance(name, str) else node.name,
                          tuple(r.name or r.id for r in attr.rows),
                          tuple(c.name or c.id for c in attr.columns),
-                         tuple(wells), acquisitions, node))
+                         tuple(wells), acquisitions, node, collection))
+    return out
+
+
+def _child_of_key(well: CollectionNode, key_of) -> Dict[Any, Node]:
+    """Each image key of `well` -> the child of the well that holds it (the image's own
+    node, or the field collection around it)."""
+    out: Dict[Any, Node] = {}
+    for child in well.nodes:
+        for node in (child.walk() if isinstance(child, CollectionNode) else [child]):
+            if isinstance(node, MultiscaleNode):
+                key = key_of.get(id(node), key_of.get(id(getattr(node, "_pyramid", None))))
+                if key is not None:
+                    out[key] = child
     return out
 
 

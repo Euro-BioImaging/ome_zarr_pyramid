@@ -15,8 +15,9 @@ __version__ = "0.4.0"
 __author__ = "Bugra Oezdemir"
 
 from ome_zarr_pyramid.core.io import IO
-from ome_zarr_pyramid.core.pyramid import Pyramid
-from ome_zarr_pyramid.core.collection import PositionUnitError, PyramidCollection
+from ome_zarr_pyramid.core.pyramid import LabelMismatchError, Pyramid
+from ome_zarr_pyramid.core.collection import (
+    OperationMismatchError, PositionUnitError, PyramidCollection, VaryingPropertyError)
 from ome_zarr_pyramid.core.concatenate import concatenate
 from ome_zarr_pyramid.core.nodes import UnsupportedNGFFVersion
 from ome_zarr_pyramid.core.ngff_plate import PlateFieldError
@@ -32,4 +33,5 @@ io = IO()
 
 __all__ = ["Pyramid", "PyramidCollection", "concatenate", "IO", "io", "UnsupportedNGFFVersion",
            "PositionUnitError", "PlateFieldError", "OMEXMLError", "RFC8Warning", "InvariantError",
-           "TransformError", "validate", "NGFFValidationError", "NGFFValidationWarning"]
+           "TransformError", "validate", "NGFFValidationError", "NGFFValidationWarning",
+           "VaryingPropertyError", "OperationMismatchError", "LabelMismatchError"]

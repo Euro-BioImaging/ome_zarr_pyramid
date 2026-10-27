@@ -16,6 +16,7 @@ from ome_zarr_pyramid.core.nodes import InvalidCollection, LabelsAttribute, Mult
 
 from test_collection_zarr import _plate
 from test_plates import DATA, PLATE, FakeImage
+from conftest import written_images
 
 
 def _file(views=False):
@@ -64,7 +65,7 @@ def test_a_file_plate_round_trips(tmp_path, version):
     coll = PyramidCollection.from_file(_file(), version=version)
     out = str(tmp_path / "screen.zarr")
     written = coll.write_plate(out)
-    assert sorted(written) == ["A/1/0", "B/3/0", "B/3/1"]
+    assert written_images(written, out) == ["A/1/0", "B/3/0", "B/3/1"]
     back = PyramidCollection.from_zarr(out)
     assert back.plates == coll.plates                     # name, rows, columns, wells
     for p_mine, p_back in zip(coll.plates[0].wells, back.plates[0].wells):
@@ -100,7 +101,7 @@ def test_a_field_with_several_images_raises_but_rfc8_keeps_them(tmp_path):
         coll.write_plate(str(tmp_path / "p.zarr"))
     assert not os.path.exists(tmp_path / "p.zarr")
     written = coll.write_plate(str(tmp_path / "r.zarr"), version="rfc8")
-    assert len(written) == 6
+    assert len(written_images(written, tmp_path / "r.zarr")) == 6
 
 
 def test_an_ngff_plate_is_copied(tmp_path):

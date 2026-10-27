@@ -10,6 +10,7 @@ import zarr
 
 from ome_zarr_pyramid import Pyramid, PyramidCollection
 from ome_zarr_pyramid.core.collection import SERIES_INDEX
+from conftest import written_images
 
 
 def _pyr(value):
@@ -31,7 +32,7 @@ def test_tiles_of_a_series_become_further_series_with_one_warning(tmp_path, vers
     out = str(tmp_path / "s.zarr")
     written, caught = _user_warnings(
         lambda: PyramidCollection(entries).write_series(out, version=version))
-    assert sorted(written) == ["0", "1", "2", "3"]
+    assert written_images(written, out) == ["0", "1", "2", "3"]
     assert len(caught) == 1
     message = str(caught[0].message)
     assert "1 of the collection's series holds several images" in message
@@ -50,7 +51,7 @@ def test_one_image_per_series_writes_without_a_warning(tmp_path):
     entries = {((SERIES_INDEX, s),): _pyr(s) for s in range(3)}
     written, caught = _user_warnings(
         lambda: PyramidCollection(entries).write_series(str(tmp_path / "s.zarr")))
-    assert sorted(written) == ["0", "1", "2"] and caught == []
+    assert written_images(written, tmp_path / "s.zarr") == ["0", "1", "2"] and caught == []
 
 
 def test_every_varying_sub_index_is_named(tmp_path):

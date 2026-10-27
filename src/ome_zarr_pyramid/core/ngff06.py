@@ -179,8 +179,10 @@ def to_06(ms: Mapping[str, Any], labels=None) -> Dict[str, Any]:
     # with, else the one read, else unknown (vendor levels, a single level)
     if stash.get("type"):
         out["type"] = stash["type"]
-    out.setdefault("type", "unknown")
-    out.setdefault("metadata", {})
+    from ome_zarr_pyramid.core.validation import FILL_DERIVED
+    if FILL_DERIVED.get():                   # write_pyramid(fill_derived=False): as given
+        out.setdefault("type", "unknown")
+        out.setdefault("metadata", {})
     return out
 
 

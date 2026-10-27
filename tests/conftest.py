@@ -84,3 +84,27 @@ def compute():
 def zarr_path(tmp_path):
     """A fresh, not-yet-created .zarr path under the test's tmp dir."""
     return str(tmp_path / "image.zarr")
+
+
+def written_images(written, root):
+    """The image groups a collection writer wrote under `root` (it returns `root`, for
+    ``io.read``), as sorted paths relative to it (``"A/1/0"``, ``"0"``, ...; label
+    images left out)."""
+    import json
+    import os
+    assert written == str(root), (written, str(root))
+    found = []
+    for folder, dirs, files in os.walk(str(root)):
+        attrs = {}
+        if "zarr.json" in files:
+            with open(os.path.join(folder, "zarr.json"), encoding="utf-8") as f:
+                attrs = (json.load(f).get("attributes") or {}).get("ome") or {}
+        elif ".zattrs" in files:
+            with open(os.path.join(folder, ".zattrs"), encoding="utf-8") as f:
+                attrs = json.load(f)
+        if "multiscales" in attrs or attrs.get("type") == "multiscale":
+            rel = os.path.relpath(folder, str(root)).replace(os.sep, "/")
+            if "labels" not in rel.split("/"):
+                found.append(rel)
+            dirs[:] = [d for d in dirs if d == "labels"]
+    return sorted(found)

@@ -447,55 +447,65 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
     label_of: Dict[str, str] = {}                          # label path -> its image's path
     where = Where()                                        # what placeholders resolve against
     written_at: Dict[int, Tuple[str, Optional[str]]] = {}  # id(pyramid) -> (rel, id)
-
-    def own_part(parent: CollectionNode, child: Node) -> Optional[str]:
-        if isinstance(child, CollectionNode):
-            if is_plate(parent) and is_well(child):
-                return well_path(parent.attributes["plate"], child)
-            if child.path is not None and child.path.type == "zarr":
-                return child.path.path
-            return None
-        if isinstance(child, MultiscaleNode) and child.path is not None:
-            return child.path.path
-        return None
-
-    def parts_of(coll: CollectionNode) -> Dict[int, str]:
-        """Where each collection and image child of `coll` goes in it: its own path,
-        else the next number no sibling takes (one counter for collections and images,
-        so a collection's folder never holds an image group of the same name)."""
-        children = [c for c in coll.nodes if isinstance(c, (CollectionNode, MultiscaleNode))]
-        own = {id(c): own_part(coll, c) for c in children}
-        used = {posixpath.normpath(p).split("/")[0] for p in own.values() if p is not None}
-        out, n = {}, 0
-        for child in children:
-            if own[id(child)] is not None:
-                out[id(child)] = own[id(child)]
-                continue
-            while str(n) in used:
-                n += 1
-            out[id(child)] = str(n)
-            used.add(str(n))
-        return out
+    label_nodes: Dict[str, str] = {}                       # a label node's path -> its source id
 
     def join(prefix: str, part: str) -> str:
         return posixpath.normpath(posixpath.join(prefix, part)) if prefix else posixpath.normpath(part)
 
-    def build(coll: CollectionNode, prefix: str, root: bool) -> Dict[str, Any]:
+    def parts_of(coll: CollectionNode, prefix: str, base: str) -> Dict[int, Tuple[str, str]]:
+        """Where each collection and image child of `coll` goes, and the base its own
+        children's paths are relative to: ``id(child) -> (path, base)``, store-relative.
+
+        A node's path is relative to its document (RFC 8): the nearest collection above
+        it with a path of its own (an NGFF well group ``A/2``, a zarr collection), else
+        the root, `base` here, never the folder a pathless collection is numbered into
+        (an RFC 8 plate read back: its wells are inline, their images ``./A/2/0``). A
+        plate's well goes at its ``<row>/<column>``; a child without a path takes the
+        next number no sibling takes under `prefix` (one counter for collections and
+        images, so a collection's folder never holds an image group of the same name)."""
+        children = [c for c in coll.nodes if isinstance(c, (CollectionNode, MultiscaleNode))]
+        out: Dict[int, Tuple[str, str]] = {}
+        for child in children:
+            own = child.path.path if child.path is not None else None
+            if isinstance(child, CollectionNode) and is_plate(coll) and is_well(child):
+                at = join(prefix, well_path(coll.attributes["plate"], child))
+                out[id(child)] = (at, join(base, own) if own and child.path.type == "zarr" else base)
+            elif own is not None and child.path.type == "zarr":
+                at = join(base, own)
+                out[id(child)] = (at, at)
+            elif isinstance(child, CollectionNode) and own is not None:
+                # another document (a .json): its nodes relative to its folder
+                out[id(child)] = (None, join(base, posixpath.dirname(own)))
+        used = {posixpath.relpath(at, prefix or ".").split("/")[0]
+                for at, _ in out.values() if at is not None}
+        n = 0
+        for child in children:
+            at, child_base = out.get(id(child), (None, base))
+            if at is not None:
+                continue
+            while str(n) in used:
+                n += 1
+            at = join(prefix, str(n))
+            used.add(str(n))
+            out[id(child)] = (at, child_base)        # inline: still its document's base
+        return out
+
+    def build(coll: CollectionNode, prefix: str, base: str, root: bool) -> Dict[str, Any]:
         out: Dict[str, Any] = {"type": "collection"}
         if coll.id is not None:
             out["id"] = coll.id
         out["name"] = coll.name
         where.prefix[id(coll)] = prefix
         children = []
-        parts = parts_of(coll)
+        parts = parts_of(coll, prefix, base)
         for child in coll.nodes:
             if isinstance(child, CollectionNode):
-                children.append(build(child, join(prefix, parts[id(child)]), False))
+                children.append(build(child, *parts[id(child)], False))
             elif isinstance(child, MultiscaleNode):
                 pyr = child.pyramid
-                own = own_part(coll, child)
-                if id(pyr) in written_at and (getattr(child, "_alias", False) or own is None
-                                              or join(prefix, own) == written_at[id(pyr)][0]):
+                at = parts[id(child)][0]
+                if id(pyr) in written_at and (getattr(child, "_alias", False) or child.path is None
+                                              or at == written_at[id(pyr)][0]):
                     # a second parent of the same image: an alias (3.11); a node with a
                     # path of its own elsewhere is a copy, written there
                     rel, ident = written_at[id(pyr)]
@@ -506,12 +516,15 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
                         entry["attributes"] = where.json(child.attributes)
                     children.append(entry)
                     continue
-                rel = join(prefix, parts[id(child)])
+                rel = at
                 where.image[id(child)] = rel
                 labels = dict(getattr(pyr, "_labels", {}) or {})
                 ident = child.id if child.id is not None or not labels else _safe_id(child.name, taken)
                 written_at[id(pyr)] = (rel, ident)
                 jobs.append((rel, pyr, child.name, ident))
+                source = child.attributes.get("labels")
+                if isinstance(source, LabelsAttribute) and len(source.source) == 1:
+                    label_nodes[rel] = source.source[0].id
                 entry: Dict[str, Any] = {"type": "multiscale"}
                 if ident is not None:
                     entry["id"] = ident
@@ -545,10 +558,12 @@ def write_rfc8(node: CollectionNode, path, *, document: Optional[str] = None,
         out.update(copy.deepcopy(coll.extra))
         return out
 
-    doc = build(node, "", True)
+    doc = build(node, "", "", True)
     beside = {k: copy.deepcopy(v.to_json() if hasattr(v, "to_json") else v)
               for k, v in node.attributes.items()
               if k not in _RFC8_ATTRIBUTES and ":" not in k and k != "bioformats2raw.layout"}
+    path_of_id = {ident: rel for rel, _, _, ident in jobs if ident is not None}
+    label_of.update({rel: path_of_id[i] for rel, i in label_nodes.items() if i in path_of_id})
     _check_paths(node.name, jobs, label_of)
 
     try:

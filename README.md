@@ -58,6 +58,60 @@ mask_pyr = (io.read_pyramid("image.ome.zarr").isel(c=0) > 128)   # Pyramid -> Py
 io.write_pyramid(mask_pyr.downscale(n_layers=4), "mask.ome.zarr", overwrite=True)
 ```
 
+### Reading and writing: `io` does it all
+
+Every read and write is a method of `io`. The classes have shortcuts with the same
+options, so use whichever reads better:
+
+| To | `io` method | Shortcut |
+|---|---|---|
+| read what a store holds: an image, or a plate / series / collection | `io.read(path)` | |
+| read one image | `io.read_pyramid(path)` (a path or an open `zarr.Group`) | `Pyramid.from_zarr(path)` |
+| write one image | `io.write_pyramid(pyr, path)` | `pyr.write(path)` |
+| edit a stored image's metadata | `io.update_metadata(path, scales=...)` | `pyr.update_metadata(scales=...)` (the store it was read from) |
+| read a plate, series or collection | `io.read_collection(path)` | `PyramidCollection.from_zarr(path)` |
+| write a collection (a plate, a series layout, or `version="rfc8"`) | `io.write(coll, path)` | `coll.write(path)` |
+| write a plate | `io.write_plate(coll, path)` | `coll.write_plate(path)` |
+| write a series layout | `io.write_series(coll, path)` | `coll.write_series(path)` |
+| write an RFC 8 collection | `io.write_collection(coll, path)` | `coll.write_collection(path)` |
+| edit the metadata of every image of a store | `io.update_metadata(path, scales=...)` | `coll.update_metadata(scales=...)` |
+
+`io` keeps no settings: every option goes with the call, as in dyna-zarr's `io`. The
+writers return the path they wrote, and `io.read` gives a `Pyramid` or a
+`PyramidCollection`, as the store holds: `new_coll = io.read(coll.write(path))`, and
+`io.write(io.read(src), dst)` copies either. `coll.write(path)` writes what the
+collection is: a plate as a plate, one image as an image, anything else as a
+bioformats2raw series layout. `version=` picks the format: `"0.4"`, `"0.5"`, `"0.6"`
+(default: the collection's own, else 0.5), or `"rfc8"` for the collection's whole tree
+(several plates too). `coll.write(directory, stem)` writes one store per image,
+`<directory>/<stem><suffix>.ome.zarr`, and returns `{key: path}` of each.
+
+The write options use dyna-zarr's words: `backend=` is the storage backend
+(`"tensorstore"`, the default, or `"zarrista"`), `engine=` dyna's loop (`"fused"` or
+`"pipeline"`, with `num_readers=` and `gc_interval=`), `chunks=` the chunk shape (also
+`chunk_shape=`), and `compressor=` takes a name, a `CompressorConfig` or dyna's `Codecs`.
+
+To write a label image, attach it to its image and write the image:
+`pyr = pyr.add_image_label(label_pyr, "cells")` then `pyr.write(path)` (the label goes
+under the image's `labels` group). `io.read_labels` and `io.write_labels` handle a label store on
+its own. An attached label follows its image through `isel`, `squeeze`, `select_levels` and
+`downscale` (downscaled with `"simple"`, so its values stay labels); a label that cannot
+follow, such as one of another size along a cropped axis, raises `LabelMismatchError`
+before anything is done. A collection's RFC 8 label nodes follow their images the same way.
+
+`Pyramid` and `PyramidCollection` share names: one name means one thing. A collection
+answers `axes`, `dtype`, `shape`, `nlayers` (and `compressor`, `scale_factor_dict`,
+`custom_metadata`) with the one value all its images have; when they differ, it raises
+`VaryingPropertyError` and `coll.table` shows each image's value. `validate()`,
+`table`, `coordinate_systems` and `supports_dyna` exist on both.
+
+```python
+coll = PyramidCollection.from_zarr("plate.ome.zarr")
+coll.axes                      # 'czyx', read from the metadata; no image opened
+pyr = coll.filter(well=3, field=0, acquisition=0).only()   # the one image left, as a Pyramid
+one_coll = pyr.as_collection()                 # a Pyramid as a collection of one
+```
+
 ## Inspect the pyramid & its metadata
 
 ```python
@@ -182,7 +236,8 @@ of level-0 pixels, so it sits at the window's centre: the level's translation is
 downscaled twice by 2 with `"mean"`, the levels are at (5, 3), (5.25, 3.25) and
 (5.75, 3.75) µm. Levels read from a store keep the translations stored there.
 
-`downscale_backend` chooses where the window methods run. Both produce the same pixels:
+`downscale_backend` chooses where the window methods run (it computes the coarser levels;
+the storage `backend=` of a write is another option). Both produce the same pixels:
 
 ```python
 pyr.downscale(downscale_method="mean")                            # TensorStore (default)
@@ -275,8 +330,9 @@ coll.tree                     # the file as nodes: its plates, and its series
 ```
 
 A file's series are numbered by the index `series` (micro-reader 0.1.0 and later).
-`select` with an index name the collection does not have raises a `KeyError` that lists
-the names it has; a known name with a value no image has gives an empty collection.
+`select` with an index name neither micro-reader nor the collection's keys know raises a
+`KeyError` that lists the names; a known name with a value no image has gives an empty
+collection.
 Any other object with `images` works too, with whatever index names its images carry.
 
 In `coll.tree`, named after the file (`sample`), a series that holds several images
@@ -306,6 +362,63 @@ Plates are navigated as in micro-reader: rows and columns count from 0,
 `plate.wells[w]` is the well with index `"well": w`, and `well.fields[f]` its f-th field.
 When a field has one image per acquisition, pick one first:
 `well.fields[0].select(acquisition=1).image`.
+
+A plate, a well or a field turns into a collection of its own with `as_collection()`
+(ozp's step from micro-reader's navigation to a collection): `coll.plates[1].as_collection()`
+holds that plate's images, keyed as before, with the plate as its tree, so
+`coll.plates[1].as_collection().write("plate1.ome.zarr")` writes that plate alone.
+
+Two ways to narrow a collection: `select` slices along the indices (plate, well, field,
+view, illumination, ...), `filter` queries the table's columns (`filter(dtype="uint16")`,
+`filter(size_z=lambda n: n > 1)`, `filter(lambda image: ...)`). `coll.select(...)` takes
+the same arguments as micro-reader's `File.select` and gives the same images:
+
+```python
+coll.select(plate=0, well=12)                    # a well by its place in plate.wells
+coll.select(well="C3")                           # by name (in each plate)
+coll.select(row="C", column=range(1, 4))         # rows / columns: names, or 0-based numbers
+coll.select(illumination=[2, 3])                 # a list, tuple, range or set: any of them
+```
+
+`row` and `column` count from 0 like `Well.row` and `Well.column` (`column=2` is the
+column named "3"); they are another address of the well, so they do not go with `well`.
+A `Well` (or `Plate`, `Field`, `Acquisition`) object is no index value: `select` raises
+and names `well_index(...)`, the name, and `.as_collection()`.
+
+A selection keeps the tree as it is: a plate keeps all its wells, those without
+selected images empty. `drop_empty()` drops the fields, wells, plates and other
+collections that hold no image, and numbers plates and wells anew so that
+`"well": w` is again `plates[p].wells[w]`; every other index keeps its value:
+
+```python
+c3 = coll.select(plate=0, well="C3").drop_empty()   # one plate, one well: "well": 0
+c3.write("c3.ome.zarr")                             # an NGFF plate (or version="rfc8")
+```
+
+Some `Pyramid` operations work on a whole collection, image by image: `isel`, `squeeze`,
+`select_levels`, `downscale`, `rechunk`, `to_version`, `saturate_cast`, `set_channels`,
+`set_display_range`, `set_custom_metadata`, and operators with a number (`coll > 128`,
+`coll * 2`, `65535 - coll`, `coll == 3`). The result is a new collection with the
+same keys and layout; nothing is read until an image is used or written, so a 384-image
+plate is relabelled in a fraction of a second and written image by image. An operation
+that does not fit every image (a channel some images lack) is refused before anything is
+done, naming those images and the `filter` that narrows the collection:
+
+```python
+named = plate_coll.set_channels({0: {"label": "DNA", "color": "blue"}})
+named.write("named.ome.zarr")                                 # every image relabelled
+plate_coll.isel(c=0).write("dna.ome.zarr")                    # the first channel of every image
+(plate_coll.isel(c=0) > 500).write("mask.ome.zarr")           # a mask plate
+plate_coll.filter(nlevels=lambda n: n >= 3).select_levels(0, 1, 2)
+```
+
+Each image keeps its place: `isel` and `select_levels` update its scale and translation.
+An image dropping an axis (`isel(z=3)`, `squeeze()`) stays in its coordinate system, and
+the system loses the axis when all its images do; dropping an axis of an image that a
+transform between images (an affine, a registration) runs through is refused, since the
+transform would no longer fit (a slice, `z=slice(3, 4)`, keeps the axis). Two collections do
+not combine image by image yet (`raw - background` raises); a collection combines with a
+number.
 
 Every image also has a flat key, the same one micro-reader gives a plate image:
 
@@ -390,11 +503,13 @@ io.write_pyramid(pyr, "out.ome.zarr", overwrite=True,     # pyr: 'tczyx'
   by chunk**. For example, a 17.6 GB stack of 2347 planes, written as a 6-level pyramid
   with 960³ shards, stayed under 1 GB with a 1.5 GB budget. It does not apply to levels
   built from dask arrays (dask's own scheduler writes those), and raises there.
-- `io_backend="zarrista"` writes the bytes with the optional zarrista backend of
-  dyna-zarr instead of TensorStore.
+- `backend="zarrista"` writes the bytes with the optional zarrista backend of
+  dyna-zarr instead of TensorStore (`io_backend=` is the old name and still works).
 - Renamed in 0.1.0: `max_workers` is now `max_threads`, and `use_multiprocessing` is now
   `max_downscale_processes`. The old names still work, with a `FutureWarning`. The old
-  `backend="sync"` and `backend="tensorstore"` write engines are gone: asking for them raises.
+  `backend="sync"` write engine is gone: asking for it raises. Since 0.5.0 `backend=`
+  names the storage backend, as in dyna-zarr: `backend="auto"` / `"dyna"` (the one
+  engine) warn and can be dropped.
 - `window_from_data=True` sets each channel's display window (`start`/`end` in the omero metadata) 
   to the min/max of level 0 as written, measured during the write itself, so the output is
   not read again. The window's `min`/`max` stay as they are. For percentiles or

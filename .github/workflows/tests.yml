@@ -1,18 +1,19 @@
 name: Tests
 
-# Runs the test suite on every push and pull request to the main branches, and
-# can be kicked off by hand from the Actions tab.
+# Tests run in two places: on a pull request (any target branch; when it is opened,
+# on every new commit, when it is reopened) and before every release (publish.yml
+# calls this workflow; nothing is published unless it passes). Plain pushes do not
+# run them; the "Run workflow" button on the Actions tab runs them by hand.
 on:
-  push:
-    branches: [main, master]
   pull_request:
-    branches: [main, master]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
-  # A new push to the same branch cancels an in-flight run for it.
-  group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  # A new commit on the same PR cancels its run still in progress (not releases).
+  group: tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
   test:

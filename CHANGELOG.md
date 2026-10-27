@@ -1,5 +1,180 @@
 # Changelog
 
+## 0.5.0 (unreleased): one API for Pyramid and PyramidCollection, IO as the hub
+
+A minor release (decision C-11): names are added and every existing name keeps working;
+one return value changes (see Changed). eubi-bridge needs no change (it does not read
+those return values).
+
+### New
+
+- `IO` is the one read/write hub: `read_collection`, `write_plate`, `write_series` and
+  `write_collection` join `read_pyramid`, `write_pyramid`, `update_metadata` and the label
+  methods. The class methods are shortcuts to them: `PyramidCollection.from_zarr`
+  and its writers now go through `IO`. `IO` keeps no settings: options are per call, as in
+  dyna-zarr's `io`.
+- `Pyramid.from_zarr(path)` and `pyr.write(path)` (returns the path), shortcuts for
+  `io.read_pyramid` / `io.write_pyramid`; `pyr.update_metadata(...)` edits the store the
+  pyramid was read from (`path=` for one it cannot name).
+- A collection answers the read properties of a `Pyramid`: `axes`, `dtype`, `shape`,
+  `nlayers`, `compressor`, `scale_factor_dict`, `custom_metadata` give the one value all
+  its images have, and raise the new `VaryingPropertyError` (a `ValueError`, pointing to
+  `coll.table`) when they differ (decision C-8). `axes`, `shape` and `nlayers` are read from
+  the table and open no image. `supports_dyna` is true when every image supports dyna.
+- `PyramidCollection.only()`: the one pyramid of a one-image collection (keeping its
+  coordinate system), else a `ValueError` listing the keys. `Pyramid.as_collection()`:
+  the pyramid as a collection of one, under the key `()`.
+- `PyramidCollection.validate(images=True)`: the graph's invariants and every image's
+  `validate()`, returning the collection; `check_invariants` stays.
+- `Pyramid.table` (a one-row `CollectionTable`), `Pyramid.coordinate_systems` (`{id:
+  system}` or `{}`) and `Pyramid.coordinate_transformations` (`[]`), as on a collection.
+- One write for a collection: `coll.write(path)` / `io.write(coll, path)` writes what the
+  collection is: a plate as a plate, one image (key `()`) as an image, anything else as a
+  series layout; `version=` picks the format (`"0.4"`, `"0.5"`, `"0.6"`, or `"rfc8"` for
+  the whole tree, several plates too). The old `coll.write(directory, stem)` (one store
+  per image) is unchanged. `io.write(pyr, path)` writes a pyramid.
+- `coll.update_metadata(...)` and `io.update_metadata(path, ...)` on a plate or series:
+  each image of the store is edited; the store is read again and returned.
+- The writers return where they wrote: `io.write_pyramid` and `io.write_labels` return the
+  path (they returned `None`).
+- `io.read(path)`, the other half of `io.write` (`io.read(io.write(obj, path))` is what
+  was written): a `Pyramid` for an image store, a
+  `PyramidCollection` for a plate, a well, a bioformats2raw layout or an RFC 8 collection
+  (also when it holds one image). `io.read_pyramid` / `io.read_collection` give one type
+  whatever the store holds.
+- `io.read_pyramid` takes an open `zarr.Group`.
+- `validate=True` on `write_collection` (and on `write_plate` / `write_series` with
+  `version="rfc8"`) checks the written RFC 8 store, and a standalone RFC 8 document:
+  RFC 8 has no published schema, so its structure is checked (node types, every level an
+  array, every referenced image a group, every transformation into a declared coordinate
+  system), with an `RFC8Warning` saying so. `ozp.validate(path)` checks an RFC 8 store
+  the same way; it passed every RFC 8 store unchecked before.
+- `as_collection()` on a plate, a well and a field of `coll.plates`: that part as a
+  collection of its own (its keys, its tree, the part of the coordinate-system graph it
+  keeps), so `coll.plates[1].as_collection().write(path)` writes one plate. The navigation
+  objects stay micro-reader's.
+- A selection writes as RFC 8: `coll.select(plate=0, well=3).write(path, version="rfc8")`
+  (and `write_collection`) writes the part of the tree that holds the selected images. A
+  kept plate keeps every well (empty where nothing was selected) and its rows and columns,
+  so the keys read back as they were; labels of images left out are left out. It was
+  refused ("a selection of its tree").
+- `select` takes micro-reader's new arguments: a well by name (`well="C3"`), wells by
+  `row` / `column` (0-based numbers or names; not together with `well`), and a list,
+  tuple, range or set as any value (any of them). A test checks that ozp and
+  micro-reader select the same images for the same arguments.
+- `coll.drop_empty()`: the collection with the fields, wells, plates and other
+  collections that hold no image dropped from its tree; plates and wells are numbered
+  anew (`"well": w` is `plates[p].wells[w]`), every other index keeps its value, the
+  coordinate-system graph follows. `coll.select(well="C3").drop_empty()` writes as an
+  NGFF plate of one well, or as RFC 8.
+- The write options use dyna-zarr's words (decision C-14): `backend=` is the storage
+  backend (`"tensorstore"`, default, or `"zarrista"`); `io_backend=`, its old name, still
+  works without a warning; giving both with different values raises. `engine=`
+  (`"fused"` / `"pipeline"`), `num_readers=` and `gc_interval=` reach dyna's write of
+  each level (a deferred downscale's one-pass write refuses `engine="pipeline"`).
+  `compressor=` takes dyna's `Codecs`. Attached labels are written with the same storage
+  backend as their image (they always used TensorStore).
+- Level names beside the layer names (decision C-16): `pyr.levels` and `pyr.nlevels`
+  (`layers`, `nlayers`), `coll.nlevels`, `write_pyramid(levels=)` (`layers=`). The layer
+  names stay, without a warning. The table's column `levels` (the number of levels) is
+  `nlevels`; `levels` still reads (`table["levels"]`, `filter(levels=...)`,
+  `group_by("levels")`, `image["levels"]` in a predicate), listings show `nlevels`.
+- `write_pyramid(fill_derived=False)` (decision 9.12-S), also on `update_metadata` and
+  every collection writer: the NGFF SHOULD fields ozp derives exactly (a multiscale's
+  empty `metadata` and `type` "unknown", an acquisition's `maximumfieldcount`) are
+  written only as the source has them. Default True, as before. A write no longer adds
+  them to the pyramid it is given, only to the store.
+- `Pyramid.layers` opens each level's zarr array once (per group and set of level paths)
+  instead of on every access: operations on a stored pyramid read its arrays' metadata
+  once (an `isel` of a 3-level image opened 24 arrays). The table of `isel(c=0)` on
+  idr0010's 384 images: 4.0 s -> 1.2 s. A store overwritten after it was read is read
+  again with `io.read_pyramid`.
+- The table rows of images with no metadata file to read (the lazy results of collection
+  operations, images in memory) are read in threads from eight images on: the same rows,
+  about twice as fast (idr0010's 384 images after `isel`: 8 s -> 4 s).
+- Storage, values and operators on a whole collection (Workplan C5): `coll.rechunk(...)`,
+  `coll.to_version(...)`, `coll.saturate_cast(...)` and operators with a number
+  (arithmetic, comparisons, bitwise, unary: `coll > 128` is a mask collection), lazy.
+  `coll == 3` / `coll != 3` are elementwise (decision C-1); with anything but a number they
+  say whether it is the same collection. Two collections do not combine yet: `coll - other`
+  raises `TypeError` (decision C-4).
+- Axis and level operations on a whole collection (Workplan C4): `coll.isel(...)`,
+  `coll.squeeze(...)`, `coll.select_levels(...)`, `coll.downscale(...)`, lazy, refused as a
+  whole when an axis, index or level is missing in some image. The coordinate-system graph:
+  a system whose images all drop an axis loses it; dropping an axis of an image an edge
+  (affine, registration) runs through is refused. RFC 8 label nodes of the tree follow
+  their images (Workplan C7, below).
+- Operations on a whole collection (Workplan C2, C3, C6): `coll.set_channels(...)`,
+  `coll.set_display_range(...)` and `coll.set_custom_metadata(...)` apply the `Pyramid`
+  method to every image and return a new collection (same keys, tree and coordinate
+  systems). Lazy: an image not opened yet gets the operation when it is first used or
+  written, and the table of the result comes from the source's metadata. An operation
+  that does not fit every image raises `OperationMismatchError` (a `ValueError`, new)
+  before anything is done, naming the images and a `filter` that narrows the collection
+  (decision C-5).
+- `chunks=` on `io.write_pyramid` (and every writer passing write options), the dyna-zarr
+  name of `chunk_shape=`; giving both raises.
+- Label images follow their image (Workplan C7, decision C-2). `isel`, `squeeze`,
+  `select_levels` and `downscale` of a pyramid apply to its attached labels too: on the
+  axes a label has, never the channel axis, and a label is downscaled with `"simple"`
+  (picking, never averaging), whatever method the image uses. Shape-preserving
+  operations (`rechunk`, operators, `saturate_cast`, metadata) keep them as they are. On a
+  collection, its RFC 8 label nodes follow their images the same way. A label that cannot
+  follow (another size along an indexed axis, fewer levels) raises the new
+  `LabelMismatchError` (a `ValueError`) naming the label, and on a collection the image,
+  before anything is done.
+
+### Fixed
+
+- Writing an RFC 8 collection read from a store as RFC 8 again was refused ("image
+  'A/2/A/2/0/labels/nuclei' would be written inside the image group 'A/2/A/2/0'"): the
+  document's image paths, relative to the document, were joined to their well's folder a
+  second time, and a label node read back was not known as its image's label.
+- A deferred `downscale()` of an in-memory pyramid whose levels were built eagerly raised
+  `TypeError` (`int(None)`): a TensorStore view without a storage grid was taken for one.
+- The table's `shards` of an image that lost an axis (`isel(c=0)` of a sharded image) was
+  its source's tuple, one entry too long; it is None now (dyna-zarr copied the shards down
+  its transforms; fixed there too, for dyna-zarr 0.1.1).
+- `Pyramid.isel` (and `squeeze`, `[...]`) of an image with a unitless axis besides the
+  channel axis (idr0010: `t` and `z` without a unit) raised "Number of units must match
+  number of axes except channel": the unitless axes' units were dropped.
+
+### Changed
+
+- `isel`, `squeeze`, `select_levels`, `downscale`, `rechunk` and the operators no longer
+  drop a pyramid's attached labels: they follow it (see New), or the operation raises
+  `LabelMismatchError` when one cannot.
+- `PyramidCollection.__eq__` / `__ne__` with a number are elementwise (decision C-1), as on
+  a `Pyramid`; the Mapping comparison (same keys and images) is gone, nothing used it.
+- `Pyramid.from_image` / `PyramidCollection.from_file` (C13): channels the file describes
+  without a colour get ozp's distinct colours (red, green, blue, ...; skipping colours
+  other channels have) instead of white, so a multichannel image no longer shows all
+  grey. A single channel stays white. Colours the file gives are kept. eubi-bridge's own
+  colour filling (emission wavelengths, transmitted light) runs after and is unchanged.
+- `backend="auto"` / `"dyna"` (ozp's one engine, the meaning `backend=` had) give a
+  `FutureWarning` and are ignored; `backend="tensorstore"` writes with TensorStore
+  storage instead of raising "removed engine"; `num_readers=` and `gc_interval=` are
+  dyna's settings again instead of being refused as the removed engines'.
+- `select` refuses a `Plate`, `Well`, `Field` or `Acquisition` object as a value
+  (`TypeError`; it selected nothing), as micro-reader's does.
+- `select` names indices as micro-reader's `select` does: any of micro-reader's index
+  names is known, with the names the keys carry; a known index no image has selects
+  nothing (it raised `KeyError` when the keys lacked it), and `'scene'` always gets the
+  rename hint. `Field.select` checks names the same way (it took any).
+- `write_plate`, `write_series` and `write_collection` return the path written (the
+  standalone RFC 8 `document`, when one is given), as `pyr.write` does, so
+  `io.read(coll.write(path))` reads the written collection back. They returned
+  `{path in the layout: written path}`. `coll.write(directory, stem)` (one store per
+  image, no top-level store) still returns `{key: path}`.
+
+### Not in this release
+
+- Length and iteration: `len(pyr)` / iterating levels is not added, because `pyr[0]`
+  already slices pixels (positional indexing), so `len` and `[]` would disagree.
+- The Pyramid operations on collections (`isel`, `rechunk`, `set_channels`, ... through
+  one private `_map`, decision C-9) wait on decisions C-1 to C-6 (Workplan C2-C6).
+  `concatenate` stays collection-only (decision C-10).
+
 ## 0.4.0 (2026-10-22): coordinate systems, NGFF 0.6, RFC 8 scenes, validation
 
 A minor release under the release policy: field collections are renamed and fields are

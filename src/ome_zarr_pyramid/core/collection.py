@@ -38,6 +38,7 @@ the same path.
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -56,6 +57,364 @@ SERIES_INDEX = "series"
 #: the indices that say where an image sits (its container); any other index (tile,
 #: view, illumination, phase, part, ...) tells apart images in one container
 CONTAINERS = ("plate", "acquisition", "well", "field", SERIES_INDEX)
+#: micro-reader's image index names (``micro_reader._base.INDEX_NAMES``; a test keeps the
+#: two the same). ``select`` knows these and any other name the collection's keys carry.
+INDEX_NAMES = ("plate", "acquisition", "well", "field", SERIES_INDEX, "tile", "rotation",
+               "view", "illumination", "phase", "block", "emission", "excitation",
+               "lifetime", "sequence", "part", "resolution")
+
+
+#: ``select``'s other address of a plate's wells (0-based numbers or names); not index
+#: names, so not in the keys
+WELL_ADDRESS = ("row", "column")
+#: a value of one of these types is "any of" its items, in ``select``
+_SEQUENCES = (list, tuple, range, set, frozenset)
+#: the navigation classes (ozp's and micro-reader's): not index values
+_NAVIGATION = ("Plate", "Well", "Field", "Acquisition")
+
+
+def check_index_names(index, keys_have, where: str, extra=()) -> None:
+    """``select``'s rule for index names, as micro-reader's ``select``: a name is known when
+    it is one of micro-reader's :data:`INDEX_NAMES`, one the keys carry (`keys_have`; an
+    index name ozp keeps as read, eubi-bridge 0.2.x's say) or one of `extra`; an unknown
+    one raises ``KeyError``. A known name no image has selects nothing."""
+    unknown = [name for name in index
+               if name not in INDEX_NAMES and name not in keys_have and name not in extra]
+    if not unknown:
+        return
+    if "scene" in unknown:
+        # micro-reader 0.1.0 renamed the index; this goes with micro-reader's guard (3.24)
+        raise KeyError(f"{where}: the image index 'scene' is now called {SERIES_INDEX!r} "
+                       f"(micro-reader 0.1.0); use {SERIES_INDEX!r}")
+    raise KeyError(f"{where}: unknown indices {sorted(unknown)}; the indices are "
+                   f"{sorted(set(INDEX_NAMES) | set(keys_have))}")
+
+
+def index_values(name: str, value, where: str = "select") -> tuple:
+    """``select``'s values for `name`, as micro-reader's: one value, or a list, tuple,
+    range or set of them (any of). A plate, well, field or acquisition object is refused:
+    it is no index value."""
+    values = tuple(value) if isinstance(value, _SEQUENCES) else (value,)
+    for v in values:
+        kind = type(v)
+        if kind.__name__ in _NAVIGATION and \
+                kind.__module__.split(".")[0] in ("ome_zarr_pyramid", "micro_reader"):
+            raise TypeError(
+                f"{where}({name}=...): a {kind.__name__} object is no index value; give its "
+                f"index (well=plate.well_index('C3')) or its name (well='C3'), or take the "
+                f"part itself with .as_collection()")
+    return values
+
+
+def _on_axis(values, number: int, labels) -> bool:
+    """Whether a well's row (or column) `number` is among `values`: 0-based numbers, or
+    names (`labels`: the plate's row or column names); None takes every one."""
+    if values is None:
+        return True
+    name = labels[number] if 0 <= number < len(labels) else None
+    return any((v == name) if isinstance(v, str) else (v == number) for v in values)
+
+
+def _io():
+    """The IO a shortcut delegates to (imported here: io.py imports this module's
+    neighbours at load time). IO holds no state, so a fresh one is the shared ``io``."""
+    from ome_zarr_pyramid.core.io import IO
+    return IO()
+
+
+def _written(path, document=None) -> str:
+    """What a collection writer returns: where to read the collection back with
+    ``io.read`` (the standalone RFC 8 document when there is one, else the store)."""
+    return str(document) if document is not None else str(path)
+
+
+def _pruned(tree, key_of: Dict[int, Any], *, keep_wells: bool = True, copies=None):
+    """A copy of `tree` holding only the images `key_of` names (``id`` of a node, or of
+    the pyramid it holds -> its key; the copies are added to it, for the writers). Kept:
+    every collection that still holds an image, an alias whose image is kept, and a label
+    or derived image whose sources are all kept. With `keep_wells` a kept plate keeps
+    every well, those left without images empty, so "well": w still reads back as
+    wells[w] (the plate's own numbers win on reading, plan 5.11); ``drop_empty`` drops
+    them. A plate keeps its rows and columns. `copies`, when given, is filled with ``id``
+    of each node -> its copy. Nothing is opened."""
+    from ome_zarr_pyramid.core.nodes import (
+        CollectionNode, LabelsAttribute, MultiscaleNode, Ref, is_plate, is_well)
+
+    out = tree.copy()
+    for original, copied in zip(tree.walk(), out.walk()):
+        if copies is not None:
+            copies[id(original)] = copied
+        key = key_of.get(id(original), key_of.get(id(getattr(original, "_pyramid", None))))
+        if key is not None:
+            key_of[id(copied)] = key
+
+    def held(node) -> bool:
+        first = getattr(node, "_alias_of", None)
+        return id(node) in key_of or (first is not None and (
+            id(first) in key_of or id(getattr(first, "_pyramid", None)) in key_of))
+
+    def derived(node) -> bool:
+        return "labels" in node.attributes or "source" in node.attributes
+
+    def prune(coll) -> None:
+        kept = []
+        for child in coll.children:
+            if isinstance(child, CollectionNode):
+                prune(child)
+                if child.children or (keep_wells and is_plate(coll) and is_well(child)):
+                    kept.append(child)
+            elif not isinstance(child, MultiscaleNode) or held(child) or derived(child):
+                kept.append(child)
+        coll._nodes = kept
+
+    def refs(value) -> List[str]:
+        if isinstance(value, Ref):
+            return [value.id]
+        if isinstance(value, LabelsAttribute):
+            return [r.id for r in value.source]
+        if isinstance(value, (list, tuple)):
+            return [i for v in value for i in refs(v)]
+        return []
+
+    def drop_orphans(coll, ids) -> None:
+        kept = []
+        for child in coll.children:
+            if isinstance(child, CollectionNode):
+                drop_orphans(child, ids)
+                if child.children or (keep_wells and is_plate(coll) and is_well(child)):
+                    kept.append(child)
+            elif isinstance(child, MultiscaleNode) and derived(child) and not held(child):
+                sources = refs(child.attributes.get("labels")) + refs(child.attributes.get("source"))
+                if all(i in ids for i in sources):
+                    kept.append(child)
+            else:
+                kept.append(child)
+        coll._nodes = kept
+
+    prune(out)
+    drop_orphans(out, {n.id for n in out.walk() if isinstance(n, MultiscaleNode) and held(n)})
+    return out
+
+
+def _renamed_graph(graph: dict, rename: Dict[Any, Any]) -> dict:
+    """`graph` (``_graph_for``'s) with the image keys renamed by `rename` (old -> new):
+    placements and every edge end that is an image key."""
+    from dataclasses import replace
+
+    from ome_zarr_pyramid.core.spatial import Transformation, is_image_key
+
+    def end(value):
+        return rename.get(value, value) if is_image_key(value) else value
+
+    def edge(e):
+        params = e.params
+        if e.type == "sequence":
+            params = dict(params)
+            params["transformations"] = [edge(t) if isinstance(t, Transformation) else t
+                                         for t in params.get("transformations") or []]
+        return replace(e, input=end(e.input), output=end(e.output), params=params)
+
+    return {"coordinate_systems": graph["coordinate_systems"],
+            "system_of": {rename.get(k, k): sid for k, sid in graph["system_of"].items()},
+            "coordinate_transformations": [edge(e) for e in graph["coordinate_transformations"]]}
+
+
+class OperationMismatchError(ValueError):
+    """A collection operation that does not fit every image: nothing is done (decision C-5,
+    all or nothing). The error names the images and how to narrow the collection first."""
+
+
+class _MappedLoader:
+    """The loader of an image of a mapped collection (C2): opens the source image (its own
+    node, so an image opened once is not read twice) and applies the operation."""
+
+    def __init__(self, source, op):
+        self.source, self.op = source, op
+
+    def __call__(self, node):
+        return self.op(self.source.pyramid)
+
+
+def _channel_count(row) -> int:
+    labels = row.get("channels") or ()
+    return len(labels) if labels else int(row.get("size_c") or 1)
+
+
+def _fits_set_channels(row, args, kwargs):
+    """(reason, hint) when ``set_channels(overrides)`` does not fit the image of `row`."""
+    overrides = args[0] if args else kwargs.get("overrides") or {}
+    labels = tuple(row.get("channels") or ())
+    for key in overrides:
+        if isinstance(key, str):
+            if key not in labels:
+                return (f"no channel labelled {key!r} (labels: {list(labels)})",
+                        f"coll.filter(channels=lambda labels: {key!r} in labels)")
+        elif not 0 <= int(key) < _channel_count(row):
+            return (f"{_channel_count(row)} channel(s), no channel {int(key)}",
+                    f"coll.filter(size_c=lambda n: (n or 1) > {int(key)})")
+    return None
+
+
+def _fits_set_display_range(row, args, kwargs):
+    level = kwargs.get("stats_level")
+    if isinstance(level, int) and not isinstance(level, bool) and \
+            not 0 <= level < int(row.get("nlevels") or 0):
+        return (f"{row.get('nlevels')} level(s), no level {level}",
+                f"coll.filter(nlevels=lambda n: n > {level})")
+    return None
+
+
+def _row_set_channels(row, args, kwargs):
+    """The table row after ``set_channels(overrides)``: the new labels (an image without
+    channels gets ``set_channels``' defaults, ``Channel {i}``, first)."""
+    overrides = args[0] if args else kwargs.get("overrides") or {}
+    labels = list(row.get("channels") or ()) or [f"Channel {i}" for i in range(_channel_count(row))]
+    index = {label: i for i, label in enumerate(labels) if label is not None}
+    for key, fields in overrides.items():
+        if isinstance(fields, dict) and "label" in fields:
+            labels[index[key] if isinstance(key, str) else int(key)] = fields["label"]
+    row["channels"] = tuple(labels)
+    return row
+
+
+def _row_dtype(row, dtype):
+    """`row` with its pixels in `dtype` (dtype and byte count)."""
+    dtype = np.dtype(dtype)
+    row["dtype"] = dtype.name
+    if row.get("shape"):
+        row["nbytes"] = int(np.prod(row["shape"])) * dtype.itemsize
+    return row
+
+
+def _row_rechunk(row, args, kwargs):
+    """The row after ``rechunk``: a chunk shape for every level gives level 0's chunks
+    (capped at its extent); a size, or one shape per level, is solved by the writer:
+    None, the row is read from the image."""
+    shape = args[0] if args else kwargs.get("chunk_shape")
+    if isinstance(shape, (tuple, list)) and row.get("shape") and len(shape) == len(row["shape"]):
+        row["chunks"] = tuple(min(int(c), int(n)) for c, n in zip(shape, row["shape"]))
+        return row
+    return None
+
+
+def _row_to_version(row, args, kwargs):
+    row["version"] = str(args[0] if args else kwargs.get("version"))
+    return row
+
+
+_COMPARISONS = ("__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__")
+_UNARY = ("__neg__", "__pos__", "__abs__", "__invert__")
+
+#: how an operation changes an image's table row, so a mapped collection's table comes
+#: from its source's (metadata only) instead of opening each image; an operation not here
+#: (or one giving None) has its rows read from the images it gives: arithmetic with a
+#: number, whose dtype follows numpy's promotion
+_ROWS = {"set_channels": _row_set_channels,
+         "set_display_range": lambda row, args, kwargs: row,      # windows: not in the table
+         "set_custom_metadata": lambda row, args, kwargs: row,    # custom blocks: neither
+         "rechunk": _row_rechunk, "to_version": _row_to_version,
+         "saturate_cast": lambda row, args, kwargs: _row_dtype(row, args[0] if args else kwargs["dtype"]),
+         **{name: (lambda row, args, kwargs: _row_dtype(row, bool)) for name in _COMPARISONS},
+         **{name: (lambda row, args, kwargs: row) for name in _UNARY}}
+
+
+def _fits_rechunk(row, args, kwargs):
+    shape = args[0] if args else kwargs.get("chunk_shape")
+    ndim = len(row.get("axes") or "")
+    if isinstance(shape, (tuple, list)) and len(shape) != ndim:
+        return (f"{ndim} axes ({row.get('axes')!r}), not {len(shape)}",
+                f"coll.filter(axes={row.get('axes')!r})")
+    return None
+
+_AXIS_ALIASES = {"channels": "c", "channel": "c", "time": "t"}
+#: from this many images to open for their table rows on, they are opened in threads
+_PARALLEL_ROWS = 8
+
+
+def _sizes(row) -> Dict[str, int]:
+    return dict(zip(row.get("axes") or "", row.get("shape") or ()))
+
+
+def _fits_isel(row, args, kwargs):
+    """``isel(**indexers)``: every axis there, every integer and list index in range."""
+    sizes = _sizes(row)
+    for name, index in kwargs.items():
+        axis = _AXIS_ALIASES.get(name, name)
+        if axis not in sizes:
+            return (f"no axis {axis!r} (axes {row.get('axes')!r})",
+                    f"coll.filter(axes=lambda axes: {axis!r} in axes)")
+        wanted = list(index) if isinstance(index, (list, tuple, range)) else \
+            [index] if isinstance(index, (int, np.integer)) else []
+        for i in wanted:
+            if not -sizes[axis] <= int(i) < sizes[axis]:
+                return (f"{sizes[axis]} along {axis}, no index {int(i)}",
+                        f"coll.filter(size_{axis}=lambda n: (n or 0) > {abs(int(i))})")
+    return None
+
+
+def _fits_squeeze(row, args, kwargs):
+    axes = args[0] if args else kwargs.get("axes")
+    sizes = _sizes(row)
+    for axis in (axes or ""):
+        if axis in sizes and sizes[axis] != 1:
+            return (f"{sizes[axis]} along {axis}: squeeze drops size-1 axes only",
+                    f"coll.filter(size_{axis}=1)")
+    return None
+
+
+def _levels_asked(args) -> List[int]:
+    out = []
+    for level in args:
+        if isinstance(level, (list, tuple, range)):
+            out += [int(v) for v in level]
+        elif isinstance(level, (int, np.integer)):
+            out.append(int(level))
+    return out
+
+
+def _fits_select_levels(row, args, kwargs):
+    """``select_levels(*levels)``: the image has every level asked for (a negative level
+    counts from the coarsest)."""
+    n = int(row.get("nlevels") or 0)
+    asked = _levels_asked(args)
+    needed = max([k + 1 for k in asked if k >= 0] + [-k for k in asked if k < 0] + [0])
+    if n < needed:
+        return (f"{n} level(s); select_levels{tuple(asked)} needs {needed}",
+                f"coll.filter(nlevels=lambda n: n >= {needed})")
+    return None
+
+
+def _dropped_isel(row, args, kwargs) -> set:
+    """The axes ``isel`` drops: those given an integer."""
+    return {_AXIS_ALIASES.get(name, name) for name, index in kwargs.items()
+            if isinstance(index, (int, np.integer))}
+
+
+def _dropped_squeeze(row, args, kwargs) -> set:
+    axes = args[0] if args else kwargs.get("axes")
+    sizes = _sizes(row)
+    names = axes if axes is not None else "".join(a for a in sizes if a not in "yx")
+    return {a for a in names if sizes.get(a) == 1 and a not in "yx"}
+
+
+#: the axes an operation drops from an image (from its table row): the graph rule of C4
+_DROPS = {"isel": _dropped_isel, "squeeze": _dropped_squeeze}
+#: operations that change an image's geometry (shape, levels, axes): RFC 8 label nodes of
+#: the tree do not follow them yet (decision C-2), so they warn
+_GEOMETRY = ("isel", "squeeze", "select_levels", "downscale")
+
+#: an operation's fit check, run on the table before anything is done (C3): a function of
+#: an image's row and the call's arguments -> None, or (why it does not fit, a filter that
+#: narrows the collection to the images it fits)
+_FITS = {"set_channels": _fits_set_channels, "set_display_range": _fits_set_display_range,
+         "isel": _fits_isel, "squeeze": _fits_squeeze, "select_levels": _fits_select_levels,
+         "rechunk": _fits_rechunk}
+
+
+class VaryingPropertyError(ValueError):
+    """A collection's read property (``axes``, ``dtype``, ...) whose value differs between
+    its images: there is no one value to return (decision C-8). The error names the
+    images that differ; ``coll.table`` gives each image's value."""
 
 
 def _crowded(keys) -> List[Tuple[List, List[str]]]:
@@ -219,10 +578,24 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     channels = list(getattr(meta, "channels", None) or [])
     n_channels = base_shape[axes.index("c")] if "c" in axes else 1
     if channels and len(channels) == n_channels:
+        from ome_zarr_pyramid.core.pyramid import auto_channel_color
+        given = [_hex(getattr(ch, "color", None)) for ch in channels]
+        taken, k = {c for c in given if c}, 0
         overrides = {}
         for i, ch in enumerate(channels):
-            # unnamed: the default label "Channel {i}" stays; no colour: white
-            fields = {"color": _hex(getattr(ch, "color", None)) or "FFFFFF"}
+            # unnamed: the default label "Channel {i}" stays. No colour: one channel
+            # white (shown as grey); of several, the next of ozp's distinct colours
+            # (red, green, blue, ...) no other channel has, so they stay apart (C13)
+            color = given[i]
+            if color is None and n_channels == 1:
+                color = "FFFFFF"
+            elif color is None:
+                while auto_channel_color(k) in taken:
+                    k += 1
+                color = auto_channel_color(k)
+                taken.add(color)
+                k += 1
+            fields = {"color": color}
             if getattr(ch, "name", None):
                 fields["label"] = str(ch.name)
             overrides[i] = fields
@@ -400,6 +773,14 @@ def _tree_entries(tree) -> Iterator[Tuple[Tuple[Tuple[str, int], ...], Any]]:
     else:
         yield from fields(tree, lambda ref: int(ref.id) if ref.id.isdigit() else 0,
                           lambda a: (("acquisition", a),))
+
+
+def _same(a, b) -> bool:
+    """Whether two property values are equal (False when they cannot say: arrays)."""
+    try:
+        return bool(a == b)
+    except Exception:                                       # noqa: BLE001
+        return a is b
 
 
 def _order_key(value):
@@ -598,6 +979,17 @@ class PyramidCollection(Mapping):
                 check_end(step.input, edge)
                 check_end(step.output, edge)
 
+    def validate(self, *, images: bool = True) -> "PyramidCollection":
+        """Check the collection as ``Pyramid.validate`` checks one image, and return it (so
+        it chains): the graph's invariants (:meth:`check_invariants`), then every image's
+        ``validate()``. ``images=False`` checks the graph only and opens no image (a store
+        read lazily). Raises on the first problem found."""
+        self.check_invariants(images=images)
+        if images:
+            for key in self._pyramids:
+                self[key].validate()
+        return self
+
     def components(self, *, warn: bool = True) -> List["Component"]:
         """The graph's connected components (plan 3.6), the unit a writer gives one owner.
         Nodes: the shared systems and every entry's own system; edges: the positions
@@ -712,6 +1104,13 @@ class PyramidCollection(Mapping):
     @classmethod
     def from_zarr(cls, path, *, storage_options: Optional[dict] = None,
                   add_missing_translation: bool = False) -> "PyramidCollection":
+        """The collection stored at `path`; a shortcut for ``io.read_collection``, where the layouts it reads are described."""
+        return _io().read_collection(path, storage_options=storage_options,
+                                     add_missing_translation=add_missing_translation)
+
+    @classmethod
+    def _from_zarr(cls, path, *, storage_options: Optional[dict] = None,
+                   add_missing_translation: bool = False) -> "PyramidCollection":
         """The collection stored at `path`: an NGFF 0.4 / 0.5 / 0.6 plate (keyed ``plate``,
         ``acquisition``, ``well``, ``field``, as micro-reader keys plate images), a well
         on its own (keyed as in its plate when it carries ``eubi:images``, else
@@ -955,6 +1354,11 @@ class PyramidCollection(Mapping):
         objects) gives each system its images name a minimal definition: the id, and the
         axes of the images in it (3.26). An image that names no system is unplaced, its
         position still written as its translation (5.12)."""
+        if isinstance(file, (str, os.PathLike)):
+            raise TypeError(
+                f"from_file takes an opened file, not a path: "
+                f"PyramidCollection.from_file(micro_reader.open({str(file)!r})). An OME-Zarr "
+                f"store is read with PyramidCollection.from_zarr(path) or io.read(path)")
         out = {}
         system_of = {}
         for image in file.images:
@@ -990,14 +1394,24 @@ class PyramidCollection(Mapping):
         coll.check_invariants()
         return coll
 
-    @validating
     def write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
                     overwrite: bool = False, storage_options: Optional[dict] = None,
                     writer: Optional[Callable] = None, document: Optional[str] = None,
-                    **write_kwargs) -> Dict[str, str]:
+                    **write_kwargs) -> str:
+        """Write plate `plate` of the collection as an NGFF plate; a shortcut for
+        ``io.write_plate``. See :meth:`_write_plate` for the options."""
+        return _io().write_plate(self, path, plate=plate, version=version,
+                                 overwrite=overwrite, storage_options=storage_options,
+                                 writer=writer, document=document, **write_kwargs)
+
+    @validating
+    def _write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
+                     overwrite: bool = False, storage_options: Optional[dict] = None,
+                     writer: Optional[Callable] = None, document: Optional[str] = None,
+                     **write_kwargs) -> str:
         """Write plate `plate` of the collection as an NGFF plate: each image in turn
         (``io.write_pyramid``, or `writer`, with `write_kwargs`), then the plate and
-        well metadata. Returns ``{"<well>/<image>": path}``. See
+        well metadata. Returns `path` (`document`, when given), for ``io.read``. See
         :func:`ome_zarr_pyramid.core.ngff_plate.write_plate` for `version` and
         `overwrite`. ``version="rfc8"`` writes it as RFC 8 (see `write_collection`;
         `document` puts the plate's RFC 8 document in a standalone ``.json``).
@@ -1008,6 +1422,7 @@ class PyramidCollection(Mapping):
         0.6): open the file with ``tiles="mosaic"``, or write ``version="rfc8"``. Images
         outside the plate (a slide's label or preview, keyed without a plate) are not
         part of it."""
+        self._refuse_empty("write_plate")
         from ome_zarr_pyramid.core.ngff_plate import check_fields, write_plate
         from ome_zarr_pyramid.core.nodes import MultiscaleNode
         from ome_zarr_pyramid.core.plates import plate_nodes
@@ -1034,15 +1449,14 @@ class PyramidCollection(Mapping):
                 indices.append(dict(key))
             fields.append((well.name, indices))
         if version == "rfc8":
-            from ome_zarr_pyramid.core import rfc8_keys
-            from ome_zarr_pyramid.core.rfc8 import write_rfc8
-            return write_rfc8(rfc8_keys.annotate(self, node, key_of), path, document=document,
-                              overwrite=overwrite, storage_options=storage_options,
-                              writer=writer, **write_kwargs)
+            return self._write_rfc8(node, key_of, path, document=document, overwrite=overwrite,
+                                    storage_options=storage_options, writer=writer,
+                                    **write_kwargs)
         check_fields(node.name, fields)        # one image per field, in every version
         node = self._plate_with_keys(node, key_of, version)
-        return write_plate(node, path, version=version, overwrite=overwrite,
-                           storage_options=storage_options, writer=writer, **write_kwargs)
+        write_plate(node, path, version=version, overwrite=overwrite,
+                    storage_options=storage_options, writer=writer, **write_kwargs)
+        return _written(path)
 
     def _plate_with_keys(self, node, key_of, version):
         """A copy of plate `node` carrying the ``eubi:`` keys of 0.4 / 0.5 (plan 5.7): each
@@ -1082,15 +1496,25 @@ class PyramidCollection(Mapping):
             image_copy.attributes[ek.INDEX_KEY] = ek.index_json(key)
         return out
 
-    @validating
     def write_series(self, path, *, version: Optional[str] = None, overwrite: bool = False,
                      ome_xml: Optional[str] = None, storage_options: Optional[dict] = None,
                      writer: Optional[Callable] = None, document: Optional[str] = None,
-                     **write_kwargs) -> Dict[str, str]:
+                     **write_kwargs) -> str:
+        """Write every entry as one series of a bioformats2raw layout; a shortcut for
+        ``io.write_series``. See :meth:`_write_series` for the options."""
+        return _io().write_series(self, path, version=version, overwrite=overwrite,
+                                  ome_xml=ome_xml, storage_options=storage_options,
+                                  writer=writer, document=document, **write_kwargs)
+
+    @validating
+    def _write_series(self, path, *, version: Optional[str] = None, overwrite: bool = False,
+                      ome_xml: Optional[str] = None, storage_options: Optional[dict] = None,
+                      writer: Optional[Callable] = None, document: Optional[str] = None,
+                      **write_kwargs) -> str:
         """Write every entry as one series of a bioformats2raw layout (``<path>/0``,
         ``<path>/1``, ..., in key order; a collection read from that layout keeps its
         series paths), then the root metadata and the ``OME`` group with its OME-XML.
-        Returns ``{series path: path}``. `ome_xml` is stored as ``OME/METADATA.ome.xml``
+        Returns `path` (`document`, when given), for ``io.read``. `ome_xml` is stored as ``OME/METADATA.ome.xml``
         (default: the source layout's when it still fits, else a minimal one). See
         :func:`ome_zarr_pyramid.core.ngff_series.write_series`.
 
@@ -1103,6 +1527,8 @@ class PyramidCollection(Mapping):
         import warnings
 
         from ome_zarr_pyramid.core.ngff_series import LAYOUT_KEY, write_series
+
+        self._refuse_empty("write_series")
         from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
 
         tree = self.tree
@@ -1129,14 +1555,13 @@ class PyramidCollection(Mapping):
                 child = node.add(MultiscaleNode(str(i), self[key]))
                 key_of[id(child)] = key
         if version == "rfc8":
-            from ome_zarr_pyramid.core import rfc8_keys
-            from ome_zarr_pyramid.core.rfc8 import write_rfc8
-            return write_rfc8(rfc8_keys.annotate(self, node, key_of), path,
-                              document=document, overwrite=overwrite,
-                              storage_options=storage_options, writer=writer, **write_kwargs)
+            return self._write_rfc8(node, key_of, path, document=document, overwrite=overwrite,
+                                    storage_options=storage_options, writer=writer,
+                                    **write_kwargs)
         node = self._series_with_keys(node, keys, version)
-        return write_series(node, path, version=version, overwrite=overwrite, ome_xml=ome_xml,
-                            storage_options=storage_options, writer=writer, **write_kwargs)
+        write_series(node, path, version=version, overwrite=overwrite, ome_xml=ome_xml,
+                     storage_options=storage_options, writer=writer, **write_kwargs)
+        return _written(path)
 
     def _series_with_keys(self, node, keys, version):
         """A copy of series layout `node` (its images are the entries `keys`, in order)
@@ -1165,22 +1590,38 @@ class PyramidCollection(Mapping):
 
     def write_collection(self, path, *, version: str = "rfc8", document: Optional[str] = None,
                          overwrite: bool = False, storage_options: Optional[dict] = None,
-                         writer: Optional[Callable] = None, **write_kwargs) -> Dict[str, str]:
+                         writer: Optional[Callable] = None,
+                         **write_kwargs) -> str:
+        """Write the collection as NGFF RFC 8; a shortcut for ``io.write_collection``. See :meth:`_write_collection` for the options."""
+        return _io().write_collection(self, path, version=version, document=document,
+                                      overwrite=overwrite, storage_options=storage_options,
+                                      writer=writer, **write_kwargs)
+
+    @validating
+    def _write_collection(self, path, *, version: str = "rfc8", document: Optional[str] = None,
+                          overwrite: bool = False, storage_options: Optional[dict] = None,
+                          writer: Optional[Callable] = None, **write_kwargs) -> str:
         """Write the collection as NGFF RFC 8 (``version="rfc8"``, the only one: a 0.4 /
         0.5 plate or series is `write_plate` / `write_series`): each image as an RFC 8
         multiscale under `path`, then the collection document in `path`'s ``zarr.json``,
         or in the standalone `document` (``.json``). The tree as read or built
         (plates, wells, nested collections, attributes) is written as it is; a
         collection without one is written as a flat collection of its images, in key
-        order. Returns ``{image path: written path}``. See
-        :func:`ome_zarr_pyramid.core.rfc8.write_rfc8`."""
+        order.         Returns `path` (`document`, when given), for ``io.read``. See
+        :func:`ome_zarr_pyramid.core.rfc8.write_rfc8`.
+
+        A selection (``coll.select(plate=0, well=3)``) is written with the part of the
+        tree that holds its images: collections left empty are dropped, as are label and
+        derived images whose source is not written; names, attributes and the plate's
+        rows and columns stay as read."""
         from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
-        from ome_zarr_pyramid.core.rfc8 import write_rfc8, tree_entries
+        from ome_zarr_pyramid.core.rfc8 import tree_entries
+
+        self._refuse_empty("write_collection")
 
         if version != "rfc8":
             raise ValueError(f"write_collection writes version='rfc8'; NGFF {version} plates "
                              f"and series are write_plate / write_series")
-        from ome_zarr_pyramid.core import rfc8_keys
 
         tree = self.tree
         key_of = self._key_of_nodes()
@@ -1191,17 +1632,37 @@ class PyramidCollection(Mapping):
             images = [n for _, n in (_tree_entries(tree) if self.plates else tree_entries(tree))]
             if any(id(n) not in held and id(getattr(n, "_pyramid", None)) not in held
                    and getattr(n, "_alias_of", None) is None for n in images):
-                raise ValueError("this collection is a selection of its tree; write it from "
-                                 "the whole collection")
-            node = tree
+                # a selection (coll.select(well=3)): RFC 8 holds any tree, so the tree cut
+                # to the images the collection holds is written
+                node = _pruned(tree, key_of)
+            else:
+                node = tree
         else:
             node = CollectionNode(str(self.name or "collection"))
             for i, key in enumerate(sorted(self._pyramids)):
                 child = node.add(MultiscaleNode(str(i), self[key]))
                 key_of[id(child)] = key
-        return write_rfc8(rfc8_keys.annotate(self, node, key_of),
-                          path, document=document, overwrite=overwrite,
-                          storage_options=storage_options, writer=writer, **write_kwargs)
+        return self._write_rfc8(node, key_of, path, document=document, overwrite=overwrite,
+                                storage_options=storage_options, writer=writer, **write_kwargs)
+
+    def _write_rfc8(self, node, key_of, path, **options) -> str:
+        """`node` (the part of the tree being written) as RFC 8; returns where to read it
+        back (the standalone document when there is one, else `path`)."""
+        from ome_zarr_pyramid.core import rfc8_keys
+        from ome_zarr_pyramid.core.rfc8 import write_rfc8
+
+        write_rfc8(rfc8_keys.annotate(self, node, key_of), path, **options)
+        return _written(path, options.get("document"))
+
+    def _refuse_empty(self, where: str) -> None:
+        """A collection without images is not written: an empty store reads back as
+        nothing, and an empty selection is mostly a value that matched no image."""
+        if not self._pyramids:
+            raise ValueError(
+                f"{where}: the collection holds no image, so nothing is written. Was it "
+                f"selected empty? select() compares index values: well=3 or "
+                f"well=coll.plates[0].well_index('C3'), not a Well object "
+                f"(coll.plates[0].wells[3].as_collection() gives a well's images)")
 
     def _key_of_nodes(self) -> Dict[int, Any]:
         """``id`` of each entry's value (its tree node, or its pyramid) -> its key (for the
@@ -1250,6 +1711,19 @@ class PyramidCollection(Mapping):
         clone._spatial_set_name = file_stem(self.name) if self.name else None
         return clone
 
+    def only(self):
+        """The one pyramid of a one-image collection (a file holding one image, say), as
+        :meth:`pyramid` gives it: it keeps the system it is placed in. A collection of
+        any other size raises ``ValueError`` listing its keys: pick one with
+        ``coll.pyramid(key)`` or narrow it with ``select`` / ``filter`` first."""
+        if len(self._pyramids) != 1:
+            keys = [dict(k) for k in self._pyramids]
+            shown = ", ".join(map(str, keys[:5])) + (" ..." if len(keys) > 5 else "")
+            raise ValueError(f"only(): the collection holds {len(keys)} images, not one"
+                             f"{': ' + shown if keys else ''}; take one with "
+                             f"coll.pyramid(key), or narrow it with select / filter first")
+        return self.pyramid(next(iter(self._pyramids)))
+
     def __iter__(self) -> Iterator[Tuple[Tuple[str, int], ...]]:
         return iter(self._pyramids)
 
@@ -1266,22 +1740,391 @@ class PyramidCollection(Mapping):
         return sorted(self._names.union(n for key in self._pyramids for n, _ in key))
 
     def select(self, **index) -> "PyramidCollection":
-        """The entries whose index matches every given value: ``select(view=1)``. A name
-        the collection's keys do not have raises ``KeyError`` naming the ones they have;
-        a known name whose value matches nothing gives an empty collection. (A plate
-        field's ``Field.select`` only filters.)"""
-        known = self._index_names()
-        unknown = [name for name in index if name not in known]
-        if unknown:
-            hint = ""
-            # micro-reader 0.1.0 renamed the index; this hint goes together with
-            # micro-reader's index guard (plan 3.24)
-            if "scene" in unknown and SERIES_INDEX in known:
-                hint = f"; 'scene' is now called {SERIES_INDEX!r} (micro-reader 0.1.0)"
-            raise KeyError(f"select: the collection has no index {unknown[0]!r}; its "
-                           f"indices are {known}{hint}")
-        return self._derive([k for k in self._pyramids
-                             if all(dict(k).get(name) == value for name, value in index.items())])
+        """The entries whose index matches every given value, as micro-reader's
+        ``File.select`` (which gives a list of images): ``select(view=1)``,
+        ``select(plate=0, well=12)``. An image without an index given does not match it.
+        ``select`` slices along the indices (containment and orthogonal); for queries over
+        the table's columns (dtype, sizes, units, functions of them) use :meth:`filter`
+        (decision C-6).
+
+        - A value may be a list, tuple, range or set: any of them (``illumination=[2, 3]``).
+        - ``well`` is a well's place in ``plates[p].wells`` (as in micro-reader) or its name
+          (``well="C3"``, in each plate).
+        - ``row`` and ``column`` select a plate's wells by row and column: 0-based numbers
+          (as ``Well.row`` / ``Well.column``: ``column=2`` is the column named "3") or
+          names (``row="C"``, ``column="3"``), one or several (``row=["B", "C"]``,
+          ``column=range(2, 5)``). They are another address of the well, so they do not
+          go with ``well``.
+        - A ``Plate``, ``Well``, ``Field`` or ``Acquisition`` object is no value (TypeError):
+          ``coll.plates[0].wells[3].as_collection()`` is a well's images.
+
+        A name that is neither one of micro-reader's index names nor one the collection's
+        keys carry raises ``KeyError``; a known name no image has gives an empty
+        collection. The tree is kept as it is (a plate keeps every well); ``drop_empty()``
+        drops what holds no image."""
+        check_index_names(index, self._index_names(), "select", extra=WELL_ADDRESS)
+        wanted = {name: index_values(name, value) for name, value in index.items()}
+        in_wells = self._keys_in_wells(wanted)
+        keys = []
+        for key in self._pyramids:
+            if in_wells is not None and key not in in_wells:
+                continue
+            values = dict(key)
+            if all(values.get(name) in allowed for name, allowed in wanted.items()):
+                keys.append(key)
+        return self._derive(keys)
+
+    def _keys_in_wells(self, wanted: Dict[str, tuple]) -> Optional[set]:
+        """The keys of the wells `wanted` names by name, row or column (those entries are
+        taken out of `wanted`), or None when it names wells by place only (matched as
+        any other index)."""
+        rows, columns = wanted.pop("row", None), wanted.pop("column", None)
+        wells = wanted.get("well")
+        if wells is not None and (rows is not None or columns is not None):
+            raise TypeError("select: give well= or row= / column=, not both (row and column "
+                            "are another address of the well)")
+        names = {v for v in wells if isinstance(v, str)} if wells is not None else set()
+        if rows is None and columns is None and not names:
+            return None
+        plates = self.plates
+        if not plates:
+            raise ValueError("select: row=, column= and well names select a plate's wells; "
+                             "the collection holds no plate")
+        if wells is not None:
+            del wanted["well"]
+        places = {v for v in wells if not isinstance(v, str)} if wells is not None else set()
+        out = set()
+        for plate in plates:
+            for w, well in enumerate(plate.wells):
+                if wells is not None:
+                    hit = w in places or well.name in names
+                else:
+                    hit = _on_axis(rows, well.row, plate.rows) and \
+                        _on_axis(columns, well.column, plate.columns)
+                if hit:
+                    out.update(key for field in well.fields for key in field.keys)
+        return out
+
+    def drop_empty(self) -> "PyramidCollection":
+        """This collection with the containers that hold none of its images dropped from
+        its tree: a field without images, then a well without fields, a plate without
+        wells and any other collection left empty (as pandas' ``dropna``:
+        ``coll.select(plate=0, well=12).drop_empty()``). The positional indices are
+        numbered anew to match: ``"plate": p`` is ``plates[p]`` and ``"well": w`` is
+        ``plates[p].wells[w]``, as in micro-reader, so a well's key can change. Every other
+        index (field, series, tile, view, illumination, ...) keeps its value: it is the
+        source's own number. The coordinate-system graph follows the new keys; a plate keeps
+        its rows and columns. This collection is not changed."""
+        from ome_zarr_pyramid.core.nodes import CollectionNode, MultiscaleNode
+        from ome_zarr_pyramid.core.plates import plate_nodes
+
+        keys = list(self._pyramids)
+        tree = self.tree
+        if not isinstance(tree, CollectionNode):
+            return self._derive(keys)
+        key_of = self._key_of_nodes()
+        copies: Dict[int, Any] = {}
+        out = _pruned(tree, key_of, keep_wells=False, copies=copies)
+        rename: Dict[Any, Any] = {}
+        new_plates = plate_nodes(out)
+        for plate in self.plates:
+            copied = copies.get(id(plate.node))
+            p_new = next((i for i, n in enumerate(new_plates) if n is copied), None)
+            if p_new is None:
+                continue
+            for well in plate.wells:
+                copied_well = copies.get(id(well.node))
+                w_new = next((i for i, n in enumerate(copied.children) if n is copied_well),
+                             None)
+                if w_new is None:
+                    continue
+                for field in well.fields:
+                    for key in field.keys:
+                        rename[key] = tuple((n, p_new if n == "plate" else
+                                             w_new if n == "well" else v) for n, v in key)
+        values = {}
+        for key in keys:
+            value = self._pyramids[key]
+            if isinstance(value, MultiscaleNode):
+                value = copies.get(id(value), value)   # the tree's own node, for the writers
+            values[rename.get(key, key)] = value
+        new = type(self)(values, name=self.name, tree=out,
+                         **_renamed_graph(self._graph_for(keys), rename))
+        new._names = frozenset(self._index_names())
+        new._source = self._source
+        return new
+
+    # -- operations: every Pyramid operation through one _map (decision C-9) -------------
+    def _map(self, name: str, *args, **kwargs) -> "PyramidCollection":
+        """`Pyramid.<name>(*args, **kwargs)` on every image (C2), as a new collection with
+        the same keys, a copy of the tree and the same coordinate-system graph. Lazy: an
+        image not opened yet is opened, and the operation applied, when it is first used
+        (read, or written); an image already open, or held in memory, gets it now (its
+        arrays stay lazy). An operation that does not fit every image is refused before
+        anything is done, naming the images (C3, decision C-5); the check runs on the
+        table, so it opens no image. Only ozp's own operations go through here: a user's
+        function on every image is pyrops'."""
+        from ome_zarr_pyramid.core.nodes import MultiscaleNode, Node
+
+        fits, drops = _FITS.get(name), _DROPS.get(name)
+        dropped: Dict[Any, set] = {}
+        if fits is not None or drops is not None:
+            table = self.table
+            rows = list(zip(table.keys, table.rows))
+            if fits is not None:
+                self._refuse(name, [(key, found) for key, row in rows
+                                    for found in [fits(row, args, kwargs)] if found is not None])
+            if drops is not None:
+                dropped = {key: drops(row, args, kwargs) for key, row in rows}
+                # the graph rule (C4): an image an edge runs through keeps its axes
+                ends = self._edge_ends()
+                self._refuse(name, [
+                    (key, (f"an edge of the coordinate-system graph (affine, registration) "
+                           f"runs through it, and it would lose axis {', '.join(sorted(gone))}",
+                           f"a slice keeps the axis: {name}("
+                           f"{sorted(gone)[0]}=slice(i, i + 1))" if name == "isel" else
+                           "leave those images out first: coll.select(...)"))
+                    for key, gone in dropped.items() if gone and key in ends])
+        # RFC 8 label nodes follow their image's geometry (decision C-2), by the Pyramid
+        # rule itself: each label attached to its image, the operation applied, the label
+        # taken back. Done now (images with label nodes are opened, metadata only), so a
+        # label that cannot follow refuses the operation before anything is done.
+        followed = self._labels_followed(name, args, kwargs) if name in _GEOMETRY else {}
+
+        def op(pyr):
+            return getattr(pyr, name)(*args, **kwargs)
+
+        tree, out, copies = self.tree, None, {}
+        if isinstance(tree, Node):
+            out = tree.copy()
+            pairs = list(zip(tree.walk(), out.walk()))
+            copies = {id(o): c for o, c in pairs}
+            for o, c in pairs:                    # an alias repeats the image's copy
+                first = getattr(o, "_alias_of", None)
+                if first is not None and id(first) in copies:
+                    c._alias_of = copies[id(first)]
+                    c.loader = lambda _n, first=c._alias_of: first.pyramid
+        values, results = {}, {}
+        for key, value in self._pyramids.items():
+            if isinstance(value, MultiscaleNode):
+                node = copies.get(id(value)) or value.copy()
+                if value.loaded:
+                    node.pyramid = op(value.pyramid)
+                else:
+                    node.pyramid = None
+                    node.loader = _MappedLoader(value, op)
+                values[key] = node
+            else:                                 # a pyramid in memory
+                results[id(value)] = values[key] = op(value)
+        for o, c in (zip(tree.walk(), out.walk()) if out is not None else ()):
+            held = getattr(o, "_pyramid", None)
+            if isinstance(o, MultiscaleNode) and id(held) in results:
+                c.pyramid = results[id(held)]
+            if id(o) in followed:                     # an RFC 8 label node: its label after
+                c.pyramid = followed[id(o)]
+        graph = self._graph_for(list(self._pyramids))
+        if any(dropped.values()):
+            graph["coordinate_systems"] = self._systems_without(graph, dropped)
+        new = type(self)(values, name=self.name, tree=out, **graph)
+        new._names = frozenset(self._index_names())
+        new._source = self._source
+        if name in _ROWS:                         # its table from this one's, opening nothing
+            new._rows_from = (self, _ROWS[name], args, kwargs)
+        return new
+
+    def _refuse(self, name: str, misfits) -> None:
+        """Decision C-5: `misfits` (``[(key, (why, a narrowing hint))]``) refuse the whole
+        operation, naming up to five images."""
+        if not misfits:
+            return
+        shown = "; ".join(f"{dict(k)}: {why}" for k, (why, _) in misfits[:5])
+        more = f" and {len(misfits) - 5} more" if len(misfits) > 5 else ""
+        raise OperationMismatchError(
+            f"{name}: does not fit {len(misfits)} of the collection's {len(self)} images, so "
+            f"nothing is done: {shown}{more}. Narrow the collection first, e.g. "
+            f"{misfits[0][1][1]}")
+
+    def _edge_ends(self) -> set:
+        """The image keys an edge of the graph runs through (not placements)."""
+        from ome_zarr_pyramid.core.spatial import is_image_key, steps
+        out = set()
+        for edge in self._edges:
+            for step in (edge,) + (steps(edge) if edge.type == "sequence" else ()):
+                out.update(end for end in (step.input, step.output) if is_image_key(end))
+        return out
+
+    @staticmethod
+    def _systems_without(graph: dict, dropped: Dict[Any, set]) -> list:
+        """The graph's systems, a system losing an axis every image placed in it dropped
+        (an image may have fewer axes than its system, so one that keeps it keeps it)."""
+        from ome_zarr_pyramid.core.spatial import CoordinateSystem
+        out = []
+        for cs in graph["coordinate_systems"]:
+            members = [k for k, sid in graph["system_of"].items() if sid == cs.id]
+            if cs.axes is not None and members:
+                gone = set.intersection(*(set(dropped.get(k, ())) for k in members))
+                if gone:
+                    cs = CoordinateSystem(cs.id, cs.name,
+                                          tuple(a for a in cs.axes if a.name not in gone),
+                                          cs.estimated, dict(cs.extra))
+            out.append(cs)
+        return out
+
+    def _labels_followed(self, name: str, args, kwargs) -> Dict[int, Any]:
+        """``id`` of each RFC 8 label node of the tree whose image is in the collection ->
+        its label after `name` (decision C-2): the label attached to its image, the
+        Pyramid operation applied (its label rule), the label taken back. A label that
+        cannot follow raises :class:`LabelMismatchError` naming the image."""
+        from ome_zarr_pyramid.core.nodes import LabelsAttribute, MultiscaleNode, Node
+        from ome_zarr_pyramid.core.pyramid import LabelMismatchError
+
+        tree = self.tree
+        if not isinstance(tree, Node):
+            return {}
+        by_id = {n.id: n for n in tree.walk() if isinstance(n, MultiscaleNode) and n.id}
+        key_of = self._key_of_nodes()
+        out: Dict[int, Any] = {}
+        for node in tree.walk():
+            if not isinstance(node, MultiscaleNode):
+                continue
+            labels = node.attributes.get("labels")
+            if not isinstance(labels, LabelsAttribute) or len(labels.source) != 1:
+                continue
+            image = by_id.get(labels.source[0].id)
+            key = key_of.get(id(image), key_of.get(id(getattr(image, "_pyramid", None)))) \
+                if image is not None else None
+            if key is None:
+                continue                          # its image is not in this collection
+            try:
+                with_label = self[key].add_image_label(node.pyramid, "label")
+                out[id(node)] = getattr(with_label, name)(*args, **kwargs).labels["label"]
+            except LabelMismatchError as exc:
+                raise LabelMismatchError(f"image {dict(key)}: {exc}") from None
+        return out
+
+    # -- axes and levels (C4): the Pyramid methods on every image ------------------------
+    def isel(self, **indexers) -> "PyramidCollection":
+        """`Pyramid.isel` on every image (``coll.isel(c=0)``, ``coll.isel(z=slice(10, 20))``):
+        an int drops the axis, a slice or list keeps it; scales and translations follow, so
+        each image keeps its place. An axis or index an image does not have refuses the
+        call, naming the images. Dropping an axis of an image an edge of the
+        coordinate-system graph runs through is refused (a slice keeps the axis); a system
+        whose images all drop an axis loses it. Lazy."""
+        return self._map("isel", **indexers)
+
+    def squeeze(self, axes: Optional[str] = None) -> "PyramidCollection":
+        """`Pyramid.squeeze` on every image: size-1 axes dropped (each image its own, or
+        those of `axes`, which must be size 1 in every image). The graph as for
+        :meth:`isel`. Lazy."""
+        return self._map("squeeze", axes)
+
+    def select_levels(self, *levels) -> "PyramidCollection":
+        """`Pyramid.select_levels` on every image (``coll.select_levels(0, 1, 2)``). A level
+        some image does not have refuses the call, naming the images:
+        ``coll.filter(nlevels=lambda n: n >= 3).select_levels(0, 1, 2)``. Lazy."""
+        return self._map("select_levels", *levels)
+
+    def downscale(self, **options) -> "PyramidCollection":
+        """`Pyramid.downscale` on every image (``coll.downscale(n_layers=4)``): each image's
+        own plan from its level 0, built when it is written. Lazy."""
+        return self._map("downscale", **options)
+
+    # -- storage and values (C5) ---------------------------------------------------------
+    def rechunk(self, chunk_shape=None, chunk_size_mb=None) -> "PyramidCollection":
+        """`Pyramid.rechunk` on every image: the storage chunks written (a shape, or a size
+        dyna solves per image). A chunk shape of another length than an image's axes refuses
+        the call, naming the images. Lazy."""
+        return self._map("rechunk", chunk_shape=chunk_shape, chunk_size_mb=chunk_size_mb)
+
+    def to_version(self, version: str) -> "PyramidCollection":
+        """`Pyramid.to_version` on every image (``"0.4"``, ``"0.5"``, ``"0.6"``). A plate or
+        series is written in the version ``write`` is given; this sets each image's own.
+        Lazy."""
+        return self._map("to_version", version)
+
+    def saturate_cast(self, dtype) -> "PyramidCollection":
+        """`Pyramid.saturate_cast` on every image: ``dtype``, clipped instead of wrapped
+        (uint16 4000 -> uint8 255). Lazy."""
+        return self._map("saturate_cast", dtype)
+
+    def _operate(self, name: str, other) -> "PyramidCollection":
+        """An operator with a number, image by image (``coll > 128``, ``coll * 2``,
+        ``65535 - coll``). Two collections do not combine yet (decision C-4)."""
+        import numbers
+        if isinstance(other, (numbers.Number, np.generic)):
+            return self._map(name, other)
+        if isinstance(other, PyramidCollection):
+            raise TypeError(
+                f"{name}: two collections do not combine image by image yet (decision C-4); "
+                f"combine their images one by one, e.g. "
+                f"PyramidCollection({{k: a[k] - b[k] for k in a}})")
+        raise TypeError(f"{name}: a collection combines with a number, not a "
+                        f"{type(other).__name__}; apply it to each image (coll[key])")
+
+    # arithmetic, comparison and bitwise operators with a number, as on a Pyramid; == and
+    # != are elementwise too (decision C-1): with anything but a number they say whether
+    # it is the same collection, so `coll in some_list` works
+    def __add__(self, o): return self._operate("__add__", o)
+    def __radd__(self, o): return self._operate("__radd__", o)
+    def __sub__(self, o): return self._operate("__sub__", o)
+    def __rsub__(self, o): return self._operate("__rsub__", o)
+    def __mul__(self, o): return self._operate("__mul__", o)
+    def __rmul__(self, o): return self._operate("__rmul__", o)
+    def __truediv__(self, o): return self._operate("__truediv__", o)
+    def __rtruediv__(self, o): return self._operate("__rtruediv__", o)
+    def __floordiv__(self, o): return self._operate("__floordiv__", o)
+    def __rfloordiv__(self, o): return self._operate("__rfloordiv__", o)
+    def __mod__(self, o): return self._operate("__mod__", o)
+    def __rmod__(self, o): return self._operate("__rmod__", o)
+    def __pow__(self, o): return self._operate("__pow__", o)
+    def __rpow__(self, o): return self._operate("__rpow__", o)
+    def __lt__(self, o): return self._operate("__lt__", o)
+    def __le__(self, o): return self._operate("__le__", o)
+    def __gt__(self, o): return self._operate("__gt__", o)
+    def __ge__(self, o): return self._operate("__ge__", o)
+    def __and__(self, o): return self._operate("__and__", o)
+    def __rand__(self, o): return self._operate("__rand__", o)
+    def __or__(self, o): return self._operate("__or__", o)
+    def __ror__(self, o): return self._operate("__ror__", o)
+    def __xor__(self, o): return self._operate("__xor__", o)
+    def __rxor__(self, o): return self._operate("__rxor__", o)
+
+    def __eq__(self, o):
+        import numbers
+        if isinstance(o, (numbers.Number, np.generic)):
+            return self._map("__eq__", o)
+        return NotImplemented                     # anything else: the same collection or not
+
+    def __ne__(self, o):
+        import numbers
+        if isinstance(o, (numbers.Number, np.generic)):
+            return self._map("__ne__", o)
+        return NotImplemented
+
+    __hash__ = None                               # a Mapping: not hashable, as before
+
+    def __neg__(self): return self._map("__neg__")
+    def __pos__(self): return self._map("__pos__")
+    def __abs__(self): return self._map("__abs__")
+    def __invert__(self): return self._map("__invert__")
+
+    def set_channels(self, overrides) -> "PyramidCollection":
+        """`Pyramid.set_channels` on every image: the same channel changes everywhere
+        (``coll.set_channels({0: {"label": "DAPI", "color": "blue"}})``). A channel index
+        or label an image does not have refuses the call, naming the images. Lazy."""
+        return self._map("set_channels", overrides)
+
+    def set_display_range(self, method: str = "minmax", **options) -> "PyramidCollection":
+        """`Pyramid.set_display_range` on every image: each image's windows from its own
+        data (``method``, ``p_low``, ``p_high``, ``stats_level``, ...). Computed when an
+        image is first used, so a write reads each image's data once more, image by image.
+        A ``stats_level`` some image does not have refuses the call."""
+        return self._map("set_display_range", method, **options)
+
+    def set_custom_metadata(self, name: str, block) -> "PyramidCollection":
+        """`Pyramid.set_custom_metadata` on every image: the block `name` set to `block`
+        (``None`` removes it). Lazy."""
+        return self._map("set_custom_metadata", name, block)
 
     def _graph_for(self, keys) -> dict:
         """The part of the graph the entries `keys` keep (3.25): their placements, the
@@ -1317,6 +2160,19 @@ class PyramidCollection(Mapping):
         new._source = self._source
         return new
 
+    def _branch(self, keys, tree, name) -> "PyramidCollection":
+        """A collection of `keys` with `tree` (a node of this collection's tree: a plate, a
+        well, a field) as its tree: what a plate, well or field's ``as_collection`` gives."""
+        keys = list(keys)
+        new = type(self)({k: self._pyramids[k] for k in keys}, name=name, tree=tree,
+                         **self._graph_for(keys))
+        new._rows = {k: self._rows[k] for k in keys if k in self._rows}
+        new._names = frozenset(self._index_names())
+        new._source = self._source
+        if getattr(self, "_rows_from", None) is not None:
+            new._rows_from = self._rows_from
+        return new
+
     # -- the table and its queries ----------------------------------------------
     @property
     def table(self):
@@ -1337,9 +2193,22 @@ class PyramidCollection(Mapping):
         missing = [k for k in self._pyramids if k not in self._rows]
         if not missing:
             return
+        derived = getattr(self, "_rows_from", None)
+        if derived is not None:                  # a mapped collection: its source's rows,
+            source, update, args, kwargs = derived    # changed as the operation changes them
+            source._build_rows()
+            for key in missing:
+                if key in source._rows:
+                    row = update(dict(source._rows[key]), args, kwargs)
+                    if row is not None:               # None: read it from the image
+                        self._rows[key] = row
+            missing = [k for k in missing if k not in self._rows]
+            if not missing:
+                return
         places = self._plate_places()
         on_disk: Dict[int, List] = {}                  # storage_options id -> [(key, location)]
         options: Dict[int, Any] = {}
+        to_open = []                                   # [(key, value, location)]
         for key in missing:
             value = self._pyramids[key]
             opener = getattr(value, "loader", None) if isinstance(value, MultiscaleNode) else None
@@ -1349,7 +2218,20 @@ class PyramidCollection(Mapping):
                 on_disk.setdefault(id(so), []).append((key, location))
                 options[id(so)] = so
             else:
-                self._rows[key] = row_from_pyramid(self._open(value), path=location)
+                to_open.append((key, value, location))
+        # images that have no metadata file to read (in memory, or the result of an
+        # operation): opened and read, each in its own thread when there are many (each
+        # key opens its own node; the rows are the ones a serial loop gives)
+        if len(to_open) >= _PARALLEL_ROWS:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(16, len(to_open))) as pool:
+                rows = list(pool.map(
+                    lambda job: row_from_pyramid(self._open(job[1]), path=job[2]), to_open))
+        else:
+            rows = [row_from_pyramid(self._open(value), path=location)
+                    for _, value, location in to_open]
+        for (key, _, _), row in zip(to_open, rows):
+            self._rows[key] = row
         for group, jobs in on_disk.items():
             rows = rows_from_files([loc for _, loc in jobs], options[group])
             for (key, location), row in zip(jobs, rows):
@@ -1396,15 +2278,17 @@ class PyramidCollection(Mapping):
         return out
 
     def _check_columns(self, names) -> None:
+        from ome_zarr_pyramid.core.query import COLUMN_ALIASES
         columns = self.table.columns
-        unknown = [n for n in names if n not in columns]
+        unknown = [n for n in names if n not in columns and n not in COLUMN_ALIASES]
         if unknown:
             raise KeyError(f"no column {unknown[0]!r}; the columns are {list(columns)}")
 
     def filter(self, predicate: Optional[Callable] = None, /, **conditions) -> "PyramidCollection":
-        """The images that pass every condition: a column name with a value (equal) or a
-        function of the value (true), e.g. ``filter(dtype="uint16", unit_x="nanometer",
-        levels=lambda n: n >= 3)``. `predicate`, if given, is a function of each image's
+        """The images that pass every condition, a query over the table's columns (to slice
+        along the indices, :meth:`select`; decision C-6): a column name with a value
+        (equal) or a function of the value (true), e.g. ``filter(dtype="uint16", unit_x="nanometer",
+        nlevels=lambda n: n >= 3)``. `predicate`, if given, is a function of each image's
         record (a dict of its columns): ``filter(lambda image: image["size_z"] ==
         image["size_c"])``. Keys are columns too: ``filter(well=3)``. Nothing is read beyond
         the table's metadata."""
@@ -1434,7 +2318,7 @@ class PyramidCollection(Mapping):
 
     def group_by(self, *columns: str) -> Dict[Any, "PyramidCollection"]:
         """One collection per distinct value of `columns` (a tuple of values for several):
-        ``group_by("acquisition")``, ``group_by("dtype", "levels")``."""
+        ``group_by("acquisition")``, ``group_by("dtype", "nlevels")``."""
         if not columns:
             raise ValueError("group_by: name at least one column")
         self._check_columns(columns)
@@ -1541,6 +2425,85 @@ class PyramidCollection(Mapping):
                 values.setdefault(name, set()).add(value)
         return tuple(name for name, vals in values.items() if len(vals) > 1)
 
+    # -- read properties shared with Pyramid (decision C-8) -----------------------------
+    def _shared(self, name: str, column: Optional[str] = None, exact: bool = False):
+        """The value of Pyramid property `name` that every image of the collection has.
+        With a table `column`, the images are compared through the table (metadata only)
+        and the value is the table's, or with `exact` the first image's own (the table
+        keeps less: a dtype without its byte order); without a column, every image is
+        opened. Images that differ raise :class:`VaryingPropertyError`."""
+        if not self._pyramids:
+            raise ValueError(f"{name}: the collection holds no image")
+        keys = list(self._pyramids)
+        values = self.table[column] if column is not None else [getattr(self[k], name) for k in keys]
+        distinct: List[Tuple[Any, Any]] = []
+        for key, value in zip(keys, values):
+            if not any(_same(value, seen) for seen, _ in distinct):
+                distinct.append((value, key))
+        if len(distinct) > 1:
+            shown = "; ".join(f"{dict(k)}: {v!r}" for v, k in distinct[:3])
+            where = (f"coll.table[{column!r}] gives each image's value" if column is not None
+                     else f"read it per image (coll[key].{name}); coll.table describes each image")
+            raise VaryingPropertyError(
+                f"{name} differs between the collection's images ({len(distinct)} different "
+                f"values, e.g. {shown}{' ...' if len(distinct) > 3 else ''}): there is no one "
+                f"{name} to return; {where}")
+        return getattr(self[keys[0]], name) if exact else values[0]
+
+    @property
+    def axes(self) -> str:
+        """The axes every image has (``"czyx"``, ...); images that differ raise
+        :class:`VaryingPropertyError`. Opens no image."""
+        return self._shared("axes", "axes")
+
+    @property
+    def dtype(self):
+        """The pixel type every image has; images that differ raise
+        :class:`VaryingPropertyError`. Opens one image."""
+        return self._shared("dtype", "dtype", exact=True)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """The level-0 shape every image has; images that differ raise
+        :class:`VaryingPropertyError`. Opens no image."""
+        return self._shared("shape", "shape")
+
+    @property
+    def nlayers(self) -> int:
+        """The number of resolution levels every image has; images that differ raise
+        :class:`VaryingPropertyError`. Opens no image."""
+        return self._shared("nlayers", "nlevels")
+
+    @property
+    def nlevels(self) -> int:
+        """The number of resolution levels all the images have (``nlayers``, by the name
+        the table, the docs and dyna-zarr use; decision C-16)."""
+        return self.nlayers
+
+    @property
+    def compressor(self):
+        """The compressor every image has; images that differ raise
+        :class:`VaryingPropertyError`. Opens every image."""
+        return self._shared("compressor")
+
+    @property
+    def scale_factor_dict(self) -> dict:
+        """The downscale factors every image has; images that differ raise
+        :class:`VaryingPropertyError`. Opens every image."""
+        return self._shared("scale_factor_dict")
+
+    @property
+    def custom_metadata(self) -> dict:
+        """The custom metadata blocks every image has; images that differ raise
+        :class:`VaryingPropertyError`. Opens every image."""
+        return self._shared("custom_metadata")
+
+    @property
+    def supports_dyna(self) -> bool:
+        """Whether every image can be processed with dyna-zarr (``Pyramid.supports_dyna``
+        for all of them; True for an empty collection). Opens every image."""
+        return all(self[k].supports_dyna for k in self._pyramids)
+
     def suffix(self, key, names: Optional[Dict[str, str]] = None) -> str:
         """The file-name suffix for an entry: one ``_<name><value>`` per varying index,
         e.g. ``_view1_illumination0``. `names` renames indices (``{"illumination":
@@ -1551,9 +2514,84 @@ class PyramidCollection(Mapping):
                  if name in self.varying]
         return "".join(parts)
 
+    def update_metadata(self, *, path=None, **options):
+        """Rewrite the metadata of each image of the store the collection was read from
+        (or of `path`), as ``io.update_metadata(path, ...)``; returns the store read
+        again. A collection not read from an OME-Zarr store needs `path`."""
+        if path is None:
+            kind, where = self._source if isinstance(self._source, tuple) else (None, None)
+            if kind != "store":
+                raise ValueError("update_metadata: this collection was not read from an "
+                                 "OME-Zarr store; pass path=, or call "
+                                 "IO().update_metadata(path, ...)")
+            path = where
+        return _io().update_metadata(path, **options)
+
+    def write(self, path=None, stem: Optional[str] = None, *, version: Optional[str] = None,
+              names: Optional[Dict[str, str]] = None, writer: Optional[Callable] = None,
+              directory=None, **options):
+        """Write the collection to `path`; a shortcut for ``io.write(coll, path, ...)``.
+        Returns where to read it back: ``io.read(coll.write(path))`` is the written
+        collection (`path`, or the standalone RFC 8 `document` when one is given).
+
+        What is written follows the collection; `version` picks the format:
+
+        - ``"0.4"``, ``"0.5"``, ``"0.6"`` (default: the collection's own, as read, else
+          0.5): a plate when the collection is one plate (as ``write_plate``), one image
+          when it holds one image keyed ``()`` (a store read, or ``pyr.as_collection()``),
+          else a bioformats2raw series layout (as ``write_series``). Several plates raise:
+          NGFF 0.4 to 0.6 hold one plate per store.
+        - ``"rfc8"``: the collection's tree as an NGFF RFC 8 collection (as
+          ``write_collection``), several plates too.
+
+        `options` are those of the writer used (``overwrite``, ``storage_options``,
+        ``validate``, ``document``, ...) and of ``io.write_pyramid`` for each image.
+
+        ``coll.write(directory, stem)`` writes each image as a store of its own,
+        ``<directory>/<stem><suffix>.ome.zarr`` (`names` renames indices in the suffix),
+        and returns ``{key: path}`` of each store."""
+        if directory is not None:
+            if path is not None:
+                raise TypeError("write: give path or directory, not both")
+            path = directory
+        if path is None:
+            raise TypeError("write: missing the path to write to")
+        return _io().write(self, path, stem=stem, version=version, names=names,
+                           writer=writer, **options)
+
+    def _write(self, path, stem: Optional[str] = None, *, version: Optional[str] = None,
+               names: Optional[Dict[str, str]] = None, writer: Optional[Callable] = None,
+               **options):
+        """The implementation behind ``io.write(coll, ...)`` (see :meth:`write`)."""
+        self._refuse_empty("write")
+        if stem is not None:
+            if version is not None:
+                options["version"] = version
+            return self._write_images(path, stem, names=names, writer=writer, **options)
+        if names is not None:
+            raise ValueError("write: names= renames the indices in the store names of "
+                             "coll.write(directory, stem); give a stem")
+        if version == "rfc8":
+            return self._write_collection(path, writer=writer, **options)
+        plates = self.plates
+        if len(plates) > 1:
+            raise ValueError(f"write: the collection holds {len(plates)} plates and NGFF "
+                             f"{version or 'up to 0.6'} holds one plate per store; write each "
+                             f"with write_plate(path, plate=i), or all of them with "
+                             f"version='rfc8'")
+        if plates and all(any(n in ("plate", "well") for n, _ in key) for key in self._pyramids):
+            return self._write_plate(path, version=version, writer=writer, **options)
+        if list(self._pyramids) != [()]:
+            return self._write_series(path, version=version, writer=writer, **options)
+        pyr = self.pyramid(())
+        if version is not None and str(pyr.meta.version) != str(version):
+            pyr = pyr.to_version(version)
+        (writer or _io().write_pyramid)(pyr, path, **options)
+        return str(path)
+
     @validating
-    def write(self, directory, stem: str, *, names: Optional[Dict[str, str]] = None,
-              writer: Optional[Callable] = None, **write_kwargs) -> Dict[Any, str]:
+    def _write_images(self, directory, stem: str, *, names: Optional[Dict[str, str]] = None,
+                      writer: Optional[Callable] = None, **write_kwargs) -> Dict[Any, str]:
         """Write each entry as ``<directory>/<stem><suffix>.ome.zarr``; returns
         {key: path}. `write_kwargs` go to ``io.write_pyramid`` (or `writer`).
 
@@ -1568,6 +2606,7 @@ class PyramidCollection(Mapping):
 
         from ome_zarr_pyramid.core import eubi_keys as ek
         from ome_zarr_pyramid.core.io import IO
+        self._refuse_empty("write")
         if self._edges:
             kinds = sorted({e.type for e in self._edges})
             warnings.warn(f"write: {len(self._edges)} edge(s) of the coordinate-system graph "

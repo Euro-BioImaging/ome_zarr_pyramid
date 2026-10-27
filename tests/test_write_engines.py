@@ -98,16 +98,17 @@ def test_multiprocessing_refuses_dask_levels(data, zarr_path):
         IO().write_pyramid(pyr, zarr_path, overwrite=True, max_downscale_processes=4)
 
 
-@pytest.mark.parametrize("engine", ["sync", "tensorstore"])
-def test_a_removed_engine_is_refused_not_swapped(data, zarr_path, route, engine):
+def test_a_removed_engine_is_refused_not_swapped(data, zarr_path, route):
     with pytest.raises(ValueError, match="removed in ome_zarr_pyramid 0.1.0"):
-        IO().write_pyramid(_zarr_pyr(data), zarr_path, overwrite=True, backend=engine)
+        IO().write_pyramid(_zarr_pyr(data), zarr_path, overwrite=True, backend="sync")
     assert route == []
 
 
 @pytest.mark.parametrize("engine", ["auto", "dyna"])
-def test_auto_and_dyna_are_the_same_engine(data, zarr_path, route, engine):
-    IO().write_pyramid(_zarr_pyr(data) * 1, zarr_path, overwrite=True, backend=engine)
+def test_the_old_engine_words_warn_and_write_with_dyna(data, zarr_path, route, engine):
+    # backend= named ozp's engine before 0.5.0 (always dyna); now it is the storage backend
+    with pytest.warns(FutureWarning, match="backend= names the storage backend"):
+        IO().write_pyramid(_zarr_pyr(data) * 1, zarr_path, overwrite=True, backend=engine)
     assert route == ["dyna"]
     np.testing.assert_array_equal(_level(zarr_path)[...], data)
 
