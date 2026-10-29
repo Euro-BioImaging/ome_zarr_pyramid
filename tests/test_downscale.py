@@ -220,7 +220,9 @@ def _planned(pyr, **over):
 def test_downscale_without_plan_uses_defaults(tmp_path):
     pyr = _multi_level(tmp_path).select_levels("0")
     plan = pyr.downscale()._downscale_plan
-    assert plan["n_layers"] is None and plan["scale_factor"] is None
+    # resolved from the defaults (2 on z/y/x, as many levels as keep 64 px or more): a
+    # 32 x 64 x 64 base stays one level
+    assert plan["n_layers"] == 1 and plan["level_scale_factors"] == [(1, 1, 1, 1, 1)]
 
 
 def test_downscale_on_planned_pyramid_is_a_noop(tmp_path):

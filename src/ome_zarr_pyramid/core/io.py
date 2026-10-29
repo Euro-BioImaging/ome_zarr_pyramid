@@ -272,75 +272,18 @@ def _dyna_write_level(arr, output_path: str, kwargs: dict) -> str:
     return "\n".join(messages)
 
 
-def _plan_level_factors(plan: dict, full, base_shape, dmethod: str):
-    """Per-level cumulative factors and target shapes of a downscale plan, level 0 first.
-
-    Factors are SOLVED against each target shape rather than rounded from the ratio:
-    `round(base/tgt)` silently produced an off-by-one level whenever the rounded ratio
-    did not reproduce `tgt` (e.g. base=101 tgt=50), and it cannot express an irregular
-    progression at all. Raises when a target is unreachable by any integer factor."""
-    from ome_zarr_pyramid.utils.scale import _fits, _level_size, _solve_axis_factor
-    fpaths = full.meta.resolution_paths
-    ndim = len(base_shape)
-    factors, targets = [tuple([1] * ndim)], [tuple(int(s) for s in base_shape)]
-    planned = plan.get('level_scale_factors')
-    pshapes = plan.get('level_shapes')
-    for i in range(1, len(fpaths)):
-        # When the plan carries DERIVED per-level factors, they - not the shapes
-        # `downscale(defer=False)` regenerates - are authoritative. That expansion applies
-        # one `scale_factor` repeatedly, so it cannot reproduce an irregular or anisotropic
-        # progression (base 64 with levels 64/32 -> level 2 factor (2,4,4), which
-        # `scale_factor**2` renders as (1,1,64,16,16)).
-        if planned is not None and i < len(planned):
-            factor = tuple(int(f) for f in planned[i])
-            tgt = (tuple(pshapes[i]) if pshapes is not None and i < len(pshapes)
-                   else tuple(_level_size(base_shape[a], factor[a], dmethod)
-                              for a in range(ndim)))
-        else:
-            tgt = full.layers[fpaths[i]].shape
-            # The factor the level's SCALE metadata states comes first: it is what the
-            # written store will claim. The shape alone is ambiguous whenever an extent is
-            # not divisible (41 -> 6 fits factors 7 AND 8), and the solver returns the
-            # smallest fit - 7 - while the metadata said 8: pixels and physical
-            # coordinates silently disagreed.
-            s0, si = full.meta.get_scale(fpaths[0]), full.meta.get_scale(fpaths[i])
-            stated = [si[a] / s0[a] if s0[a] else None for a in range(ndim)]
-            factor = []
-            for a in range(ndim):
-                st = stated[a]
-                if (st is not None and abs(st - round(st)) < 1e-6 and round(st) >= 1
-                        and _fits(base_shape[a], int(round(st)), tgt[a])):
-                    factor.append(int(round(st)))
-                    continue
-                f = _solve_axis_factor(base_shape[a], tgt[a], dmethod)
-                factor.append(int(f) if f is not None
-                              else max(1, int(round(base_shape[a] / tgt[a]))))
-            factor = tuple(factor)
-        got = tuple(_level_size(base_shape[a], factor[a], dmethod) for a in range(ndim))
-        if not all(_fits(base_shape[a], factor[a], tgt[a]) for a in range(ndim)):
-            raise ValueError(
-                f"cannot reproduce level {i} of the downscale plan exactly: "
-                f"base {tuple(base_shape)} with factor {factor} gives {got}, "
-                f"but the plan requires {tuple(tgt)}. No integer downscale factor "
-                f"maps the base to that shape under method '{dmethod}' (no backend "
-                f"accepts a target shape). Re-plan with .downscale(...) or use "
-                f"drop_downscale_plan()."
-            )
-        factors.append(factor)
-        targets.append(tuple(int(t) for t in tgt))
-    return factors, targets
-
-
 def _full_pyramid(pyramid, full, arrays, rechunked, method):
     """The full pyramid over `arrays` (one per level of `full`, built from level 0 with
     downscale `method`), carrying the source `pyramid`'s metadata: what a plan-expanded
     write saves on the group."""
     import copy as _copy
     fpaths = full.meta.resolution_paths
-    unit_clean = [u for u in full.meta.unit_list if u is not None]
+    # one unit per axis, None for a unitless one (idr0010's t and z): dropping the Nones
+    # left fewer units than axes
+    units = list(full.meta.unit_list or [])
     full_dask = Pyramid().from_arrays(
         arrays=arrays, axis_order=full.meta.axis_order,
-        unit_list=unit_clean if unit_clean else None,
+        unit_list=units if any(u is not None for u in units) else None,
         scales=[full.meta.get_scale(p) for p in fpaths],
         version=full.meta.version,
         name=full.meta.multiscales.get('name', 'unnamed') if full.meta.metadata else 'unnamed',
@@ -1692,7 +1635,7 @@ class PyramidIO:
             )
 
 
-    def _write_plan_one_pass(self, pyramid, base, path, plan, dk, *, overwrite, rechunked,
+    def _write_plan_one_pass(self, pyramid, base, path, plan, *, overwrite, rechunked,
                              write_kwargs) -> bool:
         """Write a deferred-downscale pyramid from ONE read of the source, if it can.
 
@@ -1715,11 +1658,11 @@ class PyramidIO:
             return False
         dmethod = plan.get('downscale_method', 'simple')
         dbackend = plan.get('downscale_backend', 'tensorstore')
-        full = base.downscale(defer=False, **dk)          # lazy: shapes and scales only
+        full = base._build_levels(plan)                   # lazy: shapes and scales only
         fpaths = full.meta.resolution_paths
         if len(fpaths) < 2:
             return False
-        factors, targets = _plan_level_factors(plan, full, base_arr.shape, dmethod)
+        factors, targets = plan['level_scale_factors'], plan['level_shapes']
         if any(tuple(_level_size(b, f, dmethod) for b, f in zip(base_arr.shape, fac)) != t
                for fac, t in zip(factors, targets)):
             return False
@@ -1881,13 +1824,13 @@ class PyramidIO:
         finally:
             if saved is not None:
                 pyramid._downscale_plan = saved
-        dk = {k: plan[k] for k in ('n_layers', 'min_dimension_size', 'scale_factor',
-                                   'downscale_method', 'backend', 'smart_scale_factor')}
-        dk['downscale_backend'] = plan.get('downscale_backend', 'tensorstore')
+        # every level's factor and shape, worked out once (resolve_levels): the levels
+        # written are the levels the pyramid showed
+        plan = base._resolve_plan(plan)
 
         # ONE PASS: level 0 and the coarser levels from ONE read of the
         # source, without re-reading the stored level 0 (see _write_plan_one_pass).
-        if self._write_plan_one_pass(pyramid, base, path, plan, dk, overwrite=overwrite,
+        if self._write_plan_one_pass(pyramid, base, path, plan, overwrite=overwrite,
                                      rechunked=_rechunked, write_kwargs=write_kwargs):
             return
         self.write_pyramid(base, path, layers=[base_path0], overwrite=overwrite, **write_kwargs)
@@ -1898,7 +1841,7 @@ class PyramidIO:
                                  storage_options=storage_options, apply_scene=None)
 
         # 3) expand the plan for the level count / shapes / scales (metadata only)
-        full = disk.downscale(defer=False, **dk)
+        full = disk._build_levels(plan)
         fpaths = full.meta.resolution_paths
         extra = list(fpaths[1:])
         if not extra:
@@ -1919,7 +1862,7 @@ class PyramidIO:
                 from dyna_zarr import DynamicArray
                 level = DynamicArray(level)
             return level
-        level_factors, targets = _plan_level_factors(plan, full, base_da.shape, dmethod)
+        level_factors, targets = plan['level_scale_factors'], plan['level_shapes']
         level_arrays = [base_da]
         for factor, tgt in zip(level_factors[1:], targets[1:]):
             level = method(base_da, scale_factor=factor)

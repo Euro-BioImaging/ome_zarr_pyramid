@@ -13,10 +13,11 @@ pixels. A field's ``images`` are the collection's pyramids, opened when first as
 """
 from __future__ import annotations
 
+import numbers
 import os
 import re
 from dataclasses import dataclass, field as _field, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 from ome_zarr_pyramid.core.collection import SERIES_INDEX
 from ome_zarr_pyramid.core.nodes import (
@@ -31,12 +32,18 @@ CONTAINMENT = ("plate", "well", "field", SERIES_INDEX, "tile", "part", "resoluti
 class Field:
     """One field of a well: its field ``index`` and its images' collection ``keys``
     (``images`` opens them). When an orthogonal index (acquisition, view, ...) varies
-    in the field, ``select`` picks one first: ``field.select(acquisition=1).image``."""
+    in the field, ``select`` picks one first: ``field.select(acquisition=1).image``.
+    ``parent`` is its well."""
     index: int
     keys: Tuple = ()
     collection: Any = _field(default=None, repr=False)
     #: its node in the collection's tree: a field collection, or its one image's node
     node: Any = _field(default=None, compare=False, repr=False)
+    parent: Any = _field(default=None, compare=False, repr=False)
+    kind: ClassVar[str] = "field"
+
+    def __getattr__(self, name):
+        return _wrong_level(self, name)
 
     @property
     def images(self) -> tuple:
@@ -90,7 +97,11 @@ class Field:
         """The field's images as a `PyramidCollection` (same keys, the part of the
         coordinate-system graph they keep), with the field's node as its tree (none after
         a ``select`` that dropped images)."""
-        return self.collection._branch(self.keys, self.node, f"field{self.index}")
+        out = self.collection._branch(self.keys, self.node, f"field{self.index}")
+        out._kind = "field"
+        well = self.parent
+        out._parent = (lambda: well.as_collection()) if well is not None else None
+        return out
 
     def __repr__(self) -> str:
         return f"<Field {self.index}: {len(self.keys)} images>"
@@ -99,12 +110,18 @@ class Field:
 @dataclass(frozen=True)
 class Well:
     """A well that holds images: its 0-based row and column, its name (``"B2"``) and its
-    fields (``fields[j]`` is the j-th field present; ``.index`` is its number)."""
+    fields (``fields[j]`` is the j-th field present; ``.index`` is its number).
+    ``parent`` is its plate."""
     row: int
     column: int
     name: str
     fields: Tuple[Field, ...] = _field(default=(), compare=False, repr=False)
     node: Any = _field(default=None, compare=False, repr=False)
+    parent: Any = _field(default=None, compare=False, repr=False)
+    kind: ClassVar[str] = "well"
+
+    def __getattr__(self, name):
+        return _wrong_level(self, name)
 
     def as_collection(self):
         """The well's images as a `PyramidCollection` (same keys, the part of the
@@ -113,7 +130,11 @@ class Well:
         collection = self.fields[0].collection if self.fields else None
         if collection is None:
             raise ValueError(f"well {self.name} holds no image")
-        return collection._branch(keys, self.node, self.name)
+        out = collection._branch(keys, self.node, self.name)
+        out._kind = "well"
+        plate = self.parent
+        out._parent = (lambda: plate.as_collection()) if plate is not None else None
+        return out
 
 
 @dataclass(frozen=True)
@@ -126,37 +147,148 @@ class Acquisition:
 @dataclass(frozen=True)
 class Plate:
     """A plate: its name (``""`` when its source has none), its row and column names
-    (``rows[i]`` names row ``i``), the wells that hold images (``wells[w]`` is index
-    ``"well": w``) and its acquisitions. ``node`` is its collection node."""
+    (``row_names[i]`` names row ``i``), the wells that hold images (``wells[w]`` is index
+    ``"well": w``) and its acquisitions. ``node`` is its collection node, ``parent`` (also
+    ``collection``) the collection it is a plate of.
+
+    ``rows`` and ``columns`` slice it (decision C-19): an index, a slice, a name or a list
+    of them gives the part of the plate in those rows (or columns), still a plate -
+    ``plate.rows[2:5].columns[3:7]``, as ``coll.select(row=slice(2, 5), column=slice(3,
+    7))``. Positions are the whole layout's; rows and columns are a well's address, not
+    levels of containment."""
     name: str
-    rows: Tuple[str, ...]
-    columns: Tuple[str, ...]
+    row_names: Tuple[str, ...]
+    column_names: Tuple[str, ...]
     wells: Tuple[Well, ...]
     acquisitions: Tuple[Acquisition, ...] = ()
     node: Any = _field(default=None, compare=False, repr=False)
     collection: Any = _field(default=None, compare=False, repr=False)
+    #: the whole plate's wells, for a part of it: ``well_index`` answers with the index
+    #: the images carry
+    whole: Tuple[Well, ...] = _field(default=(), compare=False, repr=False)
+    kind: ClassVar[str] = "plate"
+
+    @property
+    def parent(self):
+        """The collection this is a plate of."""
+        return self.collection
+
+    @property
+    def rows(self) -> "Axis":
+        """The plate's rows as a slicer: ``rows[2:5]``, ``rows["B"]``, ``rows[["B", "D"]]``
+        give the part of the plate in those rows."""
+        return Axis(self.row_names, "row", self.name, lambda keep: self._cut("row", keep))
+
+    @property
+    def columns(self) -> "Axis":
+        """The plate's columns as a slicer (see ``rows``)."""
+        return Axis(self.column_names, "column", self.name,
+                    lambda keep: self._cut("column", keep))
+
+    @property
+    def is_part(self) -> bool:
+        """Whether this is a part of its plate (``rows`` / ``columns``, or a selection's)."""
+        return bool(self.whole) and len(self.wells) != len(self.whole)
+
+    def _cut(self, axis: str, keep) -> "Plate":
+        keep = set(keep)
+        return replace(self, wells=tuple(w for w in self.wells if getattr(w, axis) in keep),
+                       whole=self.whole or self.wells)
 
     def as_collection(self):
         """The plate as a `PyramidCollection` of its own: its images (same keys), the part
         of the coordinate-system graph they keep, and the plate as its tree, so
         ``coll.plates[1].as_collection().write(path)`` writes that plate (the navigation
-        stays micro-reader's; this is ozp's step from it to a collection)."""
+        stays micro-reader's; this is ozp's step from it to a collection). A part of the
+        plate gives the plate with those images."""
         keys = [key for well in self.wells for f in well.fields for key in f.keys]
-        return self.collection._branch(keys, self.node, self.name or None)
+        out = self.collection._branch(keys, self.node, self.name or None)
+        out._kind = "plate"
+        out._parent = self.collection
+        return out
 
     def well_index(self, name: str) -> int:
-        """The index of the well called `name` (``"B2"``), for ``select(well=...)`` and
-        ``wells[...]``."""
-        for i, well in enumerate(self.wells):
+        """The index of the well called `name` (``"B2"``), for ``select(well=...)``: its
+        place in the whole plate's wells (the index its images carry)."""
+        for i, well in enumerate(self.whole or self.wells):
             if well.name == name:
                 return i
         raise KeyError(f"no well {name!r} with images in plate {self.name!r}; "
-                       f"wells: {[w.name for w in self.wells]}")
+                       f"wells: {[w.name for w in self.whole or self.wells]}")
+
+    def __getattr__(self, name):
+        return _wrong_level(self, name)
 
     def __repr__(self) -> str:
         n = len(self.wells)
-        return (f"<Plate {self.name!r} {len(self.rows)} x {len(self.columns)}, "
+        part = " (part)" if self.is_part else ""
+        return (f"<Plate {self.name!r}{part} {len(self.row_names)} x {len(self.column_names)}, "
                 f"{n} well{'' if n == 1 else 's'} with images>")
+
+
+class Axis:
+    """A plate's rows or columns as a slicer (``Plate.rows``, a plate collection's
+    ``rows``; decision C-19): ``axis[i]``, ``axis[a:b]``, ``axis["C"]`` and ``axis[["B",
+    "D"]]`` give the part of the plate in those rows or columns. Positions count from 0
+    in the whole layout; a slice's negative bounds count from its end. ``len`` is the
+    layout's row (column) count; the names are ``row_names`` (``column_names``)."""
+
+    def __init__(self, names, axis: str, plate_name, cut: Callable):
+        self.names, self.axis, self.plate_name, self._cut = tuple(names), axis, plate_name, cut
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def __iter__(self):
+        raise TypeError(f"plate.{self.axis}s is a slicer, not a sequence: its names are "
+                        f"{self.axis}_names; {self.axis}s[...] gives a part of the plate")
+
+    def positions(self, value) -> List[int]:
+        n = len(self.names)
+        if isinstance(value, slice):
+            return list(range(*value.indices(n)))
+        if isinstance(value, str):
+            if value not in self.names:
+                raise KeyError(f"plate {self.plate_name!r} has no {self.axis} {value!r}; its "
+                               f"{self.axis}s are {list(self.names)}")
+            return [self.names.index(value)]
+        if isinstance(value, (list, tuple, range, set, frozenset)):
+            return [p for v in value for p in self.positions(v)]
+        if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+            i = int(value) + n if value < 0 else int(value)
+            if not 0 <= i < n:
+                raise IndexError(f"{self.axis} {value} of a plate with {n} {self.axis}s")
+            return [i]
+        raise TypeError(f"{self.axis}s[...]: a position, slice, name or a list of them, "
+                        f"not {value!r}")
+
+    def __getitem__(self, value):
+        return self._cut(self.positions(value))
+
+    def __repr__(self) -> str:
+        shown = ", ".join(self.names[:4]) + (", ..." if len(self.names) > 4 else "")
+        return f"<{self.axis}s of plate {self.plate_name!r}: {shown} ({len(self.names)})>"
+
+
+#: what each level holds (decision C-19): accessors go down only
+BELOW = {"collection": ("plates",), "plate": ("wells", "rows", "columns"),
+         "well": ("fields",), "field": ("images", "tiles", "image"), "image": ()}
+_ABOVE = {"wells": "plate", "fields": "well", "images": "field", "tiles": "field",
+          "image": "field", "plates": "collection", "rows": "plate", "columns": "plate",
+          "row_names": "plate", "column_names": "plate", "well_index": "plate"}
+
+
+def wrong_level_message(kind: str, name: str) -> str:
+    """Why a `kind` has no `name` accessor, naming the way (decision C-19)."""
+    holds = ", ".join(f".{a}" for a in BELOW.get(kind, ())) or "no level below"
+    return (f"a {kind} holds no {name} ({name} belong to a {_ABOVE[name]}); a {kind} "
+            f"holds {holds}, and .parent is what holds it")
+
+
+def _wrong_level(obj, name: str):
+    if name.startswith("__") or name not in _ABOVE:
+        raise AttributeError(f"{type(obj).__name__!r} object has no attribute {name!r}")
+    raise AttributeError(wrong_level_message(obj.kind, name))
 
 
 def plate_nodes(tree) -> List[CollectionNode]:
@@ -170,10 +302,11 @@ def plate_nodes(tree) -> List[CollectionNode]:
     return []
 
 
-def plates_of(collection) -> List[Plate]:
+def plates_of(collection, held: bool = True) -> List[Plate]:
     """The plates of a collection: one :class:`Plate` per plate node of its tree, with
     each well's fields made from the collection's keys (``plate``, ``well``,
-    ``field``)."""
+    ``field``). `held`: only the plates and wells holding the collection's images (what
+    a selection shows, decision C-19); else every one of the tree (ozp's own code)."""
     groups: Dict[Tuple[int, int, int], List] = {}
     for key in collection:
         index = dict(key)
@@ -207,10 +340,20 @@ def plates_of(collection) -> List[Plate]:
             Acquisition(int(a.id) if a.id.isdigit() else i, a.name or "")
             for i, a in enumerate(attr.acquisitions))
         name = node.ngff_fields.get("plate", {}).get("name", node.name)
-        out.append(Plate(name if isinstance(name, str) else node.name,
-                         tuple(r.name or r.id for r in attr.rows),
-                         tuple(c.name or c.id for c in attr.columns),
-                         tuple(wells), acquisitions, node, collection))
+        # the wells holding this collection's images (a selection's views show what it
+        # holds, decision C-19); `whole` keeps every well for well_index ("well": w)
+        shown = tuple(w for w in wells if w.fields) if held else tuple(wells)
+        if held and not shown:
+            continue                              # a plate none of the images is in
+        plate = Plate(name if isinstance(name, str) else node.name,
+                      tuple(r.name or r.id for r in attr.rows),
+                      tuple(c.name or c.id for c in attr.columns),
+                      shown, acquisitions, node, collection, tuple(wells))
+        for well in wells:                        # each level knows what holds it
+            object.__setattr__(well, "parent", plate)
+            for f in well.fields:
+                object.__setattr__(f, "parent", well)
+        out.append(plate)
     return out
 
 
@@ -228,6 +371,25 @@ def _child_of_key(well: CollectionNode, key_of) -> Dict[Any, Node]:
 
 
 # -- an opened file's tree, from its images' indices (plan 3.17) -----------------
+
+def _names(plate, axis: str) -> tuple:
+    """A plate's row (or column) names: ``row_names`` (micro-reader 0.3, ozp 0.5), else
+    ``rows`` (micro-reader 0.2, where it held the names)."""
+    names = getattr(plate, f"{axis}_names", None)
+    return tuple(names if names is not None else getattr(plate, f"{axis}s"))
+
+
+def _plate_number(plate, position: int) -> int:
+    """The ``plate`` index the images of `plate` carry: from its fields' keys (an ozp
+    plate view, which may leave out plates holding none of a selection's images), else
+    its place among the file's plates (micro-reader)."""
+    for well in getattr(plate, "whole", None) or plate.wells:
+        for field in getattr(well, "fields", ()):
+            keys = getattr(field, "keys", None)
+            if keys:
+                return dict(keys[0]).get("plate", 0)
+    return position
+
 
 def _item(name: str, i: int, kind: str) -> PlateItem:
     """A row or column named `name`, with its name as id when it can be one."""
@@ -295,6 +457,12 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
       make a collection, and an index name ozp does not know (the old series name
       eubi-bridge 0.2.x uses) is one of those: it is kept as it is, never renamed."""
     plates = list(getattr(file, "plates", None) or [])
+    # the plate and well numbers the images carry: a micro-reader file's plates and
+    # wells are in that order; an ozp collection's .plates show only the plates and
+    # wells holding images (a selection, a store read back), so its plates are matched
+    # by the number their fields' keys carry, its wells by place in the whole plate
+    numbers = {_plate_number(plate, i): i for i, plate in enumerate(plates)}
+    wells_of = [tuple(getattr(plate, "whole", None) or plate.wells) for plate in plates]
     # per well, its images by field (None: an image with no field index, in the well
     # itself); acquisition, like tile or view, makes no collection
     by_well: Dict[Tuple[int, int], Dict[Optional[int], List]] = {}
@@ -303,16 +471,16 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
         index = dict(key)
         if "well" not in index:
             continue
-        p, w = index.get("plate", 0), index["well"]
-        if 0 <= p < len(plates) and 0 <= w < len(plates[p].wells):
+        p, w = numbers.get(index.get("plate", 0)), index["well"]
+        if p is not None and 0 <= w < len(wells_of[p]):
             by_well.setdefault((p, w), {}).setdefault(index.get("field"), []).append(key)
             placed.add(key)
     root = CollectionNode(name or "file")
     plate_nodes_: List[Node] = []
     for p, plate in enumerate(plates):
         attr = PlateAttribute(
-            rows=[_item(r, i, "row") for i, r in enumerate(plate.rows)],
-            columns=[_item(c, i, "column") for i, c in enumerate(plate.columns)],
+            rows=[_item(r, i, "row") for i, r in enumerate(_names(plate, "row"))],
+            columns=[_item(c, i, "column") for i, c in enumerate(_names(plate, "column"))],
             acquisitions=[PlateItem(str(a.id), a.name or None) for a in plate.acquisitions])
         node = CollectionNode(plate.name or f"plate{p}", attributes={"plate": attr},
                               kind="plate", index=p)
@@ -320,14 +488,15 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
         # an NGFF plate is written with
         node.ngff_fields = {"plate": {"name": plate.name, "field_count": None},
                             "node_name": node.name}
-        outside = [w.name for w in plate.wells
-                   if not (0 <= w.row < len(plate.rows) and 0 <= w.column < len(plate.columns))]
+        outside = [w.name for w in wells_of[p]
+                   if not (0 <= w.row < len(_names(plate, "row"))
+                           and 0 <= w.column < len(_names(plate, "column")))]
         if outside:
             raise InvalidCollection(
                 f"plate {plate.name!r}: the file puts wells {outside} outside its "
-                f"{len(plate.rows)} x {len(plate.columns)} layout (rows {list(plate.rows)}, "
-                f"columns {list(plate.columns)})")
-        for w, well in enumerate(plate.wells):
+                f"{len(_names(plate, 'row'))} x {len(_names(plate, 'column'))} layout (rows "
+                f"{list(_names(plate, 'row'))}, columns {list(_names(plate, 'column'))})")
+        for w, well in enumerate(wells_of[p]):
             well_node = node.add(CollectionNode(well.name, attributes={"well": WellAttribute(
                 Ref(attr.rows[well.row].id), Ref(attr.columns[well.column].id))},
                 kind="well", index=w))

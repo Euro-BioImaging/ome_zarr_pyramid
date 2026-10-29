@@ -526,14 +526,24 @@ def well_path(attr: PlateAttribute, well: Node) -> str:
     return f"{row.name or row.id}/{col.name or col.id}"
 
 
+def _own_path(image) -> Optional[str]:
+    """An image's path inside its well: the last part of its own path (an RFC 8 tree
+    names an image from the collection's root, ``./B/2/0``), or None."""
+    if image.path is None:
+        return None
+    return image.path.path.strip("/").rsplit("/", 1)[-1] or None
+
+
 def image_paths(well: CollectionNode) -> List[str]:
-    """Where each image of a well is written in it: its own path, else the next free
-    number (``"0"``, ``"1"``, ...; NGFF image paths are alphanumeric)."""
-    used = {image.path.path for image in well.nodes if image.path is not None}
+    """Where each image of a well is written in it: its own path (the last part of it),
+    else the next free number (``"0"``, ``"1"``, ...; NGFF image paths are
+    alphanumeric)."""
+    own = [_own_path(image) for image in well.nodes]
+    used = {p for p in own if p is not None}
     out, n = [], 0
-    for image in well.nodes:
-        if image.path is not None:
-            out.append(image.path.path)
+    for image, path in zip(well.nodes, own):
+        if path is not None:
+            out.append(path)
             continue
         while str(n) in used:
             n += 1

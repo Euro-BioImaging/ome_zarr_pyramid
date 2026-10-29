@@ -100,7 +100,7 @@ def test_an_ngff_plate_navigates_the_same_way(tmp_path):
     path, data = _plate(tmp_path, "0.5")
     coll = PyramidCollection.from_zarr(path)
     (plate,) = coll.plates
-    assert plate.name == "screen" and plate.rows == ("A", "B") and plate.columns == ("1", "2")
+    assert plate.name == "screen" and plate.row_names == ("A", "B") and plate.column_names == ("1", "2")
     assert plate.wells == (Well(0, 1, "A2"), Well(1, 0, "B1"))
     assert plate.acquisitions == (Acquisition(0, "first"), Acquisition(1, "second"))
     field = plate.wells[1].fields[0]
@@ -116,7 +116,7 @@ def _plate_files():
 
 
 def _summary(plates, keys_of):
-    return [(p.name, tuple(p.rows), tuple(p.columns), tuple((a.id, a.name) for a in p.acquisitions),
+    return [(p.name, tuple(p.row_names), tuple(p.column_names), tuple((a.id, a.name) for a in p.acquisitions),
              [(w.row, w.column, w.name, [(f.index, sorted(keys_of(f))) for f in w.fields])
               for w in p.wells]) for p in plates]
 

@@ -9,10 +9,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import asyncio
+from fractions import Fraction
 import contextvars
 import copy
 import functools
-import inspect
 import warnings
 import operator
 from collections.abc import Mapping
@@ -338,6 +338,95 @@ def _level_sizes(pyr) -> List[Dict[str, int]]:
     return [dict(zip(axes, pyr.layers[p].shape)) for p in pyr.meta.resolution_paths]
 
 
+def _rebased(plan: dict, first: int, n: int) -> Optional[dict]:
+    """A resolved plan's levels ``first .. first + n - 1`` as a plan over level `first`
+    (relative factors, the same shapes), or None when a factor is not a whole multiple
+    of level `first`'s."""
+    factors = plan["level_scale_factors"][first:first + n]
+    root = factors[0]
+    if any(f % r for fac in factors for f, r in zip(fac, root)):
+        return None
+    out = dict(plan)
+    out["level_scale_factors"] = [tuple(f // r for f, r in zip(fac, root)) for fac in factors]
+    out["level_shapes"] = list(plan["level_shapes"][first:first + n])
+    out["n_layers"] = n
+    out["scale_factor"] = out["level_scale_factors"][1] if n > 1 else None
+    out["smart_scale_factor"] = None
+    return out
+
+
+def _pixel_ratio(image_size: int, image_scale, label_size: int, label_scale):
+    """Label pixels per image pixel along one axis, as a Fraction (1, n or 1/n), when a
+    label can follow its image there (decision C-18): the same pixel count, or a
+    whole-number ratio of pixel sizes with the image's size at that ratio (rounded down
+    or up) - the same area. None when it cannot."""
+    if image_size == label_size:
+        return Fraction(1)
+    si, sl = float(image_scale or 1.0), float(label_scale or 1.0)
+    if si <= 0 or sl <= 0:
+        return None
+    r = si / sl
+    q = Fraction(round(r)) if r >= 1 else Fraction(1, max(1, round(1 / r)))
+    if q <= 0 or abs(float(q) - r) > 1e-6 * max(r, 1.0):
+        return None
+    # the same area: the image's size in label pixels, rounded either way (535 image px
+    # at a quarter: 133 or 134 label px), nothing else
+    exact = Fraction(image_size) * q
+    if label_size not in (exact.numerator // exact.denominator, -(-exact.numerator // exact.denominator)):
+        return None
+    return q
+
+
+def _index_onto(value, q, size: int, label_size: int, axis: str, refuse):
+    """An ``isel`` index of the image along `axis` on a label with `q` label pixels per
+    image pixel (decision C-18): an integer to the label pixel holding it (a label as
+    fine or coarser), a slice when its start and stop land on whole label pixels (the far
+    edge counts as one) and its step is 1 or lands on whole label pixels; anything else
+    refuses."""
+    if isinstance(value, (int, np.integer)):
+        if q > 1:
+            refuse(f"index {value} along {axis} covers {q} label pixels, not one")
+        i = int(value) + size if int(value) < 0 else int(value)
+        return min(int(Fraction(i) * q), label_size - 1)
+    if isinstance(value, slice):
+        start, stop, step = value.indices(size)
+        lo = Fraction(start) * q
+        hi = Fraction(label_size) if stop >= size else Fraction(stop) * q
+        st = Fraction(1) if step == 1 else Fraction(step) * q
+        if step < 1 or lo.denominator != 1 or hi.denominator != 1 or st.denominator != 1 \
+                or st < 1:
+            refuse(f"{value} along {axis} does not land on whole label pixels ({q} label "
+                   f"pixels per image pixel)")
+        return slice(int(lo), int(hi), int(st))
+    refuse(f"a list of indices along {axis} on a label at another resolution")
+
+
+def _plan_onto(plan, image_axes: str, label_axes: str, label_shapes, same=None) -> dict:
+    """An image's resolved plan (``level_scale_factors``, ``level_shapes``) on a label's
+    axes: the image's factor along each axis they share (1 along the label's own), and
+    the image's size along the axes in `same` (the same pixel count, floor-sized levels
+    included); elsewhere the label's own sizes - its recorded levels, else ceil - so a
+    label at another resolution (decision C-18) keeps covering the image's area."""
+    from ome_zarr_pyramid.utils.scale import resolve_levels
+    same = set(label_axes) if same is None else set(same)
+    factors = []
+    for fac in plan["level_scale_factors"]:
+        f = dict(zip(image_axes, fac))
+        factors.append(tuple(int(f.get(a, 1)) for a in label_axes))
+    _, own = resolve_levels(label_shapes[0], label_axes, level_scale_factors=factors,
+                            level_shapes=list(label_shapes))
+    shapes = []
+    for shape, mine in zip(plan["level_shapes"], own):
+        n = dict(zip(image_axes, shape))
+        shapes.append(tuple(int(n[a]) if a in same and a in n else int(m)
+                            for a, m in zip(label_axes, mine)))
+    out = dict(plan)
+    out["level_scale_factors"], out["level_shapes"] = factors, shapes
+    out["scale_factor"] = factors[1] if len(factors) > 1 else None
+    out["smart_scale_factor"] = None
+    return out
+
+
 def _label_after(image, result, label, name, method, args, kwargs):
     """`label` after `method` (a geometry operation) took `image` to `result`."""
     op = method.__name__
@@ -345,18 +434,36 @@ def _label_after(image, result, label, name, method, args, kwargs):
     def refuse(why):
         raise LabelMismatchError(
             f"{op}: the label image {name!r} cannot follow its image ({why}), so nothing is "
-            f"done (decision C-2). Drop or fix the label first.")
+            f"done (decisions C-2, C-18): a label follows with the image's pixel count, or "
+            f"covering the same area with a whole-number ratio of pixel sizes. Drop or fix "
+            f"the label first.")
 
     image_axes, label_axes = image.meta.axis_order, label.meta.axis_order
     image0 = dict(zip(image_axes, image.layers[image.meta.resolution_paths[0]].shape))
     label0 = dict(zip(label_axes, label.layers[label.meta.resolution_paths[0]].shape))
     shared = [a for a in label_axes if a in image_axes and a != "c"]
+
+    def ratio(a, i_level=0, l_level=0):
+        """Label pixels per image pixel along `a` on the given levels (1, n or 1/n), the
+        two covering the same area (decision C-18); refuses otherwise."""
+        isz = image.layers[image.meta.resolution_paths[i_level]].shape[image_axes.index(a)]
+        lsz = label.layers[label.meta.resolution_paths[l_level]].shape[label_axes.index(a)]
+        q = _pixel_ratio(isz, image.meta.get_scale(image.meta.resolution_paths[i_level])
+                         [image_axes.index(a)], lsz,
+                         label.meta.get_scale(label.meta.resolution_paths[l_level])
+                         [label_axes.index(a)])
+        if q is None:
+            refuse(f"{lsz} along {a}, the image {isz}")
+        return q
+
     if op == "isel":
         indexers = {_AXIS_ALIASES_PYR.get(a, a): v for a, v in kwargs.items()}
-        mine = {a: v for a, v in indexers.items() if a in label_axes and a != "c"}
-        for a in mine:
-            if label0[a] != image0.get(a):
-                refuse(f"{label0[a]} along {a}, the image {image0.get(a)}")
+        mine = {}
+        for a, v in indexers.items():
+            if a not in label_axes or a == "c":
+                continue
+            q = ratio(a)
+            mine[a] = v if q == 1 else _index_onto(v, q, image0[a], label0[a], a, refuse)
         return label.isel(**mine) if mine else label
     if op == "squeeze":
         dropped = [a for a in image_axes if a not in result.meta.axis_order]
@@ -371,22 +478,36 @@ def _label_after(image, result, label, name, method, args, kwargs):
         for i in chosen:
             if i >= len(label_levels):
                 refuse(f"{len(label_levels)} level(s), no level {i}")
-            if any(label_levels[i][a] != image_levels[i].get(a) for a in shared):
-                refuse(f"level {i} is {label_levels[i]}, the image's {image_levels[i]}")
+            for a in shared:
+                ratio(a, i, i)                      # same area, whole ratio, on level i
         return label.select_levels(*chosen)
     if op == "downscale":
-        bound = inspect.signature(method).bind(image, *args, **kwargs).arguments
-        bound.pop("self", None)
-        options = {**bound.pop("kwargs", {}), **bound}
-        options["downscale_method"] = "simple"         # labels: nearest, never averaged
-        for a in shared:
-            if label0[a] != image0.get(a):
-                refuse(f"{label0[a]} along {a}, the image {image0.get(a)}")
-        followed = label.downscale(**options)
+        same = {a for a in shared if ratio(a) == 1}
+        # the image's levels as built (resolve_levels), on the label's axes: the label
+        # gets the image's factors, and its sizes where the pixel counts match; a label
+        # at another resolution (decision C-18) keeps its own sizes, the same area
+        built = getattr(result, "_built_plan", None) or getattr(result, "_downscale_plan", None)
+        plan = _plan_onto(built, image_axes, label_axes,
+                          [tuple(label.layers[p].shape) for p in label.meta.resolution_paths],
+                          same)
+        plan["downscale_method"] = "simple"            # labels: picked, never averaged
+        base = label.select_levels(0) if label.nlevels > 1 else label
+        base.__dict__.pop("_downscale_plan", None)
+        deferred = getattr(result, "_downscale_plan", None) is not None
+        followed = base._materialize_plan(plan) if deferred else base._build_levels(plan)
         image_levels, label_levels = _level_sizes(result), _level_sizes(followed)
-        if len(label_levels) != len(image_levels) or any(
-                label_levels[i][a] != image_levels[i].get(a)
-                for i in range(len(image_levels)) for a in shared):
+        bad = len(label_levels) != len(image_levels) or any(
+            label_levels[i][a] != image_levels[i].get(a)
+            for i in range(len(image_levels)) for a in same)
+        for i in range(min(len(label_levels), len(image_levels))):
+            for a in shared:
+                if a not in same:
+                    rp = result.meta.resolution_paths[i]
+                    fp = followed.meta.resolution_paths[i]
+                    bad = bad or _pixel_ratio(
+                        image_levels[i][a], result.meta.get_scale(rp)[image_axes.index(a)],
+                        label_levels[i][a], followed.meta.get_scale(fp)[label_axes.index(a)]) is None
+        if bad:
             refuse(f"its levels would be {[tuple(l.values()) for l in label_levels]}, the "
                    f"image's {[tuple(l.values()) for l in image_levels]}")
         return followed
@@ -1906,8 +2027,12 @@ class Pyramid:
                                 backend='numpy',
                                 smart_scale_factor=None,
                                 downscale_backend='tensorstore',
+                                level_factors=None,
+                                level_shapes=None,
                                 **kwargs) -> 'Pyramid':
-        """Update downscaler for creating pyramid layers."""
+        """Update downscaler for creating pyramid layers. `level_factors` and
+        `level_shapes` (``resolve_levels``) give every level's cumulative factor and
+        shape; ``_build_levels`` passes them, and they override the rest."""
         if self.meta is None:
             raise RuntimeError("Pyramid not initialized")
 
@@ -1919,7 +2044,9 @@ class Pyramid:
         if scale_factor is None:
             scale_factor = tuple([defaults.scale_factor_map[key] for key in self.axes])
 
-        if n_layers in (None, 'default', 'auto'):
+        if level_factors is not None:
+            n_layers = len(level_factors)
+        elif n_layers in (None, 'default', 'auto'):
             n_layers = calculate_n_layers(shape, scale_factor, min_dimension_size)
         n_layers = int(n_layers)
 
@@ -1935,6 +2062,8 @@ class Pyramid:
             backend=backend,
             smart_scale_factor=smart_scale_factor,
             downscale_backend=downscale_backend,
+            level_factors=level_factors,
+            level_shapes=level_shapes,
         )
         await self.downscaler.update()
         return self
@@ -1959,8 +2088,9 @@ class Pyramid:
         # Convert scales to list format
         scales_list: List[Union[List[float], np.ndarray]] = scales.tolist() if hasattr(scales, 'tolist') else list(scales)  # type: ignore
         
-        # Filter out None values from unit_list for passing to from_arrays
-        unit_list_clean: List[str] = [u for u in unit_list if u is not None]
+        # one unit per axis, None for a unitless one (t, z of some files, idr0010): dropping
+        # the Nones left fewer units than axes and the downscale raised
+        units_given = list(unit_list) if any(u is not None for u in unit_list) else None
 
         # from_arrays() derives the compressor from arrays[0] itself when it's
         # zarr-backed (and forbids passing compressor= in that case) - only
@@ -1971,7 +2101,7 @@ class Pyramid:
         new_pyr = Pyramid().from_arrays(
             arrays=arrays,
             axis_order=axis_order,
-            unit_list=unit_list_clean if unit_list_clean else None,  # type: ignore
+            unit_list=units_given,  # type: ignore
             scales=scales_list,  # type: ignore
             name=name,
             compressor=compressor,
@@ -2071,6 +2201,41 @@ class Pyramid:
             )
         return plan
 
+    def _resolve_plan(self, plan: dict) -> dict:
+        """`plan` with every level's cumulative factor and shape filled in
+        (``level_scale_factors``, ``level_shapes``, ``n_layers``) for this pyramid's
+        level 0, by ``resolve_levels``: the one place a plan's levels are worked out."""
+        from ome_zarr_pyramid.utils.scale import resolve_levels
+        base = self.layers[self.meta.resolution_paths[0]].shape
+        factors, shapes = resolve_levels(base, self.axes, **plan)
+        out = dict(plan)
+        out["n_layers"] = len(factors)
+        out["level_scale_factors"], out["level_shapes"] = factors, shapes
+        if out.get("scale_factor") is None and len(factors) > 1:
+            out["scale_factor"] = factors[1]
+        return out
+
+    def _build_levels(self, plan: dict, **kwargs) -> 'Pyramid':
+        """The pyramid of `plan`'s levels over this pyramid's level 0, lazy: every level
+        from level 0 with its factor (``downscale_level``), cut to its shape, its scale
+        level 0's times the factor. THE builder: the eager ``downscale``, a deferred
+        plan's visible levels, ``select_levels`` on a plan, the writer and the label rule
+        all build levels here, so what a pyramid shows is what it writes."""
+        plan = self._resolve_plan(plan)
+        _run_coroutine(self.update_downscaler(
+            scale_factor=plan.get("scale_factor"),
+            n_layers=plan["n_layers"],
+            downscale_method=plan.get("downscale_method") or "simple",
+            backend=plan.get("backend") or "numpy",
+            downscale_backend=plan.get("downscale_backend") or "tensorstore",
+            level_factors=plan["level_scale_factors"],
+            level_shapes=plan["level_shapes"],
+            **kwargs,
+        ))
+        built = self.get_downscaled_pyramid()
+        built._built_plan = plan
+        return built
+
     @_labels_follow
     def downscale(self,
                   n_layers: Optional[int] = None,
@@ -2159,88 +2324,73 @@ class Pyramid:
         """
         from ome_zarr_pyramid.utils.scale import check_downscale_args
         check_downscale_args(downscale_method, downscale_backend)
+        # ONE plan for both modes (``defer`` only says whether the writer gets it).
+        # MERGED with any plan already carried rather than replacing it: ops propagate a
+        # plan across a pipeline precisely so the intent survives, so the method named
+        # `downscale` must not be the one that silently discards it. Explicitly passed
+        # arguments win; omitted ones (left at their `None`/default) inherit. A bare
+        # `.downscale()` on an already-planned pyramid is a no-op, `.downscale(n_layers=4)`
+        # keeps the carried factors, and a pyramid with no plan gets one built from its own
+        # levels or the defaults. Use `drop_downscale_plan()` to start over.
+        recipe = {
+            'n_layers': n_layers,
+            'min_dimension_size': min_dimension_size,
+            'scale_factor': scale_factor,
+            'downscale_method': downscale_method,
+            'backend': backend,
+            'smart_scale_factor': smart_scale_factor,
+            'downscale_backend': downscale_backend,
+        }
+        carried = getattr(self, '_downscale_plan', None)
+        if carried is not None and n_layers is None and carried.get('n_layers'):
+            # Activating a DORMANT plan with no arguments: adopt the level count it
+            # derived from the source, so `.downscale()` means "give me the levels my
+            # source had" rather than recomputing from min_dimension_size.
+            recipe['n_layers'] = carried['n_layers']
+        if carried is not None:
+            defaults = {'n_layers': None, 'min_dimension_size': 64,
+                        'scale_factor': None, 'downscale_method': 'simple',
+                        'backend': 'numpy', 'smart_scale_factor': None,
+                        'downscale_backend': 'tensorstore'}
+            recipe = {k: (v if v != defaults[k] else carried.get(k, v))
+                      for k, v in recipe.items()}
+            # The per-level lists are not among `recipe`'s own fields, so the
+            # comprehension above would DROP them. Carry them, unless the caller named a
+            # scale_factor - which supersedes the source's factors.
+            if scale_factor is None:
+                for k in ('level_scale_factors', 'level_shapes'):
+                    if carried.get(k) is not None:
+                        recipe[k] = carried[k]
+        base = self
+        if len(self.meta.resolution_paths) > 1:
+            # The pyramid already HAS levels and the caller named no scale_factor: the
+            # source's own factors (per level and per axis) and shapes, not 2 on z/y/x,
+            # so an anisotropic, irregular or floor-sized source round-trips. Derivation
+            # is verified or refused - on refusal the defaults are used and
+            # `derive_downscale_plan` has already warned that shapes may change.
+            if scale_factor is None and (carried is None
+                                         or carried.get('scale_factor') is None):
+                derived = self.derive_downscale_plan(
+                    downscale_method=recipe.get('downscale_method', 'simple'))
+                if derived is not None:
+                    recipe['scale_factor'] = derived['scale_factor']
+                    recipe['level_scale_factors'] = derived['level_scale_factors']
+                    recipe['level_shapes'] = derived['level_shapes']
+                    if n_layers is None and (carried is None
+                                             or carried.get('n_layers') is None):
+                        recipe['n_layers'] = derived['n_layers']
+            # The plan describes the whole result from level 0: narrow to it, or the old
+            # levels would linger beside the new ones (and the writer, handed several
+            # levels, would write them instead of the plan).
+            base = self.select_levels(0)
         if defer:
-            # Record the recipe; the writer builds the levels when it writes.
-            # MERGE with any plan already carried rather than replacing it: ops propagate
-            # a plan across a pipeline precisely so the intent survives, so the method
-            # named `downscale` must not be the one that silently discards it. Explicitly
-            # passed arguments win; omitted ones (left at their `None`/default) inherit.
-            # Consequences: a bare `.downscale()` on an already-planned pyramid is a no-op,
-            # `.downscale(n_layers=4)` keeps the carried `scale_factor`, and a pyramid with
-            # no plan gets one built from the defaults. Use `drop_downscale_plan()` to
-            # start over.
-            recipe = {
-                'n_layers': n_layers,
-                'min_dimension_size': min_dimension_size,
-                'scale_factor': scale_factor,
-                'downscale_method': downscale_method,
-                'backend': backend,
-                'smart_scale_factor': smart_scale_factor,
-                'downscale_backend': downscale_backend,
-            }
-            carried = getattr(self, '_downscale_plan', None)
-            if carried is not None and n_layers is None and carried.get('n_layers'):
-                # Activating a DORMANT plan with no arguments: adopt the level count it
-                # derived from the source, so `.downscale()` means "give me the levels my
-                # source had" rather than recomputing from min_dimension_size.
-                recipe['n_layers'] = carried['n_layers']
-            if carried is not None:
-                defaults = {'n_layers': None, 'min_dimension_size': 64,
-                            'scale_factor': None, 'downscale_method': 'simple',
-                            'backend': 'numpy', 'smart_scale_factor': None,
-                            'downscale_backend': 'tensorstore'}
-                recipe = {k: (v if v != defaults[k] else carried.get(k, v))
-                          for k, v in recipe.items()}
-                # The derived per-level keys are not part of `recipe`'s own six fields,
-                # so the comprehension above would DROP them and the merged plan would
-                # fall back to a single repeated factor. Carry them, unless the caller
-                # named a scale_factor - which supersedes what was derived.
-                if scale_factor is None:
-                    for k in ('level_scale_factors', 'level_shapes'):
-                        if carried.get(k) is not None:
-                            recipe[k] = carried[k]
-            if len(self.meta.resolution_paths) > 1:
-                # The pyramid already HAS levels and the caller named no scale_factor:
-                # derive it from those levels instead of assuming 2 on z/y/x, so a
-                # source built with an anisotropic or irregular progression round-trips.
-                # Derivation is verified or refused - on refusal we keep the defaults and
-                # `derive_downscale_plan` has already warned that shapes may change.
-                if scale_factor is None and (carried is None
-                                             or carried.get('scale_factor') is None):
-                    derived = self.derive_downscale_plan(
-                        downscale_method=recipe.get('downscale_method', 'simple'))
-                    if derived is not None:
-                        recipe['scale_factor'] = derived['scale_factor']
-                        recipe['level_scale_factors'] = derived['level_scale_factors']
-                        recipe['level_shapes'] = derived['level_shapes']
-                        if n_layers is None and (carried is None
-                                                 or carried.get('n_layers') is None):
-                            recipe['n_layers'] = derived['n_layers']
-                # Asking to (re)downscale a pyramid that ALREADY has levels: narrow to
-                # level 0 first, so the plan describes the whole result. Leaving the old
-                # levels in place would make the plan unactionable - the writer builds the
-                # base and then expands from disk, so it must be handed a single level -
-                # and `write_pyramid` would fall back to writing the existing levels,
-                # silently ignoring the new recipe.
-                base = self.select_levels(0)
-                return base._materialize_plan(recipe)
-            # ACTIVATION. A dormant plan inherited from the source records what the
-            # source's levels were but commits to nothing; `downscale()` is what turns
-            # that record into levels. A bare `downscale()` therefore activates exactly
-            # what was derived (the source's own level count and per-axis factors) -
-            # explicit arguments override, having already been merged into `recipe`.
-            return self._materialize_plan(recipe)
-        _run_coroutine(self.update_downscaler(
-            scale_factor=scale_factor,
-            n_layers=n_layers,
-            downscale_method=downscale_method,
-            backend=backend,
-            smart_scale_factor=smart_scale_factor,
-            min_dimension_size=min_dimension_size,
-            downscale_backend=downscale_backend,
-            **kwargs,
-        ))
-        return self.get_downscaled_pyramid()
+            # Record the plan for the writer and show its levels (lazy, nothing computed)
+            return base._materialize_plan(recipe)
+        if getattr(base, '_downscale_plan', None) is not None:
+            base = base._clone_metadata_only()
+            base.__dict__.pop('_downscale_plan', None)
+            base.__dict__.pop('_downscale_plan_active', None)
+        return base._build_levels(recipe, **kwargs)
 
     def _materialize_plan(self, recipe: dict) -> 'Pyramid':
         """Expand `recipe` into VISIBLE lazy levels, keeping the plan for the writer.
@@ -2262,16 +2412,10 @@ class Pyramid:
         pixels through a resolved coarse level instead re-runs the base graph - which is
         why the plan, not these arrays, drives the write.
         """
-        keys = ('n_layers', 'min_dimension_size', 'scale_factor',
-                'downscale_method', 'backend', 'smart_scale_factor', 'downscale_backend')
-        dk = {k: recipe.get(k) for k in keys}
-        if dk.get('downscale_backend') is None:
-            dk['downscale_backend'] = 'tensorstore'
-        if dk.get('min_dimension_size') is None:
-            dk['min_dimension_size'] = 64
         saved = self.__dict__.pop('_downscale_plan', None)
         try:
-            full = self.downscale(defer=False, **dk)
+            recipe = self._resolve_plan(recipe)
+            full = self._build_levels(recipe)
         except Exception as exc:
             # Keep the pyramid usable (the plan still drives the write), but do NOT fail
             # silently: this fallback once turned a hard `Downscaler` bug into a pyramid
@@ -2393,11 +2537,13 @@ class Pyramid:
             new_arrays.append(a.rechunk(spec))
 
         compressor = None if isinstance(new_arrays[0], zarr.Array) else self.compressor
-        unit_clean = [u for u in self.meta.unit_list if u is not None]
+        # one unit per axis, None for a unitless one (as in _build_indexed): dropping the
+        # Nones made every rechunk of an image with a unitless t or z raise
+        units = list(self.meta.unit_list or [])
         new_pyr = Pyramid().from_arrays(
             arrays=new_arrays,
             axis_order=axes,
-            unit_list=unit_clean if unit_clean else None,  # type: ignore
+            unit_list=units if any(u is not None for u in units) else None,  # type: ignore
             scales=[self.meta.get_scale(p) for p in paths],  # type: ignore
             name=self.meta.multiscales.get('name', 'unnamed') if self.meta.metadata else 'unnamed',
             compressor=compressor,
@@ -2797,14 +2943,11 @@ class Pyramid:
         A CONTIGUOUS selection stays deferred (finest kept -> new base + a narrowed
         plan for the coarser kept levels); a non-contiguous one is returned as the
         selected lazy arrays."""
-        keys = ('n_layers', 'min_dimension_size', 'scale_factor',
-                'downscale_method', 'backend', 'smart_scale_factor')
-        dk = {k: plan[k] for k in keys}
-        dk['downscale_backend'] = plan.get('downscale_backend', 'tensorstore')
         # resolve the plan into a full lazy pyramid WITHOUT disturbing self's plan
         saved = self.__dict__.pop('_downscale_plan', None)
         try:
-            full = self.downscale(defer=False, **dk)   # lazy: no compute, all levels
+            plan = self._resolve_plan(plan)
+            full = self._build_levels(plan)            # lazy: no compute, all levels
         finally:
             if saved is not None:
                 self._downscale_plan = saved
@@ -2816,10 +2959,13 @@ class Pyramid:
             # contiguous -> keep the coarser kept levels DEFERRED, re-based on level sel[0]
             new = full._select_materialized([sel[0]])   # finest kept -> single-level base
             n_kept = len(sel)
-            if n_kept > 1:
-                narrowed = {k: plan[k] for k in keys}
-                narrowed['n_layers'] = n_kept
+            narrowed = _rebased(plan, sel[0], n_kept) if n_kept > 1 else None
+            if narrowed is not None:
                 new._downscale_plan = narrowed
+            elif n_kept > 1:
+                # the kept levels' factors are not whole multiples of the new base's:
+                # the selected lazy levels as they are
+                new = full._select_materialized(sel)
         else:
             # non-contiguous -> select the resolved lazy levels directly
             new = full._select_materialized(sel)

@@ -97,7 +97,10 @@ under the image's `labels` group). `io.read_labels` and `io.write_labels` handle
 its own. An attached label follows its image through `isel`, `squeeze`, `select_levels` and
 `downscale` (downscaled with `"simple"`, so its values stay labels); a label that cannot
 follow, such as one of another size along a cropped axis, raises `LabelMismatchError`
-before anything is done. A collection's RFC 8 label nodes follow their images the same way.
+before anything is done. A label stored at another resolution than its image (a quarter, as
+Fractal writes them) follows in physical space: it gets the image's downscale factors, and a
+crop maps through the ratio of pixel sizes. A collection's RFC 8 label nodes follow their
+images the same way.
 
 `Pyramid` and `PyramidCollection` share names: one name means one thing. A collection
 answers `axes`, `dtype`, `shape`, `nlayers` (and `compressor`, `scale_factor_dict`,
@@ -353,10 +356,18 @@ from ome_zarr_pyramid import PyramidCollection
 
 plate_coll = PyramidCollection.from_zarr("plate.ome.zarr")   # an NGFF plate; no image read yet
 plate = plate_coll.plates[0]
-plate.rows, plate.columns                     # ('A', 'B', ...), ('1', '2', ...)
+plate.row_names, plate.column_names           # ('A', 'B', ...), ('1', '2', ...)
 well = plate.wells[plate.well_index("B3")]    # Well(row=1, column=2, name='B3')
 pyr = well.fields[0].image                    # -> Pyramid, opened now
+part = plate.rows[2:5].columns[3:7]           # a part of the plate: still a plate
 ```
+
+Every level knows what it is and what holds it: `.kind` is `"plate"`, `"well"` or
+`"field"` (`"collection"` for a collection as read), and `.parent` is the level above
+(`well.parent` is its plate, `plate.parent` the collection). Accessors go down only: a
+collection holds `.plates`, a plate `.wells`, a well `.fields`, a field its images.
+`plate.rows` and `plate.columns` slice a plate by position, name or a list of them, as
+`select(row=..., column=...)` does; rows and columns are a well's address, not a level.
 
 Plates are navigated as in micro-reader: rows and columns count from 0,
 `plate.wells[w]` is the well with index `"well": w`, and `well.fields[f]` its f-th field.
@@ -366,7 +377,14 @@ When a field has one image per acquisition, pick one first:
 A plate, a well or a field turns into a collection of its own with `as_collection()`
 (ozp's step from micro-reader's navigation to a collection): `coll.plates[1].as_collection()`
 holds that plate's images, keyed as before, with the plate as its tree, so
-`coll.plates[1].as_collection().write("plate1.ome.zarr")` writes that plate alone.
+`coll.plates[1].as_collection().write("plate1.ome.zarr")` writes that plate alone. Such a
+collection keeps its level: a plate's collection has `.wells` (not `.plates`), a well's
+`.fields`, and a selection of it is still a plate, showing the wells it holds
+(`pcoll.select(row="B").wells`).
+
+What a collection holds is read from its table, metadata only: `coll.table.columns`,
+`coll.table["dtype"]`, `coll.table.unique("well_name")`, `coll.table.count("codec")`, or
+`coll.table.to_pandas()`.
 
 Two ways to narrow a collection: `select` slices along the indices (plate, well, field,
 view, illumination, ...), `filter` queries the table's columns (`filter(dtype="uint16")`,
@@ -375,13 +393,19 @@ the same arguments as micro-reader's `File.select` and gives the same images:
 
 ```python
 coll.select(plate=0, well=12)                    # a well by its place in plate.wells
-coll.select(well="C3")                           # by name (in each plate)
-coll.select(row="C", column=range(1, 4))         # rows / columns: names, or 0-based numbers
+coll.select(well_name="C3")                      # by name (in each plate)
+coll.select(row_name="C", column=range(1, 4))    # rows / columns: names, or 0-based numbers
 coll.select(illumination=[2, 3])                 # a list, tuple, range or set: any of them
+coll.select(row=slice(2, None))                  # a slice of positions: row C onward
 ```
 
-`row` and `column` count from 0 like `Well.row` and `Well.column` (`column=2` is the
-column named "3"); they are another address of the well, so they do not go with `well`.
+A plate's places have a position and a name, a keyword each, which are the table's columns
+too: `plate` / `plate_name`, `acquisition` / `acquisition_name`, `well` / `well_name`,
+`row` / `row_name`, `column` / `column_name`. So an image's own value in any of those
+columns selects it. A name given to a position keyword is its name (`well="C3"` is
+`well_name="C3"`). Positions count from 0 like `Well.row` and `Well.column` (`column=2` is
+the column named "3"); `row` and `column` are another address of the well, so they do not
+go with `well`.
 A `Well` (or `Plate`, `Field`, `Acquisition`) object is no index value: `select` raises
 and names `well_index(...)`, the name, and `.as_collection()`.
 

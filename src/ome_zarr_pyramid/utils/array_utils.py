@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import math
+import re
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -200,33 +201,32 @@ def get_chunksize_from_array(arr) -> str:
     return f'{chunk_size_gb * 1.1:.2f}GB'
 
 
+#: MB per unit of a memory size string (binary units: 1 GB = 1024 MB)
+_MEMORY_UNITS = {"b": 1 / 1024 ** 2, "k": 1 / 1024, "kb": 1 / 1024, "kib": 1 / 1024,
+                 "m": 1.0, "mb": 1.0, "mib": 1.0, "g": 1024.0, "gb": 1024.0, "gib": 1024.0,
+                 "t": 1024.0 ** 2, "tb": 1024.0 ** 2, "tib": 1024.0 ** 2}
+
+
 def parse_memory(gb_string: Union[str, int, float]) -> float:
-    """Convert memory size string to megabytes.
+    """Convert a memory size to megabytes.
 
     Args:
-        gb_string: String like '5GB', '1.2GB', or numeric value
+        gb_string: a number (MB), or a string such as '512', '512MB', '4GB', '4 GiB',
+            '1.5g', '2TB' (binary units, case-insensitive; no unit means MB)
 
     Returns:
         Size in megabytes
     """
-    if isinstance(gb_string, (int, float)):
-        # Assume already in MB
+    if not isinstance(gb_string, str):
+        # a number: already in MB
         return float(gb_string)
-
-    if isinstance(gb_string, str):
-        gb_string = gb_string.strip().upper()
-        if gb_string.isnumeric():
-            # Already in MB
-            return float(gb_string)
-        if not gb_string.endswith('GB'):
-            # Assume MB
-            return float(gb_string)
-
-        # Extract numeric part and convert from GB to MB
-        number_part = gb_string[:-2]  # remove 'GB'
-        return float(number_part) * 1024
-
-    return float(gb_string)
+    match = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*", gb_string)
+    unit = match.group(2).lower() if match else None
+    if unit is None or (unit and unit not in _MEMORY_UNITS):
+        raise ValueError(f"memory size {gb_string!r}: give a number of MB or a size "
+                         f"such as '512MB', '8GB', '1TB'")
+    number = float(match.group(1))
+    return number * _MEMORY_UNITS[unit] if unit else number
 
 
 def autocompute_chunk_shape(

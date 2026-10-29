@@ -293,7 +293,7 @@ def test_s3_plate_table_from_metadata_files(bucket, tmp_path):
     coll = PyramidCollection.from_zarr(url, storage_options=opts)
     table = coll.table
     assert len(table) == 4 and _opened(coll) == []
-    assert coll.unique("well_name") == ["A2", "B1"]
+    assert coll.table.unique("well_name") == ["A2", "B1"]
     for key, row in zip(coll, table.rows):
         node = coll._pyramids[key]
         expected = row_from_pyramid(coll[key], path=node.loader.path_of(node))

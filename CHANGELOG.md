@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased): one API for Pyramid and PyramidCollection, IO as the hub
+## 0.5.0 (2026-10-28): one API for Pyramid and PyramidCollection, IO as the hub
 
 A minor release (decision C-11): names are added and every existing name keeps working;
 one return value changes (see Changed). eubi-bridge needs no change (it does not read
@@ -62,6 +62,31 @@ those return values).
   `row` / `column` (0-based numbers or names; not together with `well`), and a list,
   tuple, range or set as any value (any of them). A test checks that ozp and
   micro-reader select the same images for the same arguments.
+- `select`'s keywords are the table's columns: each place of a plate has a position and a
+  name, `plate` / `plate_name`, `acquisition` / `acquisition_name`, `well` / `well_name`,
+  `row` / `row_name`, `column` / `column_name` (`select(well_name="B2")` raised
+  `KeyError`). The table gains `row` and `column`, the well's 0-based row and column, beside
+  `row_name` and `column_name`. A name given to a position keyword is still its name
+  (`well="B2"`); a number given to a name keyword raises `TypeError` naming the position
+  keyword. The `KeyError` for an unknown keyword lists `row`, `column` and the names too.
+- `select` (and `Field.select`) take slices of positions, as ranges: `well=slice(0, 12)`,
+  `row=slice(2, None)` (open-ended: row C onward), `column=slice(0, None, 2)`. A slice
+  selected nothing, silently (it was compared as one value); a negative bound or a step
+  below 1 raises `ValueError` (which position is last depends on what is selected), a
+  slice on a name keyword `TypeError`. As micro-reader's.
+- Containment (decision C-19), as micro-reader's navigation (a test keeps the two the
+  same): every level has `.kind` and `.parent`. A plate, well or field view knows its
+  kind (`"plate"`, `"well"`, `"field"`) and the level above (`well.parent` is its plate,
+  `plate.parent` the collection). A collection is `"collection"` as read or built, and
+  `"plate"`, `"well"` or `"field"` when taken from navigation (`as_collection()`; a
+  selection or operation of it keeps its kind and parent). Accessors go down only: a
+  collection holds `.plates`, a plate's collection `.wells` (and `.row_names`,
+  `.column_names`, `.well_index`), a well's `.fields`, a field's `.images`; another
+  level's accessor raises `AttributeError` naming the way. `plate.rows[...]` /
+  `plate.columns[...]` give a part of the plate, still a plate (`plate.rows[2:5].columns[3:7]`,
+  as `select(row=..., column=...)`). A selection's plates and wells are the ones holding
+  its images: `pcoll.select(row="B").wells` is row B's wells (they listed every well of
+  the tree, empty ones too); the tree underneath stays whole for writing.
 - `coll.drop_empty()`: the collection with the fields, wells, plates and other
   collections that hold no image dropped from its tree; plates and wells are numbered
   anew (`"well": w` is `plates[p].wells[w]`), every other index keeps its value, the
@@ -123,8 +148,46 @@ those return values).
   follow (another size along an indexed axis, fewer levels) raises the new
   `LabelMismatchError` (a `ValueError`) naming the label, and on a collection the image,
   before anything is done.
+- A label at another resolution than its image follows it in physical space (decision
+  C-18): Fractal's plates store labels at a quarter of the image's resolution, covering the
+  same area. Along each axis the pixel sizes must differ by a whole-number ratio and the
+  label's size be the image's at that ratio. `downscale` gives the label the image's
+  factors (its levels stay aligned: 540 -> 270 -> 135 beside 2160 -> 1080 -> 540); `isel`
+  maps an index through the ratio (a slice when it lands on whole label pixels, an integer
+  to the label pixel holding it); `select_levels` takes the same levels.
 
 ### Fixed
+
+- **An RFC 8 plate written as NGFF 0.4, 0.5 or 0.6** (`PyramidCollection.from_zarr(rfc8)
+  .write_plate(out, version="0.6")`) put each field at its path from the collection's root
+  inside its well (`B/2/B/2/0`, not a valid NGFF image path); in 0.6 the well's scene then
+  named images it could not find, and every field read back at the origin. A well writes
+  each image at the last part of its path (found by eubi-bridge's OME-Zarr plate input,
+  Workplan E2).
+
+Found by the operations on real plates (Workplan C8):
+
+- `Pyramid.rechunk`, and writing a downscale plan, of an image with a unitless axis besides
+  the channel axis (idr0010: `t` and `z` without a unit) raised "Number of units must match
+  number of axes except channel", as `isel` did: the unitless axes' units were dropped.
+- The levels a pyramid shows are the levels it writes. A downscale's levels were worked out
+  in several places (the eager `downscale(defer=False)`, the levels a deferred plan shows,
+  `select_levels` on a plan, the writer's two routes, the label rule), each its own way, and
+  they disagreed: a deferred downscale of floor-sized levels (Fractal's plates: 535 -> 267)
+  showed 268 and wrote 267, one of an irregular source (64 -> 64 / 32 -> 32 / 16) wrote
+  other levels than it showed, and the eager and deferred results differed for most
+  sources. Now `resolve_levels` works out every level's factor and shape once, the plan
+  holds them (`level_scale_factors`, `level_shapes`), and one builder makes the levels
+  from them everywhere.
+- An attached label with fewer axes than its image (a `zyx` label on a `czyx` image) could
+  not follow a downscale plan when written ("operands could not be broadcast together"),
+  and did not get the image's floor-sized levels.
+- `coll.write(path)` of a collection holding a plate and images beside it (a CZI's slide
+  overview) wrote everything as a series, losing the plate, without a word. It is refused
+  now, naming the ways out: the plate alone (`coll.plates[0].as_collection().write(path)`),
+  the other images (`coll.select(...)`), or all of it as RFC 8.
+- An RFC 8 store holding a plate and images beside it read back the plate only: the images
+  beside it are keyed `(("series", i),)` now, as micro-reader keys them.
 
 - Writing an RFC 8 collection read from a store as RFC 8 again was refused ("image
   'A/2/A/2/0/labels/nuclei' would be written inside the image group 'A/2/A/2/0'"): the
@@ -141,6 +204,22 @@ those return values).
 
 ### Changed
 
+- **Breaking:** a plate view's `rows` and `columns` slice the plate (decision C-19); the
+  names are `row_names` and `column_names`, as micro-reader's. `len(plate.rows)` still
+  works. ozp reads micro-reader 0.2's plates (`rows` held the names) as before.
+- `.plates` of a plate's (or well's) collection raises `AttributeError` naming `.wells`
+  (it gave the plate itself); a collection as read keeps `.plates`.
+- What the table holds is read from the table: `coll.columns`, `coll.unique(column)` and
+  `coll.count(column)` are `coll.table.columns`, `coll.table.unique(column)` and
+  `coll.table.count(column)`. The old names still answer, with a `FutureWarning`, and will
+  be removed; on a plate's collection `coll.columns` is the column slicer (decision C-19),
+  beside `coll.rows`: `pcoll.rows[2:5].columns[3:7]` is the plate's collection with those
+  images. `filter`, `group_by` and `sort_by` stay on the collection: they give collections.
+- `downscale(defer=False)` of a pyramid that already has levels uses the pyramid's own
+  factors and level shapes, as `downscale()` (deferred) always did, unless a `scale_factor`
+  is named: it forced 2 on z / y / x, so an anisotropic source (z kept) came out halved
+  along z. Levels past the source's last one continue with its last step (they repeated
+  level 1's factor). A plan now always holds every level's factor and shape.
 - `isel`, `squeeze`, `select_levels`, `downscale`, `rechunk` and the operators no longer
   drop a pyramid's attached labels: they follow it (see New), or the operation raises
   `LabelMismatchError` when one cannot.

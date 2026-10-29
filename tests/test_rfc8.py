@@ -135,7 +135,7 @@ def test_the_rfc_hcs_examples_read_as_plates(tmp_path):
         _write_json(path, {"ome": {"version": "0.x", **doc}})
         coll = PyramidCollection.from_zarr(path)
         (plate,) = coll.plates
-        assert plate.rows == ("A",) and plate.columns == ("1",)
+        assert plate.row_names == ("A",) and plate.column_names == ("1",)
         assert [w.name for w in plate.wells] == ["well A01"]
         assert sorted(dict(k)["acquisition"] for k in coll) == ([0] if name == "wide" else [0, 1])
 
@@ -250,10 +250,12 @@ def test_a_selection_is_written_with_its_part_of_the_tree(tmp_path):
     out = part.write(str(tmp_path / "part.zarr"), version="rfc8")
     back = PyramidCollection.from_zarr(out)
     assert sorted(back) == sorted(part)
-    # the plate keeps its wells (B1 empty), so every key reads back as it was
-    assert [w.name for w in back.plates[0].wells] == ["A2", "B1"]
-    assert [len(w.fields) for w in back.plates[0].wells] == [len(coll.plates[0].wells[0].fields), 0]
-    assert back.plates[0].rows == coll.plates[0].rows                # rows / columns as read
+    # the plate keeps its wells (B1 empty), so every key reads back as it was; its views
+    # show the wells holding images (decision C-19), B1 stays in the tree underneath
+    assert [w.name for w in back.plates[0].wells] == ["A2"]
+    assert back.plates[0].well_index("B1") == coll.plates[0].well_index("B1")
+    assert [w.name for w in back._plate_views()[0].wells] == ["A2", "B1"]
+    assert back.plates[0].row_names == coll.plates[0].row_names      # rows / columns as read
     for key in part:
         np.testing.assert_array_equal(np.asarray(back[key].layers["0"]),
                                       np.asarray(coll[key].layers["0"]))
