@@ -66,7 +66,7 @@ def test_group_by_well_gives_each_well_its_system_and_its_edges():
         assert {e.output for e in g.coordinate_transformations} == {f"well-{well}-registered"}
         g.check_invariants()
     # unique and count read the table, not the graph; the derived collections keep it
-    assert coll.unique("well") == [0, 1]
+    assert coll.table.unique("well") == [0, 1]
     assert coll.sort_by("well", reverse=True).system_of == coll.system_of
 
 

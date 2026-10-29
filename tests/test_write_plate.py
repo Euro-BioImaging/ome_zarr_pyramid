@@ -104,6 +104,22 @@ def test_a_field_with_several_images_raises_but_rfc8_keeps_them(tmp_path):
     assert len(written_images(written, tmp_path / "r.zarr")) == 6
 
 
+@pytest.mark.parametrize("version", ["0.4", "0.5", "0.6"])
+def test_an_rfc8_plate_written_as_ngff_puts_each_field_in_its_well(tmp_path, version):
+    # an RFC 8 tree names its images from the collection's root (./B/3/0); a well
+    # writes each one at the last part of that path, not at B/3/B/3/0
+    coll = PyramidCollection.from_file(_file())
+    rfc8 = str(tmp_path / "r.zarr")
+    coll.write_plate(rfc8, version="rfc8")
+    out = str(tmp_path / "p.zarr")
+    written = PyramidCollection.from_zarr(rfc8).write_plate(out, version=version)
+    assert written_images(written, out) == ["A/1/0", "B/3/0", "B/3/1"]
+    back = PyramidCollection.from_zarr(out)
+    assert list(back) == list(coll)
+    for key in coll:
+        np.testing.assert_array_equal(_pixels(back[key]), _pixels(coll[key]))
+
+
 def test_an_ngff_plate_is_copied(tmp_path):
     src, data = _plate(tmp_path, "0.4")
     out = str(tmp_path / "copy.zarr")
@@ -181,10 +197,10 @@ def test_harmony_to_ngff_and_back(tmp_path, index, version):
         warnings.simplefilter("ignore")
         coll.write_plate(out)
     back = PyramidCollection.from_zarr(out)
-    layout = [(p.name, p.rows, p.columns, [(w.row, w.column, w.name, [
+    layout = [(p.name, p.row_names, p.column_names, [(w.row, w.column, w.name, [
         (fl.index, sorted(tuple(sorted((k, v) for k, v in i.index.items() if k != "resolution"))
                           for i in fl.images)) for fl in w.fields]) for w in p.wells]) for p in f.plates]
-    assert [(p.name, p.rows, p.columns, [(w.row, w.column, w.name, [
+    assert [(p.name, p.row_names, p.column_names, [(w.row, w.column, w.name, [
         (fl.index, sorted(tuple(sorted(k)) for k in fl.keys)) for fl in w.fields]) for w in p.wells])
         for p in back.plates] == [(n, tuple(r), tuple(c), w) for n, r, c, w in layout]
     for key in coll:

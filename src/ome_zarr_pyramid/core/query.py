@@ -30,7 +30,8 @@ IMAGE_COLUMNS = ("name", "axes", "shape") + tuple(f"size_{a}" for a in SIZE_AXES
     "dtype", "nlevels", "level_shapes", "chunks", "shards", "codec", "version", "scale",
     "units", "translation") + tuple(f"{what}_{a}" for what in ("scale", "unit", "translation")
                                     for a in SIZE_AXES) + ("channels", "nbytes", "path")
-PLATE_COLUMNS = ("plate_name", "well_name", "row_name", "column_name", "acquisition_name")
+PLATE_COLUMNS = ("plate_name", "well_name", "row", "row_name", "column", "column_name",
+                 "acquisition_name")
 #: older column names that still read (decision C-16): ``levels`` is ``nlevels`` (the number
 #: of resolution levels; ``pyr.levels`` is the levels themselves). Each row holds both;
 #: listings show the new name only.
@@ -321,6 +322,16 @@ class CollectionTable:
             raise KeyError(f"no column {column!r}; the columns are {list(self.columns)}")
         return [r.get(column) for r in self.rows]
 
+    def unique(self, column: str) -> list:
+        """The distinct values of a column, sorted (None last): ``table.unique("dtype")``."""
+        return sorted_values(set(self[column]))
+
+    def count(self, column: str) -> Dict[Any, int]:
+        """The number of images per value of a column: ``table.count("codec")`` gives
+        ``{'blosc-lz4': 2}``."""
+        values = self[column]
+        return {v: values.count(v) for v in sorted_values(set(values))}
+
     def to_pandas(self):
         """The table as a pandas DataFrame (pandas is not a dependency of ozp)."""
         import pandas as pd
@@ -337,6 +348,20 @@ class CollectionTable:
         if len(self) > 12:
             out.append(f"... {len(self) - 12} more")
         return "\n".join(out)
+
+
+def order_key(value):
+    """Sorts values of one column: None last, then by type, then by value."""
+    return (value is None, type(value).__name__, value if value is not None else 0)
+
+
+def sorted_values(values) -> list:
+    """A column's values in order (None last); values of one type that do not order by
+    their repr."""
+    try:
+        return sorted(values, key=order_key)
+    except TypeError:
+        return sorted(values, key=lambda v: (v is None, repr(v)))
 
 
 def matches(row: Dict[str, Any], predicate: Optional[Callable], conditions: Dict[str, Any]) -> bool:

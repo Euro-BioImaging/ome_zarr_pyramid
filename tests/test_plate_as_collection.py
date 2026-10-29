@@ -60,10 +60,13 @@ def test_a_plate_as_a_collection_holds_that_plate_only(tmp_path):
     coll = _two_plates()
     second = coll.plates[1].as_collection()
     assert sorted(second) == sorted(coll.select(plate=1))
-    assert len(second.plates) == 1 and second.tree is coll.plates[1].node
-    nav = second.plates[0]                             # navigation as before, keys kept
-    assert [w.name for w in nav.wells] == [w.name for w in coll.plates[1].wells]
-    assert nav.wells[0].fields[1].keys == coll.plates[1].wells[0].fields[1].keys
+    assert second.kind == "plate" and second.parent is coll
+    assert second.tree is coll.plates[1].node
+    # a plate holds wells, not plates (decision C-19); keys kept
+    assert [w.name for w in second.wells] == [w.name for w in coll.plates[1].wells]
+    assert second.wells[0].fields[1].keys == coll.plates[1].wells[0].fields[1].keys
+    with pytest.raises(AttributeError, match="a plate holds no plates.*holds .wells"):
+        second.plates
     with pytest.warns(UserWarning, match="disagrees with the plate's own numbering"):
         back = IO().read(second.write(str(tmp_path / "plate1.zarr")))
         list(back)
@@ -125,10 +128,10 @@ def test_select_by_well_name_row_and_column():
     by_place = coll.select(plate=0, well=b3)
     assert sorted(coll.select(plate=0, well="B3")) == sorted(by_place)
     assert len(coll.select(well="B3")) == 4           # B3 of both plates
-    row_b = plate.rows.index("B")
+    row_b = plate.row_names.index("B")
     assert sorted(coll.select(plate=0, row="B")) == sorted(by_place)
     assert sorted(coll.select(plate=0, row=row_b)) == sorted(by_place)   # 0-based
-    column_3 = plate.columns.index("3")
+    column_3 = plate.column_names.index("3")
     assert sorted(coll.select(plate=0, row="B", column=column_3)) == sorted(by_place)
     assert sorted(coll.select(plate=0, column=["1", "3"])) == sorted(coll.select(plate=0))
     assert len(coll.select(plate=0, row=range(0, 1))) == 1                 # row A: A1
@@ -163,7 +166,10 @@ def test_select_refuses_what_is_no_index_value():
 def test_drop_empty_drops_what_holds_no_image_and_numbers_plates_and_wells_anew(tmp_path):
     coll = _two_plates()
     part = coll.select(plate=1, well="B3", field=2)
-    assert len(part.plates) == 2 and len(part.plates[1].wells) == 2     # the tree as it was
+    # a selection shows what it holds (decision C-19): plate 1's well B3; the tree under it
+    # stays whole, so its keys (and well_index) are the whole plate's
+    assert len(part.plates) == 1 and [w.name for w in part.plates[0].wells] == ["B3"]
+    assert part.plates[0].well_index("B3") == coll.plates[1].well_index("B3")
     small = part.drop_empty()
     assert len(small.plates) == 1 and [w.name for w in small.plates[0].wells] == ["B3"]
     (key,) = small
@@ -202,3 +208,21 @@ def test_the_graph_follows_the_new_keys():
     assert (first.input, first.output) == (rename[a], rename[b])
     assert first.params == {"translation": [0.0, 1.0]}
     assert (second.input, second.output) == (rename[a], "stage")
+
+
+def test_a_selection_read_back_rebuilds_with_its_images_in_their_plate(tmp_path):
+    """.plates shows only the plates and wells holding a selection's images, while the
+    keys keep the whole plate's numbers; a consumer rebuilding a tree from .plates and
+    the keys (eubi-bridge's OME-Zarr plate input) put the image beside the plate."""
+    from ome_zarr_pyramid import io
+    from ome_zarr_pyramid.core.plates import plate_nodes, tree_from_file
+    out = str(tmp_path / "s.zarr")
+    _two_plates().select(plate=1, well=1).write(out, version="rfc8")
+    back = io.read_collection(out)
+    ((key, _),) = [(k, None) for k in back]
+    assert dict(key)["plate"] == 1 and len(back.plates) == 1
+    tree = tree_from_file(SimpleNamespace(plates=back.plates, path="x"), {k: back[k] for k in back})
+    assert [c.kind for c in tree.nodes] == ["plate"]                     # nothing beside it
+    (plate,) = plate_nodes(tree)
+    (well,) = [w for w in plate.nodes if w.nodes]
+    assert well.name == back.plates[0].wells[0].name

@@ -382,3 +382,10 @@ def test_io_read_says_what_to_do_with_one_store_per_image(tmp_path):
         IO().read(by_stem)
     with pytest.raises(FileNotFoundError, match="is no OME-Zarr store"):
         IO().read(str(tmp_path))
+
+
+def test_a_single_image_collection_holds_no_plates():
+    """.plates is [] for a collection of one image, as before 0.5.0 (decision C-19 made
+    it raise for plates, wells and fields only)."""
+    coll = _same_files(1).only().as_collection()
+    assert coll.kind == "image" and coll.plates == []

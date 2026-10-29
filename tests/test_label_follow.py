@@ -122,8 +122,10 @@ def test_rfc8_label_nodes_follow_and_still_match_when_written(tmp_path):
 
 
 def test_an_rfc8_label_that_cannot_follow_refuses_naming_the_image(tmp_path):
-    coll = _rfc8_plate(tmp_path, label_shape=(16, 12))           # the image is 24 wide
-    with pytest.raises(LabelMismatchError, match=r"image \{.*'well': 0.*\}: isel: .*12 along x"):
+    # the image is 24 pixels wide at 0.5: a label 10 wide at 1 covers another area (12 at 1
+    # would cover the same, at half the resolution, and follow: decision C-18)
+    coll = _rfc8_plate(tmp_path, label_shape=(16, 10))
+    with pytest.raises(LabelMismatchError, match=r"image \{.*'well': 0.*\}: isel: .*10 along x"):
         coll.isel(x=slice(0, 4))
     coll.isel(y=slice(0, 4))                                       # y sizes agree: fine
 

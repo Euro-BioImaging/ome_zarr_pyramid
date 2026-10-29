@@ -59,11 +59,11 @@ def test_queries():
     assert [dict(k)["series"] for k in coll.filter(size_z=lambda n: n is not None)] == [2]
     assert [dict(k)["series"] for k in coll.filter(lambda row: row["nbytes"] > 1000)] == [2]
     assert [dict(k)["series"] for k in coll.filter(levels=lambda n: n >= 3)] == [3]
-    assert coll.count("levels") == {1: 3, 3: 1}
-    assert coll.unique("dtype") == ["uint16", "uint8"]                # sorted as text
-    assert coll.unique("size_z") == [4, None]                         # None last
-    assert len(coll) == 4 and coll.count("axes") == {"cyx": 3, "czyx": 1}
-    assert coll.columns == coll.table.columns and coll.columns[:1] == ("series",)
+    assert coll.table.count("levels") == {1: 3, 3: 1}
+    assert coll.table.unique("dtype") == ["uint16", "uint8"]                # sorted as text
+    assert coll.table.unique("size_z") == [4, None]                         # None last
+    assert len(coll) == 4 and coll.table.count("axes") == {"cyx": 3, "czyx": 1}
+    assert coll.table.columns[:1] == ("series",)
     groups = coll.group_by("axes")
     assert list(groups) == ["cyx", "czyx"] and len(groups["cyx"]) == 3
     by_two = coll.group_by("dtype", "axes")
@@ -78,8 +78,8 @@ def test_queries():
 
 def test_unknown_columns_are_refused():
     coll = _mixed()
-    for call in (lambda: coll.filter(colour="red"), lambda: coll.unique("colour"),
-                 lambda: coll.count("colour"), lambda: coll.group_by("colour"), lambda: coll.sort_by("colour")):
+    for call in (lambda: coll.filter(colour="red"), lambda: coll.table.unique("colour"),
+                 lambda: coll.table.count("colour"), lambda: coll.group_by("colour"), lambda: coll.sort_by("colour")):
         with pytest.raises(KeyError, match="no column 'colour'; the columns are"):
             call()
 
@@ -103,10 +103,10 @@ def test_rows_from_files_equal_rows_from_pyramids(tmp_path, version):
     assert len(coll.filter(lambda image: image["size_y"] < image["size_x"])) == 4
     assert table.rows[0]["codec"] is not None and table.rows[0]["levels"] == 1
     # plate columns
-    assert coll.unique("well_name") == ["A2", "B1"]
-    assert coll.unique("acquisition_name") == ["first", "second"]
-    assert coll.count("row_name") == {"A": 2, "B": 2}
-    assert coll.count("column_name") == {"1": 2, "2": 2}
+    assert coll.table.unique("well_name") == ["A2", "B1"]
+    assert coll.table.unique("acquisition_name") == ["first", "second"]
+    assert coll.table.count("row_name") == {"A": 2, "B": 2}
+    assert coll.table.count("column_name") == {"1": 2, "2": 2}
     assert [dict(k)["acquisition"] for k in coll.filter(acquisition_name="second")] == [1, 1]
     # a filtered plate keeps its plate views and writes
     second = coll.filter(acquisition_name="second")
@@ -131,8 +131,8 @@ def test_a_vendor_style_plate_has_plate_columns():
     images = [FakeImage({"plate": 0, "acquisition": 0, "well": w, "field": f}, w * 10 + f)
               for w, fields in ((0, (0, 2)), (1, (0,))) for f in fields]
     coll = PyramidCollection.from_file(SimpleNamespace(path="/data/s.idx.xml", images=images, plates=[PLATE]))
-    assert coll.count("well_name") == {"A1": 1, "B3": 2}
-    assert coll.unique("row_name") == ["A", "B"] and coll.unique("plate_name") == [""]
+    assert coll.table.count("well_name") == {"A1": 1, "B3": 2}
+    assert coll.table.unique("row_name") == ["A", "B"] and coll.table.unique("plate_name") == [""]
 
 
 @pytest.mark.skipif(not os.path.isdir(IDR0010), reason="idr0010 is not here")
@@ -143,8 +143,29 @@ def test_idr0010_table_opens_no_image():
     table = coll.table
     assert time.perf_counter() - t < 5.0                          # well under 1 s locally
     assert len(table) == 384 and _opened(coll) == []
-    assert coll.unique("dtype") == ["uint16"] and coll.unique("levels") == [3]
+    assert coll.table.unique("dtype") == ["uint16"] and coll.table.unique("levels") == [3]
     key = list(coll)[17]
     node = coll._pyramids[key]
     expected = row_from_pyramid(coll[key], path=node.loader.path_of(node))
     assert {c: table.rows[17][c] for c in expected} == expected
+
+
+def test_what_the_table_holds_is_read_from_the_table():
+    # coll.columns / .unique / .count moved to coll.table (decision C-19: coll.columns is a
+    # plate's column slicer); the old names still answer, with a FutureWarning
+    from test_plate_as_collection import _two_plates
+    coll = _two_plates()
+    with pytest.warns(FutureWarning, match=r"coll\.columns is coll\.table\.columns"):
+        assert coll.columns == coll.table.columns
+    with pytest.warns(FutureWarning, match=r"coll\.table\.unique"):
+        assert coll.unique("well_name") == coll.table.unique("well_name") == ["A1", "B3"]
+    with pytest.warns(FutureWarning, match=r"coll\.table\.count"):
+        assert coll.count("well_name") == coll.table.count("well_name")
+    # a plate's collection: rows / columns slice it, as select does
+    pcoll = coll.plates[0].as_collection()
+    part = pcoll.rows["B"].columns[2:]
+    assert part.kind == "plate" and [w.name for w in part.wells] == ["B3"]
+    assert sorted(part) == sorted(pcoll.select(row="B", column=slice(2, None)))
+    assert sorted(pcoll.columns[0]) == sorted(pcoll.select(column=0))
+    with pytest.raises(AttributeError, match="a collection holds no rows"):
+        coll.rows

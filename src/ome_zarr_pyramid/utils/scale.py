@@ -370,6 +370,8 @@ class DownscaleManager:
     n_layers: int
     scale: Optional[Union[list, tuple]] = None
     smart_scale_factor: Optional[Union[list, tuple]] = None  # isotropic first-level factors
+    #: every level's cumulative factor (``resolve_levels``); overrides the two above
+    level_factors: Optional[Sequence[Sequence[int]]] = None
 
     def __post_init__(self):
         """Validate inputs."""
@@ -385,6 +387,8 @@ class DownscaleManager:
     @property
     def _theoretical_scale_factors(self) -> np.ndarray:
         """Get theoretical scale factors for each layer."""
+        if self.level_factors is not None:
+            return np.array(self.level_factors, dtype=float)[: self.n_layers]
         if self.smart_scale_factor is None:
             return np.power(self.scale_factor, self._scale_ids)
         smart = np.array(self.smart_scale_factor, dtype=float)
@@ -461,6 +465,10 @@ class Downscaler:
     downscale_method: str = 'simple'
     downscale_backend: str = 'tensorstore'
     smart_scale_factor: Optional[Union[list, tuple]] = None  # isotropic first-level factors
+    #: every level's cumulative factor and target shape (``resolve_levels``): the levels
+    #: are built with these factors and cut to these shapes (floor-sized source levels)
+    level_factors: Optional[Sequence[Sequence[int]]] = None
+    level_shapes: Optional[Sequence[Sequence[int]]] = None
     # Assigned in __post_init__
     base_array_root: Optional[str] = dataclasses.field(default=None, init=False, repr=False)
     param_names: list = dataclasses.field(default_factory=list, init=False, repr=False)
@@ -582,6 +590,7 @@ class Downscaler:
             n_layers=self.n_layers,
             scale=self.scale,
             smart_scale_factor=self.smart_scale_factor,
+            level_factors=self.level_factors,
         )
 
     def get_method(self) -> Callable:
@@ -632,7 +641,10 @@ class Downscaler:
         
         self._downscaled_arrays = [self.array]
         for idx in range(len(results)):
-            self._downscaled_arrays.append(results[idx])
+            level = results[idx]
+            if self.level_shapes is not None and idx + 1 < len(self.level_shapes):
+                level = crop_to_level(level, self.level_shapes[idx + 1])
+            self._downscaled_arrays.append(level)
         
         return self
 
@@ -757,3 +769,83 @@ def derive_downscale_plan(shapes: Sequence[Sequence[int]],
         'level_shapes': [tuple(int(s) for s in sh) for sh in shapes],
         'downscale_method': downscale_method,
     }
+
+
+# --- the levels of a plan: ONE resolution, used by every path that builds levels -------
+#
+# The eager `downscale(defer=False)`, the visible levels of a deferred plan, `select_levels`
+# on a plan, the writer (one pass and level by level) and the label rule all take their
+# per-level factors and shapes from `resolve_levels`. They used to work them out each in
+# their own way and drifted: a deferred downscale of Fractal's floor-sized levels showed
+# 268 where it wrote 267, and the eager path ignored the source's factors altogether.
+
+def resolve_levels(base_shape: Sequence[int], axes: str, *,
+                   n_layers=None, min_dimension_size: int = 64, scale_factor=None,
+                   smart_scale_factor=None, level_scale_factors=None, level_shapes=None,
+                   **_ignored) -> Tuple[List[Tuple[int, ...]], List[Tuple[int, ...]]]:
+    """(cumulative factor, shape) of every level, level 0 first, for a base of
+    `base_shape` and a plan's fields.
+
+    The factors, in order of precedence:
+
+    1. ``level_scale_factors``: the source's own (derived from its levels, carried by a
+       plan; dropped by ``downscale`` when the caller names a ``scale_factor``). Levels
+       past the last one continue with its last step (``f[-1] / f[-2]``), else
+       ``scale_factor``;
+    2. ``scale_factor`` (per axis), ``smart_scale_factor`` for level 1 when given;
+    3. the defaults: 2 on z / y / x, 1 on t / c.
+
+    The count is ``n_layers``, else the source's level count, else as many as keep the
+    largest downscaled axis at ``min_dimension_size`` or more. A shape is
+    ``level_shapes[i]`` where the plan records one its factor gives (a floor-sized source
+    level, reproduced by cropping), else ``ceil(base / factor)``.
+    """
+    from ome_zarr_pyramid.core.pyramid import calculate_n_layers
+    from ome_zarr_pyramid.utils import defaults
+    base = tuple(int(s) for s in base_shape)
+    ndim = len(base)
+    listed = [tuple(int(f) for f in fs) for fs in (level_scale_factors or [])]
+    if listed and (len(listed[0]) != ndim or any(f != 1 for f in listed[0])):
+        listed = []                                   # not this base's: ignore
+    if scale_factor is None:
+        if len(listed) > 1:
+            scale_factor = listed[1]
+        else:
+            scale_factor = tuple(defaults.scale_factor_map[a] for a in axes)
+    elif np.isscalar(scale_factor):
+        scale_factor = (scale_factor,) * ndim
+    factor = tuple(max(1, min(int(round(f)), b)) for f, b in zip(scale_factor, base))
+    if n_layers in (None, 'default', 'auto'):
+        n = len(listed) if len(listed) > 1 else calculate_n_layers(base, factor,
+                                                                  min_dimension_size)
+    else:
+        n = int(n_layers)
+    n = max(1, n)
+
+    factors: List[Tuple[int, ...]] = []
+    for i in range(n):
+        if i < len(listed):
+            factors.append(listed[i])
+        elif i == 0:
+            factors.append((1,) * ndim)
+        elif len(listed) > 1:
+            step = tuple(max(1, a // b) for a, b in zip(listed[-1], listed[-2]))
+            factors.append(tuple(p * s for p, s in zip(factors[-1], step)))
+        elif i == 1 and smart_scale_factor is not None and \
+                any(float(s) != 1.0 for s in smart_scale_factor):
+            factors.append(tuple(max(1, int(round(s))) for s in smart_scale_factor))
+        elif smart_scale_factor is not None and len(factors) > 1 and factors[1] != factor:
+            factors.append(tuple(p * f for p, f in zip(factors[-1], factor)))
+        else:
+            factors.append(tuple(f ** i for f in factor))
+
+    recorded = [tuple(int(s) for s in sh) for sh in (level_shapes or [])]
+    shapes: List[Tuple[int, ...]] = []
+    for i, fac in enumerate(factors):
+        ceil = tuple(_level_size(b, f) for b, f in zip(base, fac))
+        if i < len(recorded) and len(recorded[i]) == ndim and \
+                all(_fits(b, f, t) for b, f, t in zip(base, fac, recorded[i])):
+            shapes.append(recorded[i])
+        else:
+            shapes.append(ceil)
+    return factors, shapes

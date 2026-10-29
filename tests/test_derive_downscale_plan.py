@@ -165,7 +165,12 @@ def test_explicit_scale_factor_is_not_overridden(tmp_path):
     src = _pyr([(1, 1, 64, 64, 64), (1, 1, 64, 32, 32)])
     planned = src.downscale(scale_factor=(1, 1, 2, 2, 2), n_layers=3)
     assert planned._downscale_plan['scale_factor'] == (1, 1, 2, 2, 2)
-    assert 'level_scale_factors' not in planned._downscale_plan
+    # every plan holds its resolved levels (resolve_levels): the named factor's, not the
+    # source's (1, 1, 1, 2, 2)
+    assert planned._downscale_plan['level_scale_factors'] == [
+        (1, 1, 1, 1, 1), (1, 1, 2, 2, 2), (1, 1, 4, 4, 4)]
+    assert [tuple(planned.layers[p].shape) for p in planned.meta.resolution_paths] == [
+        (1, 1, 64, 64, 64), (1, 1, 32, 32, 32), (1, 1, 16, 16, 16)]
 
 
 def test_plan_survives_an_elementwise_op(tmp_path):
@@ -237,7 +242,8 @@ def test_explicit_scale_factor_supersedes_derived_keys():
     src = _pyr([(1, 1, 64, 64, 64), (1, 1, 64, 32, 32)])
     merged = src.downscale().downscale(scale_factor=(1, 1, 2, 2, 2))
     assert merged._downscale_plan['scale_factor'] == (1, 1, 2, 2, 2)
-    assert 'level_scale_factors' not in merged._downscale_plan
+    # the resolved levels are the named factor's, the derived (1, 1, 1, 2, 2) discarded
+    assert merged._downscale_plan['level_scale_factors'][1] == (1, 1, 2, 2, 2)
 
 
 def test_narrowing_op_preserves_level_count(tmp_path):
