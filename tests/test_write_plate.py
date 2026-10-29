@@ -180,7 +180,8 @@ def test_harmony_to_ngff_and_back(tmp_path, index, version):
         warnings.simplefilter("ignore")
         coll.write_plate(out)
     back = PyramidCollection.from_zarr(out)
-    layout = [(p.name, p.rows, p.columns, [(w.row, w.column, w.name, [
+    from ome_zarr_pyramid.core.plates import _names      # micro-reader 0.2 or 0.3 names
+    layout = [(p.name, _names(p, "row"), _names(p, "column"), [(w.row, w.column, w.name, [
         (fl.index, sorted(tuple(sorted((k, v) for k, v in i.index.items() if k != "resolution"))
                           for i in fl.images)) for fl in w.fields]) for w in p.wells]) for p in f.plates]
     assert [(p.name, p.rows, p.columns, [(w.row, w.column, w.name, [

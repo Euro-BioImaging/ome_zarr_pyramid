@@ -116,7 +116,9 @@ def _plate_files():
 
 
 def _summary(plates, keys_of):
-    return [(p.name, tuple(p.rows), tuple(p.columns), tuple((a.id, a.name) for a in p.acquisitions),
+    # row / column names from micro-reader 0.2 (rows) or 0.3 (row_names), and ozp's
+    from ome_zarr_pyramid.core.plates import _names
+    return [(p.name, _names(p, "row"), _names(p, "column"), tuple((a.id, a.name) for a in p.acquisitions),
              [(w.row, w.column, w.name, [(f.index, sorted(keys_of(f))) for f in w.fields])
               for w in p.wells]) for p in plates]
 

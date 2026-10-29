@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 (2026-10-28): plates from micro-reader 0.3
+
+A patch for users who stay on ome_zarr_pyramid 0.4 (0.5.0 has the same fix).
+
+### Fixed
+
+- **Plates read with micro-reader 0.3.0 failed**: micro-reader 0.3.0 made `Plate.rows` /
+  `Plate.columns` slicers of the plate, which cannot be iterated, and moved the names to
+  `row_names` / `column_names`. Building a collection from a plate file (`from_file`)
+  iterated `plate.rows` and raised `TypeError`. The names are read from `row_names` /
+  `column_names` when the plate has them, else from `rows` / `columns` (micro-reader
+  0.2), so both give the same plate.
+
 ## 0.4.0 (2026-10-22): coordinate systems, NGFF 0.6, RFC 8 scenes, validation
 
 A minor release under the release policy: field collections are renamed and fields are

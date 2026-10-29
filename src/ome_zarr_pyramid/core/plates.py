@@ -168,6 +168,14 @@ def plates_of(collection) -> List[Plate]:
 
 # -- an opened file's tree, from its images' indices (plan 3.17) -----------------
 
+def _names(plate, axis: str) -> tuple:
+    """A plate's row (or column) names: ``row_names`` (micro-reader 0.3, where ``rows``
+    slices the plate and cannot be iterated), else ``rows`` (micro-reader 0.2, where it
+    held the names)."""
+    names = getattr(plate, f"{axis}_names", None)
+    return tuple(names if names is not None else getattr(plate, f"{axis}s"))
+
+
 def _item(name: str, i: int, kind: str) -> PlateItem:
     """A row or column named `name`, with its name as id when it can be one."""
     text = str(name)
@@ -249,9 +257,10 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
     root = CollectionNode(name or "file")
     plate_nodes_: List[Node] = []
     for p, plate in enumerate(plates):
+        row_names, column_names = _names(plate, "row"), _names(plate, "column")
         attr = PlateAttribute(
-            rows=[_item(r, i, "row") for i, r in enumerate(plate.rows)],
-            columns=[_item(c, i, "column") for i, c in enumerate(plate.columns)],
+            rows=[_item(r, i, "row") for i, r in enumerate(row_names)],
+            columns=[_item(c, i, "column") for i, c in enumerate(column_names)],
             acquisitions=[PlateItem(str(a.id), a.name or None) for a in plate.acquisitions])
         node = CollectionNode(plate.name or f"plate{p}", attributes={"plate": attr},
                               kind="plate", index=p)
@@ -260,12 +269,12 @@ def tree_from_file(file, entries: Dict[Tuple, Any], name: Optional[str] = None
         node.ngff_fields = {"plate": {"name": plate.name, "field_count": None},
                             "node_name": node.name}
         outside = [w.name for w in plate.wells
-                   if not (0 <= w.row < len(plate.rows) and 0 <= w.column < len(plate.columns))]
+                   if not (0 <= w.row < len(row_names) and 0 <= w.column < len(column_names))]
         if outside:
             raise InvalidCollection(
                 f"plate {plate.name!r}: the file puts wells {outside} outside its "
-                f"{len(plate.rows)} x {len(plate.columns)} layout (rows {list(plate.rows)}, "
-                f"columns {list(plate.columns)})")
+                f"{len(row_names)} x {len(column_names)} layout (rows {list(row_names)}, "
+                f"columns {list(column_names)})")
         for w, well in enumerate(plate.wells):
             well_node = node.add(CollectionNode(well.name, attributes={"well": WellAttribute(
                 Ref(attr.rows[well.row].id), Ref(attr.columns[well.column].id))},
