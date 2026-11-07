@@ -50,3 +50,11 @@ def test_operator_applies_to_all_levels(make_pyramid, compute):
     assert out.nlayers == 3
     for p in out.meta.resolution_paths:
         np.testing.assert_allclose(compute(out, p), compute(ds, p) + 5)
+
+
+def test_unary_plus_minus_and_abs(make_pyramid, compute):
+    # tenth review C-09: the README lists unary +, which raised TypeError
+    pyr, data = make_pyramid(shape=(2, 16, 16), axis_order="cyx")
+    np.testing.assert_allclose(compute(+pyr), data)
+    np.testing.assert_allclose(compute(-pyr), -data)
+    np.testing.assert_allclose(compute(abs(-pyr)), np.abs(-data))

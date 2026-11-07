@@ -1511,6 +1511,9 @@ class Pyramid:
     def from_ngff(self, gr: Union[zarr.Group, str, Path]) -> 'Pyramid':
         """Load pyramid from an NGFF-compliant Zarr group (NGFF 0.4 or 0.5; a group
         declaring another version, e.g. 0.6, raises ``UnsupportedNGFFVersion``)."""
+        if isinstance(gr, (str, Path)) and not is_zarr_group(gr):
+            # connect_to_group creates a group: a read must leave the folder as it is
+            raise ValueError(f"No valid metadata found: {str(gr)!r} is not a Zarr group")
         self.meta = NGFFMetadataHandler()
         self.meta.connect_to_group(gr)
         self.meta.read_metadata()
@@ -2090,7 +2093,7 @@ class Pyramid:
         
         # one unit per axis, None for a unitless one (t, z of some files, idr0010): dropping
         # the Nones left fewer units than axes and the downscale raised
-        units_given = list(unit_list) if any(u is not None for u in unit_list) else None
+        units_given = list(unit_list)
 
         # from_arrays() derives the compressor from arrays[0] itself when it's
         # zarr-backed (and forbids passing compressor= in that case) - only
@@ -2124,20 +2127,25 @@ class Pyramid:
                     new_ms[k] = copy.deepcopy(v)
             # each level's translation: the base level's (the physical origin) plus the
             # level's alignment under the downscale method (level_translation), as the
-            # deferred write path writes it. No base translation: none on any level.
+            # deferred write path writes it. No base translation: the origin, so a window
+            # method still shifts the coarser levels by half their pixel (level 0 keeps
+            # none; review cycle 1, N-05); a stride method writes none on any level.
             base_ct = src_ms['datasets'][0].get('coordinateTransformations', [])
             trans = [t for t in base_ct if t.get('type') == 'translation']
-            if trans:
-                method = getattr(self.downscaler, 'downscale_method', 'simple')
+            method = getattr(self.downscaler, 'downscale_method', 'simple')
+            if trans or method not in STRIDE_METHODS:
                 paths = new_pyr.meta.resolution_paths
                 base_scale = new_pyr.meta.get_scale(paths[0])
+                base = trans[0]['translation'] if trans else [0.0] * len(base_scale)
                 for path, ds in zip(paths, new_ms['datasets']):
+                    shift = level_translation(base, base_scale, new_pyr.meta.get_scale(path),
+                                              method)
+                    if not trans and not any(shift):
+                        continue                    # level 0 at the origin: as it was
                     cts = [t for t in ds.setdefault('coordinateTransformations', [])
                            if t.get('type') != 'translation']
-                    entry = copy.deepcopy(trans[0])
-                    entry['translation'] = level_translation(
-                        trans[0]['translation'], base_scale, new_pyr.meta.get_scale(path),
-                        method)
+                    entry = copy.deepcopy(trans[0]) if trans else {'type': 'translation'}
+                    entry['translation'] = shift
                     ds['coordinateTransformations'] = cts + [entry]
             if len(new_ms.get('datasets') or []) > 1:
                 # the downscale method that made the levels (NGFF: multiscales `type`;
@@ -2239,7 +2247,7 @@ class Pyramid:
     @_labels_follow
     def downscale(self,
                   n_layers: Optional[int] = None,
-                  min_dimension_size: int = 64,
+                  min_dimension_size: Optional[int] = None,
                   scale_factor=None,
                   downscale_method: str = 'simple',
                   backend: str = 'numpy',
@@ -2283,7 +2291,9 @@ class Pyramid:
             the count from ``min_dimension_size``.
         min_dimension_size : int
             Stop before the largest spatial dimension would drop below this size
-            (used only when ``n_layers is None``). Default 64.
+            (used only when ``n_layers is None``). Default 64. Given on a pyramid that
+            already has levels, it sets the count; left out, the source's own count
+            is kept.
         scale_factor : sequence, optional
             Per-axis stride between levels. When omitted on a pyramid that ALREADY
             has levels, it is DERIVED from those levels (per level and per axis) so
@@ -2324,6 +2334,18 @@ class Pyramid:
         """
         from ome_zarr_pyramid.utils.scale import check_downscale_args
         check_downscale_args(downscale_method, downscale_backend)
+        if defer and kwargs:
+            # a deferred plan keeps no other options: downscale(method="mean") planned the
+            # default method in silence (review cycle 2)
+            raise TypeError(f"downscale: unexpected keyword argument(s) "
+                            f"{', '.join(sorted(kwargs))} (a deferred plan takes n_layers, "
+                            f"min_dimension_size, scale_factor, downscale_method, backend, "
+                            f"smart_scale_factor, downscale_backend)")
+        # the caller's own count rule, given (review cycle 2, R2-05: on a pyramid read from
+        # a store the source's level count won over it in silence)
+        min_given = min_dimension_size is not None
+        if not min_given:
+            min_dimension_size = 64
         # ONE plan for both modes (``defer`` only says whether the writer gets it).
         # MERGED with any plan already carried rather than replacing it: ops propagate a
         # plan across a pipeline precisely so the intent survives, so the method named
@@ -2374,11 +2396,17 @@ class Pyramid:
                     downscale_method=recipe.get('downscale_method', 'simple'))
                 if derived is not None:
                     recipe['scale_factor'] = derived['scale_factor']
-                    recipe['level_scale_factors'] = derived['level_scale_factors']
-                    recipe['level_shapes'] = derived['level_shapes']
-                    if n_layers is None and (carried is None
-                                             or carried.get('n_layers') is None):
-                        recipe['n_layers'] = derived['n_layers']
+                    if n_layers is None and min_given:
+                        # the count from min_dimension_size, with the source's factor:
+                        # its per-level lists would set the source's count again
+                        recipe.pop('level_scale_factors', None)
+                        recipe.pop('level_shapes', None)
+                    else:
+                        recipe['level_scale_factors'] = derived['level_scale_factors']
+                        recipe['level_shapes'] = derived['level_shapes']
+                        if n_layers is None and (carried is None
+                                                 or carried.get('n_layers') is None):
+                            recipe['n_layers'] = derived['n_layers']
             # The plan describes the whole result from level 0: narrow to it, or the old
             # levels would linger beside the new ones (and the writer, handed several
             # levels, would write them instead of the plan).
@@ -2543,7 +2571,7 @@ class Pyramid:
         new_pyr = Pyramid().from_arrays(
             arrays=new_arrays,
             axis_order=axes,
-            unit_list=units if any(u is not None for u in units) else None,  # type: ignore
+            unit_list=units or None,  # type: ignore
             scales=[self.meta.get_scale(p) for p in paths],  # type: ignore
             name=self.meta.multiscales.get('name', 'unnamed') if self.meta.metadata else 'unnamed',
             compressor=compressor,
@@ -2616,7 +2644,19 @@ class Pyramid:
         factors = {p: [float(s) / b if b else 1.0 for s, b in zip(self.meta.get_scale(p), base)]
                    for p in paths}
         new_base = [float(axes.get(ax, b)) for ax, b in zip(order, base)]
+        # a coarser level's offset from level 0 (a window method's half-pixel shift) is in
+        # level-0 pixels: it scales with the new size, so the levels stay on level 0
+        # (review cycle 2, R2-06: kept as it was, the levels sat off level 0 again).
+        # Level 0's own translation, a stage position, stays.
+        old = {p: self.meta.get_translation(p) for p in paths}
+        origin = old[paths[0]] or [0.0] * len(order)
         self.meta.update_scales(reference_scale=new_base, scale_factors=factors)
+        ratio = [n / b if b else 1.0 for n, b in zip(new_base, base)]
+        for p in paths[1:]:
+            if old[p] is None or ratio == [1.0] * len(order):
+                continue
+            self.meta.update_translation(p, [float(o) + (float(t) - float(o)) * k
+                                             for t, o, k in zip(old[p], origin, ratio)])
         return self
 
     def update_units(self, **axes: str) -> 'Pyramid':
@@ -2802,9 +2842,8 @@ class Pyramid:
         units = [src_units[a] for a in out_axes]
         # one unit per axis, None for a unitless one (t, z of some files): dropping the
         # Nones left fewer units than axes and every isel of such an image raised
-        units_given = units if any(u is not None for u in units) else None
         new = Pyramid().from_arrays(
-            arrays, axis_order=out_axes, unit_list=units_given,  # type: ignore
+            arrays, axis_order=out_axes, unit_list=units,  # type: ignore
             scales=scales, version=self.meta.version, name=self.meta.tag,  # type: ignore
         )
         if self.meta.metadata and new.meta and new.meta.metadata:  # type: ignore
@@ -3627,7 +3666,8 @@ class Pyramid:
 
     # unary
     def __neg__(self): return self._unary_op(operator.neg)
-    def __pos__(self): return self._unary_op(operator.pos)
+    # unary plus changes no value: the same arrays (dyna-zarr arrays have no __pos__)
+    def __pos__(self): return self._unary_op(lambda array: array)
     def __abs__(self): return self._unary_op(operator.abs)
     def __invert__(self): return self._unary_op(operator.invert)
 

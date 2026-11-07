@@ -135,7 +135,8 @@ def test_select_by_well_name_row_and_column():
     assert sorted(coll.select(plate=0, row="B", column=column_3)) == sorted(by_place)
     assert sorted(coll.select(plate=0, column=["1", "3"])) == sorted(coll.select(plate=0))
     assert len(coll.select(plate=0, row=range(0, 1))) == 1                 # row A: A1
-    assert len(coll.select(row="H")) == 0             # a row with no image: nothing
+    with pytest.raises(ValueError, match="no row named 'H'"):   # not in the layout (A, B)
+        coll.select(row="H")
 
 
 def test_select_takes_several_values_for_any_index():

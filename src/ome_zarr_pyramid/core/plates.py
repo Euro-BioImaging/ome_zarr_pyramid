@@ -210,8 +210,9 @@ class Plate:
     def well_index(self, name: str) -> int:
         """The index of the well called `name` (``"B2"``), for ``select(well=...)``: its
         place in the whole plate's wells (the index its images carry)."""
+        from ome_zarr_pyramid.core.collection import name_key
         for i, well in enumerate(self.whole or self.wells):
-            if well.name == name:
+            if name_key("well", well.name) == name_key("well", name):
                 return i
         raise KeyError(f"no well {name!r} with images in plate {self.name!r}; "
                        f"wells: {[w.name for w in self.whole or self.wells]}")
@@ -243,15 +244,32 @@ class Axis:
         raise TypeError(f"plate.{self.axis}s is a slicer, not a sequence: its names are "
                         f"{self.axis}_names; {self.axis}s[...] gives a part of the plate")
 
+    def _position_of(self, name: str) -> int:
+        from ome_zarr_pyramid.core.collection import name_key
+        keys = [name_key(self.axis, n) for n in self.names]
+        key = name_key(self.axis, name)
+        if key not in keys:
+            raise KeyError(f"plate {self.plate_name!r} has no {self.axis} {name!r}; its "
+                           f"{self.axis}s are {list(self.names)}")
+        return keys.index(key)
+
     def positions(self, value) -> List[int]:
         n = len(self.names)
+        if isinstance(value, slice) and (isinstance(value.start, str)
+                                         or isinstance(value.stop, str)):
+            # names: both ends included, as names are read ('B':'D' is B, C, D), as
+            # micro-reader's Plate.rows
+            if value.step is not None or not all(isinstance(b, (str, type(None)))
+                                                 for b in (value.start, value.stop)):
+                raise TypeError(f"{self.axis}s[{value.start!r}:{value.stop!r}]: a slice of "
+                                f"names takes names at both ends and no step")
+            lo = 0 if value.start is None else self._position_of(value.start)
+            hi = n - 1 if value.stop is None else self._position_of(value.stop)
+            return list(range(lo, hi + 1))
         if isinstance(value, slice):
             return list(range(*value.indices(n)))
         if isinstance(value, str):
-            if value not in self.names:
-                raise KeyError(f"plate {self.plate_name!r} has no {self.axis} {value!r}; its "
-                               f"{self.axis}s are {list(self.names)}")
-            return [self.names.index(value)]
+            return [self._position_of(value)]
         if isinstance(value, (list, tuple, range, set, frozenset)):
             return [p for v in value for p in self.positions(v)]
         if isinstance(value, numbers.Integral) and not isinstance(value, bool):

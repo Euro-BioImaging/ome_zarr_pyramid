@@ -146,12 +146,17 @@ def test_t_and_c_stay_zero(tmp_path, defer):
                                            [0.0, 0.0, 13.0, 5.75, 3.75]]
 
 
-def test_no_base_translation_writes_none(tmp_path):
-    pyr = _yx(translation=None).downscale(n_layers=3, scale_factor=2, downscale_method="mean",
-                                          defer=False)
-    path = str(tmp_path / "none.ome.zarr")
-    IO().write_pyramid(pyr, path, overwrite=True)
-    assert _written_translations(path) == [None, None, None]
+@pytest.mark.parametrize("defer", [False, True])
+def test_no_base_translation_is_the_origin(tmp_path, defer):
+    # review cycle 1, N-05 (tenth review C N-03): a mean level of an image at the origin had no
+    # half-pixel shift, so a viewer placed it half a pixel off level 0. Level 0 keeps none;
+    # a stride method ('simple') writes none on any level
+    for method, want in (("mean", [None, [0.25, 0.25], [0.75, 0.75]]), ("simple", [None] * 3)):
+        pyr = _yx(translation=None).downscale(n_layers=3, scale_factor=2,
+                                              downscale_method=method, defer=defer)
+        path = str(tmp_path / f"none_{method}_{defer}.ome.zarr")
+        IO().write_pyramid(pyr, path, overwrite=True)
+        assert _written_translations(path) == want
 
 
 # levels taken from a file keep what they store -----------------------------------------

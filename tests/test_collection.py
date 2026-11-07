@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from ome_zarr_pyramid import IO, Pyramid, PyramidCollection
+from ome_zarr_pyramid import io as ozp_io
 
 
 class Q:
@@ -103,15 +104,75 @@ def test_an_image_without_metadata_gets_ozp_defaults():
 
 # eubi-bridge's defaults (roadmap B2-B4), so its outputs stay the same ------------------
 
-def test_a_missing_z_or_y_pixel_size_takes_x():
+def test_a_relative_y_size_does_not_take_x():
+    # an OME-Zarr input with a unit on x only: y has a scale of its own, no measurement
+    meta = SimpleNamespace(pixel_sizes={"x": Q(2.0, "nanometer"), "y": Q(1.0, "pixel")},
+                           channels=[], position={})
+    pyr = Pyramid.from_image(FakeImage(np.zeros((8, 8), "u2"), "yx", meta))
+    assert pyr.meta.get_scale("0") == [1.0, 2.0]
+    assert pyr.meta.unit_list == [None, "nanometer"]
+
+
+def test_a_relative_position_stays_on_an_axis_without_a_unit():
+    meta = SimpleNamespace(pixel_sizes={"z": Q(5.0, "pixel"), "x": Q(0.5, "micrometer")},
+                           channels=[], position={"z": Q(3.0, "pixel"), "x": Q(20.0, "micrometer")})
+    pyr = Pyramid.from_image(FakeImage(np.zeros((4, 8, 8), "u2"), "zyx", meta))
+    assert pyr.meta.get_translation("0") == [3.0, 0.0, 20.0]
+
+
+def test_a_missing_y_size_takes_x_and_nothing_else_is_invented():
     meta = SimpleNamespace(pixel_sizes={"x": Q(250.0, "nanometer")}, channels=[], position={})
     pyr = Pyramid.from_image(FakeImage(np.zeros((1, 4, 8, 8), "u2"), "tzyx", meta))
-    assert pyr.meta.get_scale("0") == [1.0, 250.0, 250.0, 250.0]
-    assert pyr.meta.unit_list == ["second", "nanometer", "nanometer", "nanometer"]
+    assert pyr.meta.get_scale("0") == [1.0, 1.0, 250.0, 250.0]
+    # one t: no step to know, so no unit either, and none missing (tenth review N-08)
+    assert pyr.meta.unit_list == [None, None, "nanometer", "nanometer"]
+    assert pyr.uncalibrated == ("z",)
     meta.pixel_sizes["z"] = Q(2.0, "micrometer")                 # a z of its own is kept
     pyr = Pyramid.from_image(FakeImage(np.zeros((1, 4, 8, 8), "u2"), "tzyx", meta))
     assert pyr.meta.get_scale("0")[1:] == [2.0, 250.0, 250.0]
     assert pyr.meta.unit_list[1:] == ["micrometer", "nanometer", "nanometer"]
+
+
+def test_a_size_in_pixels_is_relative_so_it_is_the_scale_with_no_unit():
+    sizes = {"x": Q(1.0, "pixel"), "y": Q(1.0, "pixel"), "z": Q(5.0, "pixel")}
+    meta = SimpleNamespace(pixel_sizes=sizes, channels=[], position={})
+    pyr = Pyramid.from_image(FakeImage(np.zeros((4, 8, 8), "u2"), "zyx", meta))
+    assert pyr.meta.get_scale("0") == [5.0, 1.0, 1.0]
+    assert pyr.meta.unit_list == [None, None, None]
+    assert pyr.uncalibrated == ("z", "y", "x")
+
+
+def test_an_uncalibrated_image_has_no_unit_and_its_position_is_not_guessed(tmp_path):
+    meta = SimpleNamespace(pixel_sizes={}, channels=[], position={"x": Q(5.0, "micrometer")})
+    pyr = Pyramid.from_image(FakeImage(np.zeros((8, 8), "u2"), "yx", meta))
+    assert pyr.meta.unit_list == [None, None] and pyr.uncalibrated == ("y", "x")
+    assert pyr.meta.get_scale("0") == [1.0, 1.0]
+    ozp_io.write_pyramid(pyr, str(tmp_path / "a.zarr"))  # and it is a valid store
+    assert pyr.isel(y=slice(0, 4)).meta.unit_list == [None, None]   # a selection keeps none
+    assert pyr.rechunk((4, 4)).meta.unit_list == [None, None]
+    assert pyr.downscale(n_layers=2).meta.unit_list == [None, None]
+    assert Pyramid.from_zarr(str(tmp_path / "a.zarr")).meta.unit_list == [None, None]
+
+
+def test_the_uncalibrated_axes_survive_the_channels(tmp_path):
+    # tenth review C-03: set_channels replaced the pyramid, and the attribute went with it
+    named = SimpleNamespace(name="DAPI", color=None, emission_wavelength=None,
+                            excitation_wavelength=None)
+    meta = SimpleNamespace(pixel_sizes={"x": Q(0.5, "micrometer")}, position={},
+                           channels=[named, named])
+    image = FakeImage(np.zeros((1, 2, 3, 8, 8), "u2"), "tczyx", meta)
+    pyr = Pyramid.from_image(image)
+    assert pyr.uncalibrated == ("z",)
+    assert pyr.meta.unit_list[0] is None                        # one t: no unit invented
+    coll = PyramidCollection.from_file(SimpleNamespace(images=[image], path="a.tif"))
+    assert coll[{"series": 0}].uncalibrated == ("z",)
+
+
+def test_reading_a_folder_that_is_no_store_writes_nothing(tmp_path):
+    (tmp_path / "a.txt").write_text("x")
+    with pytest.raises(ValueError, match="not a Zarr group"):
+        Pyramid.from_zarr(str(tmp_path))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt"]
 
 
 def test_described_channels_without_a_name_or_colour():
@@ -193,8 +254,11 @@ def test_with_micro_reader_on_an_ome_tiff(tmp_path):
     assert [c["label"] for c in pyr.meta.metadata["omero"]["channels"]] == ["a", "b", "c"]
     out = str(tmp_path / "series1.ome.zarr")
     IO().write_pyramid(pyr, out, overwrite=True)
-    np.testing.assert_array_equal(np.asarray(IO().read_pyramid(out).layers["0"][...]),
-                                  data[1] + 1)
+    written = np.asarray(IO().read_pyramid(out).layers["0"][...])
+    # micro-reader 0.4.0 opens in t c z y x by default (its 0.3 gave the file's c y x)
+    expected = data[1] + 1
+    np.testing.assert_array_equal(written.reshape(expected.shape) if written.ndim == 5
+                                  else written, expected)
 
 
 # -- an image's own lazy array (eubi-bridge's LegacyImage over its older readers) -------
