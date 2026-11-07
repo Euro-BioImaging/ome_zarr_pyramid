@@ -68,13 +68,13 @@ options, so use whichever reads better:
 | read what a store holds: an image, or a plate / series / collection | `io.read(path)` | |
 | read one image | `io.read_pyramid(path)` (a path or an open `zarr.Group`) | `Pyramid.from_zarr(path)` |
 | write one image | `io.write_pyramid(pyr, path)` | `pyr.write(path)` |
-| edit a stored image's metadata | `io.update_metadata(path, scales=...)` | `pyr.update_metadata(scales=...)` (the store it was read from) |
+| edit a stored image's metadata | `io.update_metadata(path, scales={"x": 0.5})` | `pyr.update_metadata(scales={"x": 0.5})` (the store it was read from) |
 | read a plate, series or collection | `io.read_collection(path)` | `PyramidCollection.from_zarr(path)` |
 | write a collection (a plate, a series layout, or `version="rfc8"`) | `io.write(coll, path)` | `coll.write(path)` |
 | write a plate | `io.write_plate(coll, path)` | `coll.write_plate(path)` |
 | write a series layout | `io.write_series(coll, path)` | `coll.write_series(path)` |
 | write an RFC 8 collection | `io.write_collection(coll, path)` | `coll.write_collection(path)` |
-| edit the metadata of every image of a store | `io.update_metadata(path, scales=...)` | `coll.update_metadata(scales=...)` |
+| edit the metadata of every image of a store | `io.update_metadata(path, scales={"x": 0.5})` | `coll.update_metadata(scales={"x": 0.5})` |
 
 `io` keeps no settings: every option goes with the call, as in dyna-zarr's `io`. The
 writers return the path they wrote, and `io.read` gives a `Pyramid` or a
@@ -286,7 +286,7 @@ A per-level dict or sequence needs an entry for every level.
 ## Build a pyramid from your own arrays
 
 ```python
-import dask.array as da
+import dask.array as da                  # pip install "ome_zarr_pyramid[dask]"
 from ome_zarr_pyramid import Pyramid, io
 
 lvl0 = da.zeros((2, 512, 512), chunks=(1, 256, 256), dtype="uint16")  # (c, y, x)

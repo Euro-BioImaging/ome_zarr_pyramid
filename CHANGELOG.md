@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+A minor release: `select` refuses a name no plate has (it selected nothing).
+Ships with micro-reader 0.4.0, whose `select` does the same.
+
+### Changed
+
+- `select` raises `ValueError` for a plate, acquisition, well, row or column name no plate
+  of the collection has, naming the names there are; a name the layout has whose wells
+  hold no images still selects nothing.
+- tensorstore 0.1.85 is excluded, as in dyna-zarr: it keeps memory while the coarser levels
+  are built from the stored full-resolution level (one 959-plane well of 14040 x 24551 went
+  from 2.4 GB to 115 GB in 13 minutes). 0.1.86 stays flat. In an environment that has
+  0.1.85, upgrading ome_zarr_pyramid upgrades tensorstore too.
+
+- Unknown calibration is no longer invented: `Pyramid.from_image` and `from_file` give an
+  axis without a size scale 1 and no unit (before: 1 micrometer, 1 second), and z is not
+  copied from x; y still takes x's (square pixels). A z or t of one step gets no unit either
+  (before: micrometer, second), but it is not listed as uncalibrated: one step has no size to
+  know. `pyramid.uncalibrated`, on a pyramid built from a file (channels named or not), lists
+  those axes. Downscale, rechunk and
+  selections keep a missing unit.
+  A size in the unit `pixel` is relative: written as the scale, with no unit, and y keeps its
+  own rather than taking x's. A position in `pixel` on such an axis is kept as its translation.
+- The library no longer attaches a log handler of its own, so an application that logs does
+  not print each line twice, and plain Python prints no INFO lines
+  (`logging.basicConfig(level=logging.INFO)` shows them).
+- A window downscale (`mean`, `median`, ...) of an image with no translation writes the
+  half-pixel shift of its coarser levels (level 1 of 0.5 um pixels at 0.25 um): no
+  translation is the origin, as in NGFF. Before, the shift was written only when the image
+  had a translation, so such levels sat half a pixel off the full resolution in a viewer.
+  `simple` (subsampling) still writes none; in memory and on the deferred write path alike.
+- `write_pyramid(windows="dtype")` on float data takes each channel's window start and end
+  from the data, as `windows="auto"` does (min and max stay the type's): the window of a
+  float type's whole range showed float images as flat grey. Integer data is unchanged.
+
+### Fixed
+
+- Reading a folder that is no Zarr store (`read_pyramid`, `read`, `read_collection`) raises
+  without writing `.zattrs` and `.zgroup` into it.
+
+- `select`, `Plate.well_index` and `rows` / `columns` compare well, row and column names
+  as vendors spell them: without letter case and without the leading zeros of the number
+  (`well="B02"` is `"B2"`, `column_name="05"` is `"5"`); before, `B02` selected nothing.
+  `rows["B":"D"]` takes a slice of names, both ends included. The same in micro-reader
+  0.4.0, so both still select the same images.
+
+- `pyramid.uncalibrated` is kept on a pyramid whose channels the image describes
+  (`set_channels` replaced the pyramid, and it was lost), from `Pyramid.from_image` and
+  `PyramidCollection.from_file` alike. Unary `+` on a pyramid works (it raised `TypeError`:
+  dyna-zarr arrays have no unary plus); the README's `update_metadata(scales=...)` shows its
+  `{axis: value}` form and the dask example names the `[dask]` extra.
+- `update_metadata(scales=...)` / `units=` also updates the image's OME-XML
+  (`OME/METADATA.ome.xml`, when there is one): the sizes and units of the axes edited, the
+  rest of the document as written. Before, the multiscales took the new sizes and the
+  OME-XML kept the old ones. An axis left without a unit loses its size there (OME's
+  default unit, the micrometre, would be claimed); an OME-XML describing several images is
+  left as it is, with a warning. A plate is edited field by field, each field's OME-XML too.
+- `update_metadata(scales=...)` (and `Pyramid.update_scales`) moves each coarser level's
+  translation with the new size: its offset from level 0, a window method's half-pixel
+  shift, is in level-0 pixels. Before, the offsets stayed as they were, so mean / median
+  levels sat off level 0 again after a scale edit. Level 0's own translation (a stage
+  position) stays.
+- `downscale(min_dimension_size=...)` on a pyramid that already has levels (read from a
+  store) sets the level count, with the source's own factor; it was ignored and the
+  source's count kept. Left out, the source's count is kept as before.
+- `downscale` with a keyword it does not take (`method="mean"` for `downscale_method`)
+  raises `TypeError` naming it; a deferred plan dropped it in silence.
+- `select(well=...)` with a well of the layout that holds no images selects nothing, as
+  rows and columns do (it raised `ValueError`), as in micro-reader 0.4.0.
+
 ## 0.5.0 (2026-10-28): one API for Pyramid and PyramidCollection, IO as the hub
 
 A minor release (decision C-11): names are added and every existing name keeps working;

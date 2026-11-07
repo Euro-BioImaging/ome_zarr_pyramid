@@ -23,12 +23,14 @@ CALLS = [dict(well=1), dict(well="B2"), dict(well=["B2", "D7"]), dict(row="C"), 
          # each place by position and by name, as the table's columns
          dict(well_name="B2"), dict(well_name=["B2", "D7"]), dict(row_name="C"),
          dict(column_name="5", row_name=["B", "C"]), dict(row_name="C", column=4),
-         dict(plate_name=""), dict(plate=""), dict(plate_name="other"), dict(well=[1, "B2"]),
-         dict(acquisition_name="run 2"),
+         dict(plate_name=""), dict(plate=""), dict(well=[1, "B2"]),
          # slices of positions, as ranges; open-ended too
          dict(well=slice(0, 2)), dict(well=slice(1, None)), dict(row=slice(2, None)),
          dict(column=slice(0, 5, 2)), dict(row=slice(1, 3), column=slice(1, None)),
-         dict(field=slice(None, 1)), dict(well=[slice(2, None), "B2"]), dict(plate=slice(0, 1))]
+         dict(field=slice(None, 1)), dict(well=[slice(2, None), "B2"]), dict(plate=slice(0, 1)),
+         # vendors' spellings of the same names (A01 / a1 / A1), and a name no plate has
+         dict(well="B02"), dict(well_name="b2"), dict(column_name="05", row_name="c"),
+         dict(row="b")]
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +50,27 @@ def test_the_same_images(plate, call):
     assert ozp == micro
 
 
+def test_vendor_spellings_of_names_select_the_same_wells(plate):
+    f, coll = plate
+    keys = lambda c: sorted(map(str, c))                  # noqa: E731 - the selected keys
+    assert keys(coll.select(well="B02")) == keys(coll.select(well="B2")) != []
+    assert keys(coll.select(column_name="05", row_name="c")) == keys(coll.select(well="C5")) != []
+    assert coll.plates[0].well_index("B02") == coll.plates[0].well_index("B2")
+    assert len(coll.plates[0].rows["B":"C"].wells) == len(f.plates[0].rows["B":"C"].wells) == 2
+
+
+def test_a_well_of_the_layout_without_images_selects_nothing(plate):
+    # review cycle 2, R2-12: rows and columns of the layout selected nothing, its wells raised
+    f, coll = plate
+    assert f.select(well="H12") == [] and list(coll.select(well="H12")) == []
+
+
 @pytest.mark.parametrize("call, error", [(dict(well=0, row=0), TypeError),
+                                         # a name no plate has (a name the layout has, row
+                                         # H, selects nothing)
+                                         (dict(plate_name="other"), ValueError),
+                                         (dict(acquisition_name="run 2"), ValueError),
+                                         (dict(well="Z99"), ValueError),
                                          (dict(well_name="B2", row_name="B"), TypeError),
                                          (dict(well_name=3), TypeError),
                                          (dict(well_nam="B2"), KeyError),

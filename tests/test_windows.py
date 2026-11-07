@@ -35,9 +35,14 @@ def test_dtype_describes_the_written_dtype(tmp_path):
     full8 = {"min": 0, "max": 255, "start": 0, "end": 255}
     chans = _written(tmp_path, _pyr(), windows="dtype", dtype="uint8")
     assert [c["window"] for c in chans] == [full8] * 2
+    # a float type's range showed any data as one grey (review cycle 1, N-15): start / end
+    # are the data's, as windows="auto" gives them; min / max stay the type's
     f32 = np.finfo(np.float32)
-    w = _written(tmp_path, _pyr("float32"), windows="dtype")[0]["window"]
-    assert w["start"] == pytest.approx(float(f32.min)) and w["end"] == pytest.approx(float(f32.max))
+    pyr = _pyr("float32")
+    data = np.asarray(pyr.layers[pyr.meta.resolution_paths[-1]][...])
+    w = _written(tmp_path, pyr, windows="dtype")[0]["window"]
+    assert w["min"] == pytest.approx(float(f32.min)) and w["max"] == pytest.approx(float(f32.max))
+    assert float(data.min()) <= w["start"] < w["end"] <= float(data.max())
 
 
 def test_data_measures_level_0_and_keeps_min_max(tmp_path):

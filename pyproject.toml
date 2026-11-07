@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ome_zarr_pyramid"
-version = "0.5.0"
+version = "0.6.0"
 description = "Read, write and downscale OME-Zarr (NGFF) pyramids with a lazy, memory-bound Pyramid object"
 readme = "README.md"
 # 3.11+: the codebase uses PEP 604 (`str | None`) annotations at runtime, and the
@@ -40,9 +40,10 @@ classifiers = [
 # `import`.
 dependencies = [
     # the same floors and exclusions as dyna-zarr (stated here too, so they hold for ozp
-    # itself): tensorstore 0.1.77-0.1.84 crash at process exit after any S3 access
+    # itself): tensorstore 0.1.77-0.1.84 crash at process exit after any S3 access;
+    # 0.1.85 keeps memory while lower levels are built from level 0 (2.4 -> 115 GB)
     "zarr>=3.1.5",
-    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84",
+    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84,!=0.1.85",
     "numpy>=1.26",
     "numcodecs",          # utils/compressor_config.py, core/pyramid.py (codec configs)
     "pydantic>=2",        # utils/compressor_config.py (ConfigDict/field_validator = v2)

@@ -137,3 +137,109 @@ def test_a_channel_axis_unit_is_removed(tmp_path):
     IO().update_metadata(str(path))
     axes = _attrs(path)[1]["multiscales"][0]["axes"]
     assert "unit" not in next(a for a in axes if a["name"] == "c")
+
+
+OME_IMAGE = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+             '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+             '<Image ID="Image:0" Name="x"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" '
+             'Type="uint16" SizeX="80" SizeY="64" SizeZ="8" SizeC="2" SizeT="1" '
+             'PhysicalSizeX="0.5" PhysicalSizeXUnit="µm" PhysicalSizeY="0.5" '
+             'PhysicalSizeYUnit="µm" PhysicalSizeZ="2.0" PhysicalSizeZUnit="µm">'
+             '<Channel ID="Channel:0:0"/></Pixels></Image></OME>')
+
+
+def _with_xml(tmp_path, xml=OME_IMAGE):
+    path, _ = _store(tmp_path)
+    IO().update_metadata(str(path), ome_xml=xml)
+    return path
+
+
+def _xml(path):
+    return (path / "OME" / "METADATA.ome.xml").read_text(encoding="utf-8")
+
+
+def test_new_scales_reach_the_ome_xml(tmp_path):
+    """review cycle 1, N-25: the multiscales took the new sizes, the OME-XML beside the
+    image kept the old ones."""
+    path = _with_xml(tmp_path)
+    IO().update_metadata(str(path), scales={"x": 0.25, "y": 0.25})
+    xml = _xml(path)
+    assert 'PhysicalSizeX="0.25" PhysicalSizeXUnit="µm"' in xml
+    assert 'PhysicalSizeY="0.25"' in xml
+    assert 'PhysicalSizeZ="2.0"' in xml                     # an axis not edited stays
+    assert '<Channel ID="Channel:0:0"/>' in xml and 'Name="x"' in xml   # the rest as written
+    IO().update_metadata(str(path), units={"z": "nanometer"})
+    assert 'PhysicalSizeZ="2.0" PhysicalSizeZUnit="nm"' in _xml(path)
+
+
+def test_a_unitless_axis_loses_its_ome_xml_size(tmp_path):
+    """OME's default unit is the micrometre: a size left without a unit would claim it."""
+    path = _with_xml(tmp_path)
+    IO().update_metadata(str(path), units={"x": None})
+    xml = _xml(path)
+    assert "PhysicalSizeX=" not in xml and "PhysicalSizeXUnit" not in xml
+    assert 'PhysicalSizeY="0.5"' in xml
+
+
+def test_an_ome_xml_of_several_images_is_left_with_a_warning(tmp_path):
+    two = OME_IMAGE.replace("</OME>", '<Image ID="Image:1"><Pixels ID="Pixels:1" '
+                            'PhysicalSizeX="9"/></Image></OME>')
+    path = _with_xml(tmp_path, two)
+    with pytest.warns(UserWarning, match="describes 2 images"):
+        IO().update_metadata(str(path), scales={"x": 0.25})
+    assert _xml(path) == two
+
+
+def test_no_ome_xml_none_written(tmp_path):
+    path, _ = _store(tmp_path)
+    IO().update_metadata(str(path), scales={"x": 0.25})
+    assert not (path / "OME" / "METADATA.ome.xml").exists()
+
+
+def test_new_scales_keep_the_coarser_levels_on_level_0(tmp_path):
+    """review cycle 2, R2-06: a mean level's half-pixel shift stayed as it was when the
+    scales changed, so the level sat off level 0 again. Its offset from level 0 scales
+    with the new size; level 0's own translation (a stage position) stays."""
+    a = np.zeros((1, 1, 4, 32, 32), "u2")
+    pyr = Pyramid().from_arrays([a], axis_order=AXES, scales=[[1.0, 1.0, 1.0, 1.0, 1.0]],
+                                unit_list=["second", None, "micrometer", "micrometer",
+                                           "micrometer"], version="0.5")
+    path = tmp_path / "m.zarr"
+    IO().write_pyramid(pyr.downscale(n_layers=2, scale_factor=2, downscale_method="mean", defer=True), str(path),
+                       overwrite=True)
+    before = IO().read_pyramid(str(path)).meta
+    t1 = before.get_translation(before.resolution_paths[1])
+    assert t1[-1] == pytest.approx(0.5)                               # (2 - 1) / 2
+    after = IO().update_metadata(str(path), scales={"x": 0.5, "y": 0.5}).meta
+    p0, p1 = after.resolution_paths[:2]
+    assert after.get_scale(p1)[-1] == pytest.approx(1.0)
+    t1 = after.get_translation(p1)
+    assert t1[-1] == pytest.approx(0.25) and t1[-2] == pytest.approx(0.25)   # (1 - 0.5) / 2
+    assert t1[-3] == pytest.approx(before.get_translation(before.resolution_paths[1])[-3])
+    stored = IO().read_pyramid(str(path)).meta
+    assert stored.get_translation(stored.resolution_paths[1])[-1] == pytest.approx(0.25)
+
+
+def test_a_stage_position_stays_when_the_scales_change(tmp_path):
+    path, _ = _store(tmp_path)                       # translation [0, 0, 10, 20, 30] on every level
+    IO().update_metadata(str(path), scales={"x": 1.0})
+    meta = IO().read_pyramid(str(path)).meta
+    for p in meta.resolution_paths:
+        assert meta.get_translation(p) == pytest.approx([0.0, 0.0, 10.0, 20.0, 30.0])
+
+
+def test_min_dimension_size_counts_the_levels_of_a_stored_pyramid(tmp_path):
+    """review cycle 2, R2-05: on a pyramid read from a store, the source's level count won
+    over min_dimension_size in silence (the README's own example); left out, the source's
+    count is kept."""
+    a = np.zeros((1, 1, 1, 256, 256), "u2")
+    pyr = Pyramid().from_arrays([a], axis_order=AXES, scales=[[1.0] * 5],
+                                unit_list=["second", None, "micrometer", "micrometer",
+                                           "micrometer"], version="0.5")
+    path = tmp_path / "s.zarr"
+    IO().write_pyramid(pyr.downscale(n_layers=3, defer=True), str(path), overwrite=True)
+    stored = IO().read_pyramid(str(path))
+    assert [stored.downscale(min_dimension_size=m).nlayers for m in (64, 128, 200)] == [3, 2, 1]
+    assert stored.downscale().nlayers == 3
+    with pytest.raises(TypeError, match="method"):
+        stored.downscale(method="mean")

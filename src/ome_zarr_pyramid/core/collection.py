@@ -38,7 +38,9 @@ the same path.
 from __future__ import annotations
 
 import copy
+import functools
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -80,6 +82,62 @@ PLACE_NAMES = ("plate_name", "acquisition_name", "well_name", "row_name", "colum
 _PLACES = ("plate", "acquisition", "well", "row", "column")
 #: a value of one of these types is "any of" its items, in ``select``
 _SEQUENCES = (list, tuple, range, set, frozenset)
+#: the places whose names vendors spell differently (A1 / A01 / a1): compared by
+#: ``name_key``; plate and acquisition names are free text, compared as given
+_LOOSE_NAMES = ("well", "row", "column")
+_LETTERS_NUMBER = re.compile(r"([A-Z]*)0*(\d+)")
+
+
+@functools.lru_cache(maxsize=8192)                 # select asks once per key: few names
+def name_key(place: str, name):
+    """How a `place`'s name is compared: a well, row or column name in upper case with
+    the leading zeros of its number dropped, so ``"B02"``, ``"b2"`` and ``"B2"`` are one
+    well and ``"03"`` is column ``"3"`` (MetaXpress and Cellomics write ``A01``, Harmony and
+    NGFF ``A1``), as micro-reader's ``select`` compares them. Other places, and names that
+    are not letters + a number, keep their spelling (upper case for wells, rows, columns)."""
+    if place not in _LOOSE_NAMES or not isinstance(name, str):
+        return name
+    text = name.strip().upper()
+    m = _LETTERS_NUMBER.fullmatch(text)
+    return f"{m[1]}{int(m[2])}" if m else text
+
+
+def known_names(plates, place: str) -> set:
+    """The name keys (``name_key``) of every `place` of `plates`: their names, their
+    acquisitions', or their whole layout's wells, rows or columns."""
+    out = set()
+    for plate in plates:
+        names = {"plate": (plate.name,),
+                 "acquisition": tuple(a.name for a in plate.acquisitions),
+                 "well": tuple(w.name for w in (plate.whole or plate.wells)),
+                 "row": plate.row_names, "column": plate.column_names}[place]
+        out.update(name_key(place, n) for n in names if n is not None)
+        if place == "well":
+            # every well of the layout, imaged or not: a row and a column of it, so a
+            # well the layout has selects nothing rather than raising (review cycle 2,
+            # R2-12: rows and columns did, wells did not)
+            out.update(name_key("well", f"{r}{c}") for r in (plate.row_names or ())
+                       for c in (plate.column_names or ()))
+    return out
+
+
+def check_place_names(conditions, plates, where: str = "select") -> None:
+    """A name no plate has raises ``ValueError`` naming the names there are, as
+    micro-reader's ``select``; a name the layout has whose places hold no images selects
+    nothing, as any other value."""
+    for place, _numbers, labels in conditions:
+        if not labels:
+            continue
+        there = known_names(plates, place)
+        missing = sorted(set(labels) - there, key=str)
+        if missing:
+            listed = sorted(there, key=str)
+            shown = ", ".join(map(repr, listed[:24])) + (", ..." if len(listed) > 24 else "")
+            raise ValueError(f"{where}: no {place} named {', '.join(map(repr, missing))} in the "
+                             f"collection's plates; the {place} names are: "
+                             f"{shown or 'none recorded'}")
+
+
 #: the navigation classes (ozp's and micro-reader's): not index values
 _NAVIGATION = ("Plate", "Well", "Field", "Acquisition")
 
@@ -173,13 +231,13 @@ def place_conditions(wanted: Dict[str, tuple], where: str = "select"):
             if wrong:
                 raise TypeError(f"{where}({named}=...): a name, not {wrong[0]!r}; for a "
                                 f"0-based position, {place}={wrong[0]!r}")
-            out.append((place, (), frozenset(values)))
+            out.append((place, (), frozenset(name_key(place, v) for v in values)))
         values = wanted.get(place)
         if values is not None and (place in WELL_ADDRESS
                                    or any(isinstance(v, str) for v in values)):
             del wanted[place]
             out.append((place, tuple(v for v in values if not isinstance(v, str)),
-                        frozenset(v for v in values if isinstance(v, str))))
+                        frozenset(name_key(place, v) for v in values if isinstance(v, str))))
     given = {place for place, _, _ in out}
     if "well" in given or "well" in wanted:
         if given & {"row", "column"}:
@@ -192,7 +250,7 @@ def place_matches(conditions, positions: Dict[str, Any], names: Dict[str, Any]) 
     """Whether an image at `positions` (0-based plate, acquisition, well, row, column) with
     `names` (their names) meets every place condition (``place_conditions``)."""
     for place, numbers, labels in conditions:
-        if positions.get(place) not in numbers and names.get(place) not in labels:
+        if positions.get(place) not in numbers and name_key(place, names.get(place)) not in labels:
             return False
     return True
 
@@ -572,13 +630,17 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     - Levels: the image's stored resolutions (finest first), each a lazy dyna-zarr array;
       ``resolutions="base"`` takes only the full-resolution image (to downscale it
       afresh). A coarser level's scale is the base scale times the size ratio per axis.
-    - Scale and units: from ``metadata.pixel_sizes``. A missing z or y size takes x's
-      value and unit; any other axis without one keeps ome_zarr_pyramid's default
-      (1.0, micrometer / second; none for ``c``).
+    - Scale and units: from ``metadata.pixel_sizes``. A missing y size takes x's (square
+      pixels). An x, y, or z or t of more than one step, without a size, is written with
+      scale 1 and NO unit: nothing is invented, so an uncalibrated image cannot pass for a
+      measured one, and a z size is never taken from x. ``pyramid.uncalibrated`` lists those
+      axes. A z or t of one step has no step to know: scale 1 and no unit too, but it is
+      not listed (no size is missing).
     - Translation: ``metadata.position`` in each axis's own scale unit, on every level
       (the stored levels are the image's own, so they share level 0's origin), written
-      whenever the image has a position, (0, 0) included. A position along an axis in a
-      unit that cannot be converted to the axis's unit raises ``PositionUnitError``.
+      whenever the image has a position, (0, 0) included; an axis without a unit stays 0.
+      A position along an axis in a unit that cannot be converted to the axis's unit
+      raises ``PositionUnitError``.
     - Channels: name and colour into omero. A channel the image describes without a
       name is ``Channel {i}`` (counted from 0), without a colour white (OME's default
       colour); colours are generated only when the image says nothing about its
@@ -615,23 +677,24 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     meta = getattr(image, "metadata", None)
     pixel_sizes = dict(getattr(meta, "pixel_sizes", None) or {})
     base_scale, units, given = [], [], set()
-    for ax in axes:
-        # a channel axis has no unit in NGFF (ozp's default table says "Channel")
-        default_unit = None if ax == "c" else defaults.unit_map.get(ax)
+    for ax, n in zip(axes, base_shape):
         q = _quantity(pixel_sizes.get(ax)) if ax != "c" else None
         if q is None:
             base_scale.append(float(defaults.scale_map.get(ax, 1.0)))
-            units.append(default_unit)
+            units.append(None)
+            if ax in "zt" and n == 1:
+                given.add(ax)          # one step: no size to know, so none is missing
         else:
             base_scale.append(q[0])
-            units.append(q[1])
-            given.add(ax)
-    if "x" in given:
-        # a missing z or y pixel size takes x's (eubi-bridge's rule)
-        x = axes.index("x")
-        for ax in "zy":
-            if ax in axes and ax not in given:
-                base_scale[axes.index(ax)], units[axes.index(ax)] = base_scale[x], units[x]
+            # unit "pixel": a relative size (z five times x), so no unit, and uncalibrated
+            units.append(None if q[1] == "pixel" else q[1])
+            if q[1] != "pixel":
+                given.add(ax)
+    if "x" in given and "y" in axes and "y" not in given and "y" not in pixel_sizes:
+        # square pixels: the one size a file leaves out because it is the same
+        base_scale[axes.index("y")], units[axes.index("y")] = base_scale[axes.index("x")], \
+            units[axes.index("x")]
+        given.add("y")
     scales = []
     for level in levels:
         ratio = [b / max(1, int(n)) for b, n in zip(base_shape, level.shape)]
@@ -644,6 +707,10 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
     label = name or getattr(image, "name", None) or "unnamed"
     pyr = Pyramid().from_arrays(arrays, axis_order=axes, unit_list=units, scales=scales,
                                 version=version, name=label)
+    #: the axes the image gives no size for: scale 1 and no unit (see above); set again on
+    #: the pyramid returned, which set_channels replaces
+    uncalibrated = tuple(ax for ax in axes if ax != "c" and ax not in given)
+    pyr.uncalibrated = uncalibrated
 
     position = dict(getattr(meta, "position", None) or {})
     if position:
@@ -651,8 +718,11 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
         # position does not name, and t / c, stay 0. Stored levels are the image's own
         # (a vendor pyramid): they keep level 0's translation (alignment 0).
         unit_of = dict(zip(axes, units))
+        # an axis without a unit keeps a relative position (unit "pixel"), as its scale
         translation = [_position(position[ax], unit_of.get(ax), image=label, axis=ax)
-                       if ax in "zyx" and position.get(ax) is not None else 0.0
+                       if ax in "zyx" and position.get(ax) is not None
+                       and (unit_of.get(ax) or getattr(position[ax], "unit", None) == "pixel")
+                       else 0.0
                        for ax in axes]
         for path in pyr.meta.resolution_paths:
             pyr.meta.update_translation(path, translation)
@@ -704,6 +774,7 @@ def pyramid_from_image(image, *, version: str = "0.5", name: Optional[str] = Non
         pyr.meta.set_custom(acquisition_block, block)
     pyr.acquisition = acquisition
     pyr.source_index = dict(getattr(image, "index", None) or {})
+    pyr.uncalibrated = uncalibrated
     return pyr
 
 
@@ -1944,6 +2015,8 @@ class PyramidCollection(Mapping):
         if conditions and not places:
             raise ValueError("select: plate names, well names, rows and columns are a "
                              "plate's places; the collection holds no plate")
+        if conditions:                                 # the whole tree's plates and wells
+            check_place_names(conditions, self._plate_views(held=False))
         keys = []
         for key in self._pyramids:
             values = dict(key)

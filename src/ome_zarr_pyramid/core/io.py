@@ -283,7 +283,7 @@ def _full_pyramid(pyramid, full, arrays, rechunked, method):
     units = list(full.meta.unit_list or [])
     full_dask = Pyramid().from_arrays(
         arrays=arrays, axis_order=full.meta.axis_order,
-        unit_list=units if any(u is not None for u in units) else None,
+        unit_list=units or None,
         scales=[full.meta.get_scale(p) for p in fpaths],
         version=full.meta.version,
         name=full.meta.multiscales.get('name', 'unnamed') if full.meta.metadata else 'unnamed',
@@ -295,11 +295,17 @@ def _full_pyramid(pyramid, full, arrays, rechunked, method):
     # written pyramid loses its position
     base_translation = (pyramid.meta.get_base_translation()
                         if pyramid.meta is not None else None)
-    if base_translation is not None and full_dask.meta is not None:
+    from ome_zarr_pyramid.core.pyramid import STRIDE_METHODS
+    if full_dask.meta is not None and (base_translation is not None
+                                       or method not in STRIDE_METHODS):
+        # no base translation: the origin, so a window method still shifts the coarser
+        # levels (level 0 keeps none), as Pyramid.downscale does (review cycle 1, N-05)
         base_scale = full.meta.get_scale(fpaths[0])
+        base = base_translation if base_translation is not None else [0.0] * len(base_scale)
         for p in fpaths:
-            full_dask.meta.update_translation(p, level_translation(
-                base_translation, base_scale, full.meta.get_scale(p), method))
+            shift = level_translation(base, base_scale, full.meta.get_scale(p), method)
+            if base_translation is not None or any(shift):
+                full_dask.meta.update_translation(p, shift)
     # `full_dask` was rebuilt via from_arrays (axes/scales/units/name only), so overlay the
     # SOURCE pyramid's non-dataset metadata (omero channels/colours/windows and any custom
     # top-level attrs). Without this, writing the extra levels re-saves the group attrs and
@@ -695,6 +701,69 @@ def _write_ome_xml(path, xml: str, series, version: str,
         return
     data = default_buffer_prototype().buffer.from_bytes(xml.encode("utf-8"))
     _run_coroutine(store_path.store.set(key, data))
+
+
+#: NGFF unit names -> OME-XML UnitsLength / UnitsTime symbols
+_OME_UNIT_SYMBOLS = {
+    "angstrom": "Å", "attometer": "am", "centimeter": "cm", "decimeter": "dm",
+    "exameter": "Em", "femtometer": "fm", "foot": "ft", "gigameter": "Gm",
+    "hectometer": "hm", "inch": "in", "kilometer": "km", "megameter": "Mm", "meter": "m",
+    "micrometer": "µm", "mile": "mi", "millimeter": "mm", "nanometer": "nm",
+    "parsec": "pc", "petameter": "Pm", "picometer": "pm", "terameter": "Tm", "yard": "yd",
+    "yoctometer": "ym", "yottameter": "Ym", "zeptometer": "zm", "zettameter": "Zm",
+    "attosecond": "as", "centisecond": "cs", "day": "d", "decisecond": "ds",
+    "exasecond": "Es", "femtosecond": "fs", "gigasecond": "Gs", "hectosecond": "hs",
+    "hour": "h", "kilosecond": "ks", "megasecond": "Ms", "microsecond": "µs",
+    "millisecond": "ms", "minute": "min", "nanosecond": "ns", "petasecond": "Ps",
+    "picosecond": "ps", "second": "s", "terasecond": "Ts", "yoctosecond": "ys",
+    "yottasecond": "Ys", "zeptosecond": "zs", "zettasecond": "Zs"}
+#: an axis -> the OME-XML Pixels attribute giving its size
+_OME_SIZE_ATTRIBUTES = {"x": "PhysicalSizeX", "y": "PhysicalSizeY", "z": "PhysicalSizeZ",
+                        "t": "TimeIncrement"}
+
+
+def _refresh_ome_xml_sizes(root: zarr.Group, path, pyramid, axes, storage_options) -> None:
+    """After an edit of `axes`' scales or units: set the sizes and units of the image's
+    OME-XML (``OME/METADATA.ome.xml``, when there is one) to the pyramid's level 0, so
+    the two say the same. Only the Pixels element's attributes of those axes change, the
+    rest of the document stays as written. An axis without a unit loses its size there
+    (OME's default unit is the micrometre, which a unitless scale is not). A document of
+    several images is left with a warning: which one is this image is not known."""
+    import re
+    from ome_zarr_pyramid.core.pyramid import _run_coroutine
+    from zarr.core.buffer import default_buffer_prototype
+    store, prefix = root.store_path.store, root.store_path.path
+    key = "/".join(p for p in (prefix, "OME", "METADATA.ome.xml") if p)
+    found = _run_coroutine(store.get(key, prototype=default_buffer_prototype()))
+    if found is None:
+        return
+    xml = found.to_bytes().decode("utf-8")
+    tags = list(re.finditer(r"<(?:[\w.-]+:)?Pixels\b[^>]*>", xml))
+    if len(tags) != 1:
+        warnings.warn(f"{path}: the scales changed, but its OME-XML (OME/METADATA.ome.xml) "
+                      f"describes {len(tags)} images and was left as it was: it now gives "
+                      f"other sizes than the image's metadata", UserWarning, stacklevel=3)
+        return
+    tag = tags[0].group(0)
+    meta = pyramid.meta
+    order = meta.axis_order
+    scale = meta.get_scale(meta.resolution_paths[0])
+    edited = tag
+    for axis in sorted(axes):
+        attribute = _OME_SIZE_ATTRIBUTES.get(axis)
+        if attribute is None or axis not in order:
+            continue
+        value = float(scale[order.index(axis)])
+        unit = meta.unit_list[order.index(axis)]
+        symbol = _OME_UNIT_SYMBOLS.get(unit) if unit else None
+        for name in (attribute, attribute + "Unit"):
+            edited = re.sub(rf'\s{name}="[^"]*"', "", edited)
+        if symbol is None:
+            continue
+        added = f' {attribute}="{value!r}" {attribute}Unit="{symbol}"'
+        edited = re.sub(r"(\s*/?>)$", lambda m: added + m.group(1), edited, count=1)
+    if edited != tag:
+        _write_ome_xml(path, xml.replace(tag, edited, 1), None, meta.version, storage_options)
 
 
 def _drop_stray_ome_group(root: zarr.Group, path) -> bool:
@@ -1194,7 +1263,7 @@ class PyramidIO:
                           "no OME group (NGFF has one only in a bioformats2raw layout; "
                           "write_series writes that)", DeprecationWarning, stacklevel=2)
             ome_series = None
-        if windows not in _WINDOW_MODES:
+        if windows not in _WINDOW_MODES + ("_dtype",):          # _dtype: internal (auto)
             raise ValueError(f"windows={windows!r}: one of {_WINDOW_MODES}")
         if window_from_data:
             if windows not in ("keep", "data"):
@@ -1226,6 +1295,16 @@ class PyramidIO:
                 labels_group_path, _ = _legacy_https_target(labels_group_path,
                                                             storage_options)
             path, storage_options = _legacy_https_target(path, storage_options)
+        if windows == "dtype" and layers is None:
+            level0 = pyramid.layers[pyramid.meta.resolution_paths[0]].dtype
+            target = np.dtype(dtype) if dtype is not None else np.dtype(
+                getattr(level0, "numpy_dtype", level0))
+            if np.issubdtype(target, np.floating):
+                # a float type's range (-3.4e38 .. 3.4e38) shows any data as one grey
+                # (review cycle 1, N-15): its window is the data's, as windows="auto"
+                windows = "auto"
+        if windows == "_dtype":                     # the auto write's first pass: as asked
+            windows = "dtype"
         if windows == "auto" and layers is None:
             return self._write_auto_windows(
                 pyramid, path, overwrite=overwrite, max_threads=max_threads,
@@ -1359,7 +1438,7 @@ class PyramidIO:
         ``dtype``) and the source is not read again. A coarsest level over
         AUTO_WINDOW_MAX_MB (no downscaling, a deep stack kept in z) keeps the dtype's
         windows, with a log line."""
-        self.write_pyramid(pyramid, path, windows="dtype", **kwargs)
+        self.write_pyramid(pyramid, path, windows="_dtype", **kwargs)
         storage_options = kwargs.get('storage_options')
         zarr_format = int(pyramid.meta.zarr_format)
         if _is_remote_store(path):
@@ -1454,6 +1533,11 @@ class PyramidIO:
         if ome_xml is not None:
             xml = ome_xml(pyramid) if callable(ome_xml) else ome_xml
             _write_ome_xml(path, xml, ome_series, pyramid.meta.version, storage_options)
+        elif scales or units:
+            # the OME-XML beside the image says the same sizes (review cycle 1, N-25: it
+            # kept the old ones, so the two disagreed)
+            _refresh_ome_xml_sizes(group, path, pyramid,
+                                   set(scales or {}) | set(units or {}), storage_options)
         return pyramid
 
     def _write_measuring_windows(self, pyramid, path, **kwargs) -> None:

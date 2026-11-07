@@ -10,18 +10,10 @@ def get_logger(name: str) -> logging.Logger:
         name: Module name (typically __name__)
     
     Returns:
-        logging.Logger: Configured logger instance
+        logging.Logger: The logger; ``logging.basicConfig(level=logging.INFO)`` shows its lines
     """
+    # a library leaves output to the application: no handler of its own (with one, an
+    # application that logs printed every line twice, and plain Python printed INFO)
     logger = logging.getLogger(name)
-    
-    # Only configure if not already configured
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-    
+    logger.addHandler(logging.NullHandler())
     return logger
