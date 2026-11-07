@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-11-07)
 
 A minor release: `select` refuses a name no plate has (it selected nothing).
 Ships with micro-reader 0.4.0, whose `select` does the same.
