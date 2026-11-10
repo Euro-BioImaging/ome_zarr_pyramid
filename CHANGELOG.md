@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.1 (unreleased)
+## 0.6.1 (2026-11-10)
 
 Zipped OME-Zarr: written straight into a zip and read from one. Needs dyna-zarr 0.1.3, which
 also fixes a rare loss of data in its pyramid writer (below).
