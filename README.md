@@ -37,7 +37,7 @@ from ome_zarr_pyramid import Pyramid, io
 
 pyr = io.read_pyramid("image.ome.zarr")             # -> Pyramid (lazy, nothing loaded)
 print(pyr.axes, pyr.nlayers)                        # 'tczyx', 5
-print(pyr.base_array.shape, pyr.base_array.dtype)   # full-resolution level 0
+print(pyr.base_array.shape, pyr.base_array.dtype)   # full-resolution level (level-0)
 
 io.write_pyramid(pyr, "copy.ome.zarr", overwrite=True)
 ```
