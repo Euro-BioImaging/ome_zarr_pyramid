@@ -1510,7 +1510,13 @@ class Pyramid:
 
     def from_ngff(self, gr: Union[zarr.Group, str, Path]) -> 'Pyramid':
         """Load pyramid from an NGFF-compliant Zarr group (NGFF 0.4 or 0.5; a group
-        declaring another version, e.g. 0.6, raises ``UnsupportedNGFFVersion``)."""
+        declaring another version, e.g. 0.6, raises ``UnsupportedNGFFVersion``). A path to
+        a zipped OME-Zarr (``X.ome.zarr.zip``, ``X.ozx``) opens the image in the zip."""
+        if isinstance(gr, (str, Path)):
+            from ome_zarr_pyramid.core.io import _zip_group
+            zipped = _zip_group(gr, None, "r")
+            if zipped is not None:
+                gr = zipped
         if isinstance(gr, (str, Path)) and not is_zarr_group(gr):
             # connect_to_group creates a group: a read must leave the folder as it is
             raise ValueError(f"No valid metadata found: {str(gr)!r} is not a Zarr group")
