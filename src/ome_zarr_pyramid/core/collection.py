@@ -255,6 +255,18 @@ def place_matches(conditions, positions: Dict[str, Any], names: Dict[str, Any]) 
     return True
 
 
+def _writes_into_zip(method):
+    """A collection writer whose `path` may name a zip (``X.ome.zarr.zip`` / ``X.ozx``):
+    the zip is opened around the whole write and closed after it (io._zip_opened)."""
+    @functools.wraps(method)
+    def wrapper(self, path, *args, **kwargs):
+        from ome_zarr_pyramid.core.io import _zip_opened
+        with _zip_opened(path, overwrite=kwargs.get("overwrite", False),
+                         storage_options=kwargs.get("storage_options")):
+            return method(self, path, *args, **kwargs)
+    return wrapper
+
+
 def _io():
     """The IO a shortcut delegates to (imported here: io.py imports this module's
     neighbours at load time). IO holds no state, so a fresh one is the shared ``io``."""
@@ -1562,6 +1574,7 @@ class PyramidCollection(Mapping):
                                  overwrite=overwrite, storage_options=storage_options,
                                  writer=writer, document=document, **write_kwargs)
 
+    @_writes_into_zip
     @validating
     def _write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
                      overwrite: bool = False, storage_options: Optional[dict] = None,
@@ -1664,6 +1677,7 @@ class PyramidCollection(Mapping):
                                   ome_xml=ome_xml, storage_options=storage_options,
                                   writer=writer, document=document, **write_kwargs)
 
+    @_writes_into_zip
     @validating
     def _write_series(self, path, *, version: Optional[str] = None, overwrite: bool = False,
                       ome_xml: Optional[str] = None, storage_options: Optional[dict] = None,
@@ -1755,6 +1769,7 @@ class PyramidCollection(Mapping):
                                       overwrite=overwrite, storage_options=storage_options,
                                       writer=writer, **write_kwargs)
 
+    @_writes_into_zip
     @validating
     def _write_collection(self, path, *, version: str = "rfc8", document: Optional[str] = None,
                           overwrite: bool = False, storage_options: Optional[dict] = None,

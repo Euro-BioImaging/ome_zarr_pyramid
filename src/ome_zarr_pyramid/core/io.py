@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Sequence
 
 import asyncio
+import contextlib
 import gc
 import itertools
 import logging
@@ -187,6 +188,69 @@ def _object_store_group(url: str, zarr_format: int, mode: str,
     store = ObjectStore(obstore.store.from_url(url, **(storage_options or {})),
                         read_only=(mode == "r"))
     return zarr.open_group(store, mode=mode, zarr_format=zarr_format)
+
+
+_ZIP_SUFFIXES = (".zip", ".ozx")
+
+
+def _dyna_zip_io():
+    """dyna-zarr's io namespace when it writes zips (0.1.3+), else None."""
+    from dyna_zarr import io as dyna_io
+    return dyna_io if hasattr(dyna_io, "zip_zarr_store") else None
+
+
+def _names_a_zip(path) -> bool:
+    """A local path with a component named like a zip (``.zip`` / ``.ozx``)."""
+    if _is_remote_store(path):
+        return False
+    return any(part.lower().endswith(_ZIP_SUFFIXES) for part in Path(str(path)).parts)
+
+
+def _zip_file_of(path) -> Optional[str]:
+    """The zip `path` is, or is inside (OME-Zarr written straight into a zip), or None."""
+    if not _names_a_zip(path):
+        return None
+    dyna_io = _dyna_zip_io()
+    if dyna_io is None:
+        raise ImportError(
+            f"{str(path)!r} names a zip: OME-Zarr is written into and read from a zip by "
+            f"dyna-zarr 0.1.3 or newer (pip install -U dyna-zarr)")
+    return dyna_io.zip_file_of(path)
+
+
+def _zip_group(path, zarr_format, mode: str) -> Optional[zarr.Group]:
+    """The zarr group at `path` inside a zip - one open for writing (``mode`` other than
+    "r": metadata is appended to it), or a finished zip (read-only) - or None when `path`
+    is not inside a zip."""
+    if _zip_file_of(path) is None:
+        return None
+    found = _dyna_zip_io().zip_zarr_store(path, write=(mode != "r"))
+    if found is None:
+        return None
+    store, key = found
+    return zarr.open_group(store, path=key, mode="r" if mode == "r" else "a",
+                           zarr_format=zarr_format)
+
+
+@contextlib.contextmanager
+def _zip_opened(path, *, overwrite: bool = False, storage_options=None):
+    """Around a write to `path`: when `path` names a zip that is not open, open it (dyna's
+    ``io.open_zip``; ``X.ome.zarr.zip`` or ``X.ozx``), and close it when the write is done
+    (a failed write leaves no zip). Nothing for other paths, or a zip already open."""
+    zip_file = _zip_file_of(path)
+    if zip_file is None or _dyna_zip_io().zip_is_open(path):
+        yield
+        return
+    if os.path.abspath(str(path)) != os.path.abspath(zip_file):
+        raise ValueError(
+            f"{path} is inside the zip {zip_file}, which is not open for writing. Write "
+            f"to {zip_file} itself, or open it first with "
+            f"dyna_zarr.io.open_zip({str(zip_file)!r}).")
+    if storage_options:
+        raise ValueError(f"{path}: storage_options are for object stores; a zip is "
+                         f"written locally. Drop storage_options.")
+    with _dyna_zip_io().open_zip(zip_file, overwrite=bool(overwrite)):
+        yield
 
 
 #: ``write_pyramid(backend=...)``: the storage backend, as dyna-zarr names it (decision
@@ -799,7 +863,10 @@ def _open_store_group(path, zarr_format: int, mode: str = "a",
     """Open/create a zarr group for attr read/write: local directly; an object-store URL
     (s3://, gs://, az://) through obstore with dyna-style storage_options. (The https://
     s3fs branch only serves the removed engines; write_pyramid translates https:// to
-    s3:// before it gets here.)"""
+    s3:// before it gets here.) A path inside a zip: the group in the zip."""
+    group = _zip_group(path, zarr_format, mode)
+    if group is not None:
+        return group
     if _is_remote_store(path):
         if _is_legacy_https(path):
             store = tensorstore_writer.wrap_output_path(str(path))
@@ -816,7 +883,15 @@ def _existing_group_version(path, storage_options: Optional[dict] = None) -> Opt
     v3 group is its ``ome.version``, 0.5 when it records none. A v3 group declaring
     another version (0.7, say) raises :class:`UnsupportedNGFFVersion`: ozp writes 0.4,
     0.5 and 0.6."""
-    if _is_remote_store(path):
+    if _zip_file_of(path) is not None:
+        try:
+            group = _zip_group(path, None, "r")
+        except (FileNotFoundError, KeyError, ValueError):
+            group = None
+        if group is None:
+            return None
+        zarr_format, attrs = group.metadata.zarr_format, dict(group.attrs)
+    elif _is_remote_store(path):
         try:
             group = _object_store_group(str(path), None, "r", storage_options)
         except FileNotFoundError:
@@ -971,7 +1046,9 @@ class PyramidIO:
             from its attributes, before any array or label is opened.
         """
         remote = _is_remote_store(path) and not _is_legacy_https(path)
-        if not remote:
+        # OME-Zarr in a zip: a finished one, or one being written (dyna_zarr.io.open_zip)
+        zipped = None if remote else _zip_group(path, None, "r")
+        if not remote and zipped is None:
             path = Path(path) if isinstance(path, str) else path
             if not path.exists():
                 raise FileNotFoundError(f"Path does not exist: {path}")
@@ -981,7 +1058,10 @@ class PyramidIO:
 
         try:
             pyramid = Pyramid()
-            if remote:
+            if zipped is not None:
+                pyramid.from_ngff(zipped)
+                include_labels = False   # label discovery walks a local directory tree
+            elif remote:
                 # the format is read from the store; open_group detects v2 / v3
                 pyramid.from_ngff(_object_store_group(str(path), None, "r", storage_options))
                 include_labels = False   # label discovery walks a local directory tree
@@ -1230,9 +1310,13 @@ class PyramidIO:
         ``Pyramid`` object, which by default mirrors the source it was read
         from.
         """
+        given = dict(locals())                # every argument as given (a zip write below)
         if pyramid.meta is None:
             raise ValueError("Pyramid not initialized")
         _refuse_removed_settings(removed)
+        zip_file = _zip_file_of(path)
+        if zip_file is not None and not _dyna_zip_io().zip_is_open(path):
+            return self._write_pyramid_zip(zip_file, given)
         if levels is not None:            # the level paths to write, by dyna's name (C-16)
             if layers is not None:
                 raise ValueError("write_pyramid: give levels= or layers=, not both "
@@ -1289,6 +1373,12 @@ class PyramidIO:
         loop = {k: v for k, v in (("engine", engine), ("num_readers", num_readers),
                                   ("gc_interval", gc_interval)) if v is not None}
         _resolve_engine(pyramid, 'auto', max_downscale_processes=max_downscale_processes)
+        if max_downscale_processes and zip_file is not None:
+            raise ValueError(
+                f"{path}: a zip has one writer, so its levels cannot be written by "
+                f"max_downscale_processes={max_downscale_processes} processes. Drop "
+                f"max_downscale_processes (the levels are still written from one read of "
+                f"level 0), or write a folder.")
         # the legacy https://host/bucket/key form becomes s3://bucket/key + endpoint
         if _is_legacy_https(path):
             if labels_group_path is not None and _is_legacy_https(labels_group_path):
@@ -1431,6 +1521,23 @@ class PyramidIO:
             return    # internal sub-write: the caller writes the side metadata
         self._write_side_metadata(path, **side)
 
+    def _write_pyramid_zip(self, zip_file: str, given: dict) -> None:
+        """write_pyramid to ``X.ome.zarr.zip`` (the image's folder inside, as the BioImage
+        Archive asks) or ``X.ozx`` (NGFF RFC-9: the image at the zip's root, OME-Zarr 0.5+):
+        the zip is opened, every level, label and metadata file written straight into it,
+        and closed; it is ``X.part`` until then, and a failed write leaves nothing."""
+        path, pyramid = given['path'], given['pyramid']
+        if (zip_file.lower().endswith(".ozx") and int(pyramid.meta.zarr_format) != 3
+                and os.path.abspath(str(path)) == os.path.abspath(zip_file)):
+            raise ValueError(
+                f"{path}: an .ozx (NGFF RFC-9) holds OME-Zarr 0.5 or newer (zarr v3); this "
+                f"image is OME-Zarr {pyramid.meta.version}. Write {Path(zip_file).stem}"
+                f".ome.zarr.zip, or convert with pyramid.to_version('0.5').")
+        args = {k: v for k, v in given.items() if k not in ('self', 'removed')}
+        with _zip_opened(path, overwrite=bool(given['overwrite']),
+                         storage_options=given.get('storage_options')):
+            self.write_pyramid(**args)
+
     def _write_auto_windows(self, pyramid, path, **kwargs) -> None:
         """write_pyramid(windows="auto"): written with the dtype's windows, then each
         channel's start / end set to the AUTO_WINDOW_PERCENTILES of the COARSEST written
@@ -1441,7 +1548,10 @@ class PyramidIO:
         self.write_pyramid(pyramid, path, windows="_dtype", **kwargs)
         storage_options = kwargs.get('storage_options')
         zarr_format = int(pyramid.meta.zarr_format)
-        if _is_remote_store(path):
+        group = _zip_group(path, zarr_format, "r")
+        if group is not None:
+            pass
+        elif _is_remote_store(path):
             group = _object_store_group(str(path), zarr_format, "r", storage_options)
         else:
             group = zarr.open_group(str(path), mode="r", zarr_format=zarr_format)
@@ -1522,7 +1632,10 @@ class PyramidIO:
                     k: {"window": {"start": lo, "end": hi}}
                     for k, (lo, hi) in enumerate(zip(*found)) if lo is not None})
         zarr_format = int(pyramid.meta.zarr_format)
-        if _is_remote_store(path):
+        group = _zip_group(path, zarr_format, "a")
+        if group is not None:
+            pass
+        elif _is_remote_store(path):
             group = _object_store_group(str(path), zarr_format, "a", storage_options)
         else:
             group = zarr.open_group(str(path), mode="r+", zarr_format=zarr_format)
@@ -1570,7 +1683,10 @@ class PyramidIO:
     def _set_written_windows(path, zarr_format, observer, storage_options) -> None:
         """Set omero window start/end from ``observer`` on the group written at ``path``
         (OME-Zarr 0.5 keeps omero under ``ome``, 0.4 at the top level)."""
-        if _is_remote_store(path):
+        group = _zip_group(path, zarr_format, "a")
+        if group is not None:
+            pass
+        elif _is_remote_store(path):
             group = _object_store_group(str(path), zarr_format, "a", storage_options)
         else:
             group = zarr.open_group(str(path), mode="r+", zarr_format=zarr_format)
@@ -1628,7 +1744,10 @@ class PyramidIO:
         recorded = dict(getattr(pyramid, '_level_chunks', None) or {})
         storage = getattr(pyramid, '_storage_chunks', None)
 
-        if remote:
+        zarr_group = _zip_group(path, zf, "a")       # in a zip: a new zip, nothing to replace
+        if zarr_group is not None:
+            pass
+        elif remote:
             zarr_group = _object_store_group(path, zf, "w" if overwrite else "a",
                                              storage_options)
         else:
@@ -1810,7 +1929,10 @@ class PyramidIO:
                                 chunks=chunks, chunk_size_mb=kw.get('chunk_size_mb'),
                                 shard_coefficients=kw.get('shard_coefficients')))
 
-        if remote:
+        zarr_group = _zip_group(path, zf, "a")       # in a zip: a new zip, nothing to replace
+        if zarr_group is not None:
+            pass
+        elif remote:
             zarr_group = _object_store_group(path, zf, "w" if overwrite else "a",
                                              storage_options)
         else:
@@ -1981,7 +2103,7 @@ class PyramidIO:
         for i in range(1, len(fpaths)):
             prev, cur = level_factors[i - 1], level_factors[i]
             if all(c % p == 0 for c, p in zip(cur, prev)):
-                if _is_remote_store(path):
+                if _is_remote_store(path) or _zip_file_of(path) is not None:
                     from dyna_zarr import io as dyna_io
                     parent = dyna_io.read(str(_store_join(path, fpaths[i - 1])),
                                           storage_options=storage_options)

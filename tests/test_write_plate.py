@@ -207,3 +207,26 @@ def test_harmony_to_ngff_and_back(tmp_path, index, version):
         assert _meta(coll[key]) == _meta(back[key])
         np.testing.assert_array_equal(_pixels(coll[key]), _pixels(back[key]))
     _viewers(out)
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5", "rfc8"])
+def test_a_plate_into_a_zip_holds_what_a_folder_holds(tmp_path, version):
+    """write_plate to X.ome.zarr.zip (Workplan C16): the zip is opened around the whole
+    plate (every field, then the plate and well metadata) and holds the folder's files."""
+    import zipfile
+    from pathlib import Path
+    if not hasattr(__import__("dyna_zarr").io, "open_zip"):
+        pytest.skip("dyna-zarr without zip writing")
+    coll = PyramidCollection.from_file(_file(), version="0.5" if version == "rfc8" else version)
+    coll.write_plate(str(tmp_path / "screen.ome.zarr"), version=version)
+    coll.write_plate(str(tmp_path / "screen.ome.zarr.zip"), version=version)
+    folder = {p.relative_to(tmp_path / "screen.ome.zarr").as_posix(): p.read_bytes()
+              for p in Path(tmp_path / "screen.ome.zarr").rglob("*") if p.is_file()}
+    with zipfile.ZipFile(tmp_path / "screen.ome.zarr.zip") as zf:
+        names = zf.namelist()
+        assert len(names) == len(set(names))
+        zipped = {n[len("screen.ome.zarr/"):]: zf.read(n) for n in names}
+    assert zipped == folder
+    back = PyramidCollection.from_zarr(str(tmp_path / "screen.ome.zarr.zip"))
+    assert [f.index for w in back.plates[0].wells for f in w.fields] == \
+        [f.index for w in coll.plates[0].wells for f in w.fields]

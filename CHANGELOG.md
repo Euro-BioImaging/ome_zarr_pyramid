@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.1 (unreleased)
+
+Zipped OME-Zarr: written straight into a zip and read from one. Needs dyna-zarr 0.1.3, which
+also fixes a rare loss of data in its pyramid writer (below).
+
+### Added
+
+- `write_pyramid(pyr, "X.ome.zarr.zip")` writes the image straight into a zip, with no folder
+  first: the BioImage Archive's layout, the image's folder `X.ome.zarr` inside the zip, or
+  `X.ozx`, the NGFF RFC-9 draft (the image at the zip's root, OME-Zarr 0.5 or newer). Every
+  level, label and metadata file goes into the zip as it is written; the zip is `X.part` until
+  it is complete and checked, and a failed write leaves none. The zip holds the same files a
+  folder write holds. `write_plate`, `write_series` and `write_collection` take a zip path the
+  same way.
+- `read_pyramid`, `Pyramid(path)` and `PyramidCollection.from_zarr` open a zipped OME-Zarr
+  (read-only), and a zip still being written.
+- Refused, naming the way out: `max_downscale_processes` > 1 for a zip (a zip has one
+  writer), OME-Zarr 0.4 into an `.ozx`, `storage_options` with a zip, a path inside a zip that
+  is not open for writing, an existing zip without `overwrite`.
+
+### Fixed
+
+- Through dyna-zarr 0.1.3: when one chunk of a level was larger than the memory budget for a
+  block (zarr v2 or an object-store output, a source read in whole planes, several threads), a
+  rare race could leave part of a chunk empty (dyna-zarr 0.1.0 - 0.1.2). eubi-bridge's default
+  conversions do not reach that mode.
+
 ## 0.6.0 (2026-11-07)
 
 A minor release: `select` refuses a name no plate has (it selected nothing).
