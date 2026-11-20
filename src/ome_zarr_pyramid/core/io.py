@@ -1960,8 +1960,14 @@ class PyramidIO:
                 # reader caches; ~90 MB after a nematostella first pass)
                 grown = max(0.0, (_process_rss_mb() or start_rss) - start_rss)
                 level_kw['memory_budget_mb'] = max(budget / 4, budget - grown)
-            with dyna_io.capture_messages() as messages:     # thread-safe, unlike
-                n = dyna_io.write_levels(src, rel, **level_kw,  # redirect_stdout
+            # that lowered budget is ozp's, not the caller's: a later pass it cannot fit
+            # warns and writes with dyna's smallest pass (dyna 0.2.0+ raises
+            # MemoryBudgetError otherwise, after the earlier levels are written). The
+            # first pass keeps the caller's budget as a limit.
+            soft = (dyna_io.soft_memory_budget() if i > 0 and budget is not None
+                    and hasattr(dyna_io, "soft_memory_budget") else contextlib.nullcontext())
+            with soft, dyna_io.capture_messages() as messages:  # thread-safe, unlike
+                n = dyna_io.write_levels(src, rel, **level_kw,     # redirect_stdout
                                          observe=observer if i == 0 else None)
             log.append("\n".join(messages))
             i += n
