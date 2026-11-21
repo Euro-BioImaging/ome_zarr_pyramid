@@ -1,0 +1,19 @@
+[package]
+name = "ome-zarr-pyramid"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "ome_zarr_pyramid in Rust: OME-Zarr images, their multiscales and coordinate transformations, read on zarrs and dyna-zarr's crates (Workplan DR9)"
+
+[dependencies]
+# metadata keys read straight from the store (zarr.json, .zattrs), local or in a zip;
+# the same zarrs as dyna-zarr's arrays crate
+zarrs = { version = "0.23", features = ["zlib"] }
+zarrs_zip = "0.5"
+serde_json = "1"
+# dyna-zarr's crates: ozp depends on dyna, never the reverse. Paths to the checkout that
+# carries them until they are published (then versions).
+dyna-zarr-transforms = { path = "../../../../dyna_zarr_transforms/core/crates/transforms" }
+dyna-zarr-arrays = { path = "../../../../dyna_zarr_transforms/core/crates/arrays" }

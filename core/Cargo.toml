@@ -1,0 +1,36 @@
+[workspace]
+members = [".", "crates/ome-zarr-pyramid"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Euro-BioImaging/ome_zarr_pyramid"
+
+# The Python package ome-zarr-pyramid-core (module ome_zarr_pyramid_core): ome_zarr_pyramid
+# in Rust (Workplan WP15 DR9, WP14), as micro-reader-core is to micro-reader and
+# dyna-zarr-core to dyna-zarr. The work lives in the library crate ome-zarr-pyramid,
+# which knows nothing about Python; this crate only binds it, so ozp's tests can compare
+# both on the same files.
+[package]
+name = "ome-zarr-pyramid-core"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "OME-Zarr in Rust for ome_zarr_pyramid: multiscales and their coordinate transformations, built on zarrs and dyna-zarr's crates"
+
+[lib]
+name = "ome_zarr_pyramid_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3: one wheel per platform for every Python >= 3.11, as dyna-zarr-core
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+ome-zarr-pyramid = { path = "crates/ome-zarr-pyramid" }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
