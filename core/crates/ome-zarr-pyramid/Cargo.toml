@@ -13,7 +13,7 @@ description = "ome_zarr_pyramid in Rust: OME-Zarr images, their multiscales and 
 zarrs = { version = "0.23", features = ["zlib"] }
 zarrs_zip = "0.5"
 serde_json = "1"
-# dyna-zarr's crates: ozp depends on dyna, never the reverse. Paths to the checkout that
-# carries them until they are published (then versions).
-dyna-zarr-transforms = { path = "../../../../dyna_zarr_transforms/core/crates/transforms" }
-dyna-zarr-arrays = { path = "../../../../dyna_zarr_transforms/core/crates/arrays" }
+# dyna-zarr's crates: ozp depends on dyna, never the reverse. From dyna's repository,
+# pinned to a commit of its main (DR7 merged, PR #26), until they are published.
+dyna-zarr-transforms = { git = "https://github.com/bugraoezdemir/dyna_zarr", rev = "8699f9b34a5bee5e550e7c436b65cf9de6aa99f7" }
+dyna-zarr-arrays = { git = "https://github.com/bugraoezdemir/dyna_zarr", rev = "8699f9b34a5bee5e550e7c436b65cf9de6aa99f7" }

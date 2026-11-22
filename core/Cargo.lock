@@ -323,6 +323,7 @@ dependencies = [
 [[package]]
 name = "dyna-zarr-arrays"
 version = "0.0.1"
+source = "git+https://github.com/bugraoezdemir/dyna_zarr?rev=8699f9b34a5bee5e550e7c436b65cf9de6aa99f7#8699f9b34a5bee5e550e7c436b65cf9de6aa99f7"
 dependencies = [
  "dyna-zarr-filters",
  "dyna-zarr-transforms",
@@ -338,6 +339,7 @@ dependencies = [
 [[package]]
 name = "dyna-zarr-filters"
 version = "0.0.1"
+source = "git+https://github.com/bugraoezdemir/dyna_zarr?rev=8699f9b34a5bee5e550e7c436b65cf9de6aa99f7#8699f9b34a5bee5e550e7c436b65cf9de6aa99f7"
 dependencies = [
  "rayon",
 ]
@@ -345,6 +347,7 @@ dependencies = [
 [[package]]
 name = "dyna-zarr-transforms"
 version = "0.0.1"
+source = "git+https://github.com/bugraoezdemir/dyna_zarr?rev=8699f9b34a5bee5e550e7c436b65cf9de6aa99f7#8699f9b34a5bee5e550e7c436b65cf9de6aa99f7"
 dependencies = [
  "serde_json",
 ]
