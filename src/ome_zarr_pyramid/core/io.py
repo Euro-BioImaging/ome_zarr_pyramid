@@ -741,6 +741,17 @@ def _write_ome_xml(path, xml: str, series, version: str,
         raise ValueError("ome_xml: an OME-XML document (a non-empty string) is needed")
     version = str(version)
     zarr_format = zarr_format_of(version)          # raises for a version ozp does not write
+    if (not layout and storage_options is None and not _is_remote_store(path)
+            and _zip_file_of(path) is None and os.path.isdir(str(path))):
+        # an image folder on local disk: the file straight away, without opening the
+        # group through zarr (a plate writes this for every field). A stray OME group
+        # (ozp 0.3.0) takes the path below, which removes it.
+        ome = Path(str(path)) / "OME"
+        names = ("zarr.json",) if zarr_format == 3 else (".zgroup", ".zattrs")
+        if not any((ome / n).exists() for n in names):
+            ome.mkdir(exist_ok=True)
+            (ome / "METADATA.ome.xml").write_bytes(xml.encode("utf-8"))
+            return
     root = _open_store_group(path, zarr_format, mode="a", storage_options=storage_options)
     if layout:
         series = [str(s) for s in (series if series is not None else [0])]
@@ -2712,7 +2723,8 @@ class IO:
         """Write a plate of `collection` as an NGFF plate (``version`` 0.4 / 0.5 / 0.6, or
         ``"rfc8"``): each image, then the plate and well metadata. Options: ``plate`` (its
         number, default 0), ``version``, ``overwrite``, ``storage_options``, ``writer``,
-        ``document``, ``validate`` and the options of :meth:`write_pyramid`. Returns
+        ``document``, ``images_at_once`` (images written at the same time, default 1),
+        ``validate`` and the options of :meth:`write_pyramid`. Returns
         `path` (`document`, when given). ``PyramidCollection.write_plate`` is the shortcut."""
         return collection._write_plate(path, **options)
 

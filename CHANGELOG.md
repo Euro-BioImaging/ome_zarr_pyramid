@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `write_plate(..., images_at_once=N)` writes N images of a plate at the same time
+  (threads; default 1, one after another as before). Each image's write has a fixed cost
+  (its arrays, its metadata) that one at a time leaves the cores idle for, so a plate of
+  many small fields is much faster with several. A zip is still written one image at a
+  time; the first failing write stops new ones and its error is raised; the plate's
+  metadata is still written last.
+
+### Changed
+
+- Faster writes of many small images: a pyramid's group metadata is written in one update
+  instead of one per key (six rewrites of `zarr.json` per image before); the OME-XML of a
+  local image is written as a file without opening the group through zarr; coroutines run
+  on one long-lived event loop instead of a new loop and thread per call (each cost about
+  3 ms on Windows); the coordinate-system components walk the collection tree once instead
+  of once per component (quadratic on a plate of 10,000 fields).
+- TensorStore 0.1.86 or newer is required (was 0.1.62, without 0.1.77-0.1.85), as in
+  dyna-zarr. Before 0.1.86, TensorStore's thread pool can lose a wakeup, and a write then
+  waits forever. Several writes at once make this likely: a plate of 10,640 fields
+  written 6 at a time stopped for good on 0.1.81 with 4 fields unfinished.
+
 ## 0.6.1 (2026-11-10)
 
 Zipped OME-Zarr: written straight into a zip and read from one. Needs dyna-zarr 0.1.3, which

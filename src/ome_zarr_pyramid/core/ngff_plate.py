@@ -597,12 +597,60 @@ def write_plate_metadata(node: CollectionNode, path, *, version: Optional[str] =
     return plate_attrs
 
 
+def _each_written(write_one, jobs, at_once: int):
+    """``write_one(job)`` for every job, `at_once` of them at a time (threads), as
+    ``[result]`` in the order of `jobs`. Each write runs in a copy of the caller's
+    context (context variables: an open zip, a validation mode, a memory share). The
+    first write that fails stops new ones; those running finish; its error is raised."""
+    if at_once <= 1:
+        return [write_one(job) for job in jobs]
+    import contextvars
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    results = [None] * len(jobs)
+    pending = iter(enumerate(jobs))
+    running = {}
+    error = None
+    with ThreadPoolExecutor(max_workers=at_once, thread_name_prefix="ozp-plate") as pool:
+        def submit():
+            for i, job in pending:
+                ctx = contextvars.copy_context()
+                running[pool.submit(ctx.run, write_one, job)] = i
+                return True
+            return False
+        for _ in range(at_once):
+            if not submit():
+                break
+        while running:
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                i = running.pop(future)
+                exc = future.exception()
+                if exc is not None:
+                    error = error or exc
+                else:
+                    results[i] = future.result()
+                if error is None:
+                    submit()
+    if error is not None:
+        raise error
+    return results
+
+
 def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
                 overwrite: bool = False, storage_options: Optional[dict] = None,
-                writer=None, **write_kwargs) -> Dict[str, str]:
-    """Write a plate: every image, one at a time, with ``io.write_pyramid`` (or
-    `writer`) at ``<path>/<well path>/<image path>``, then the plate and well metadata.
+                writer=None, images_at_once: int = 1, **write_kwargs) -> Dict[str, str]:
+    """Write a plate: every image with ``io.write_pyramid`` (or `writer`) at
+    ``<path>/<well path>/<image path>``, then the plate and well metadata.
     Returns ``{"<well path>/<image path>": written path}``.
+
+    - `images_at_once`: how many images are written at the same time (threads; default
+      1, one after another). A plate of many small fields is far faster with several:
+      each image's write has a fixed cost (creating its arrays, its metadata) that one
+      at a time leaves the cores idle for. Every write gets the same `write_kwargs`, so
+      share ``max_threads`` and ``memory_budget_mb`` between them yourself. A zip is
+      written one image at a time. The first write that fails stops new ones; those
+      running finish, then its error is raised.
 
     - `version`: ``"0.4"`` or ``"0.5"``; default: the version the plate was read as,
       else its images' version (when they share one), else 0.5. Images in another
@@ -651,14 +699,21 @@ def write_plate(node: CollectionNode, path, *, version: Optional[str] = None,
     except (ContainsGroupError, ContainsArrayError, FileExistsError) as exc:
         raise FileExistsError(f"{path} exists; pass overwrite=True to replace it") from exc
     write = writer or IO().write_pyramid
-    written = {}
-    for in_plate, image_path, pyr in jobs:
+
+    def write_one(job):
+        in_plate, image_path, pyr = job
         target = str(_store_join(str(path), in_plate, image_path))
         if storage_options is not None:
             write(pyr, target, storage_options=storage_options, **write_kwargs)
         else:
             write(pyr, target, **write_kwargs)
-        written[f"{in_plate}/{image_path}"] = target
+        return f"{in_plate}/{image_path}", target
+
+    from ome_zarr_pyramid.core.io import _zip_file_of
+    at_once = max(1, min(int(images_at_once or 1), len(jobs)))
+    if _zip_file_of(path) is not None:
+        at_once = 1                            # one zip: its entries are written in turn
+    written = dict(_each_written(write_one, jobs, at_once))
     from ome_zarr_pyramid.core.validation import filling
     with filling(write_kwargs.get("fill_derived")):        # the plate's own SHOULD fields too
         write_plate_metadata(node, path, version=version, storage_options=storage_options)

@@ -15,6 +15,8 @@ import copy
 import functools
 import warnings
 import operator
+import os
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Union
@@ -43,14 +45,62 @@ logger = get_logger(__name__)
 def _run_coroutine(coro):
     """Run ``coro`` to completion from synchronous code - also when the caller is inside a
     running event loop (a Jupyter cell, eubi-bridge's async conversion), where
-    ``asyncio.run`` refuses to nest: there it runs on its own loop in a worker thread."""
+    ``asyncio.run`` refuses to nest.
+
+    It runs on ozp's own event loop, one per process in a thread of its own, started at
+    the first call: a new loop (and on Windows its socket pair) and a new thread for every
+    call cost ~3 ms, which a plate of 10,000 fields paid several times per field. A
+    coroutine on that loop that comes back here runs on a fresh loop in a worker thread
+    (the helper loop cannot wait for itself)."""
     try:
-        asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(asyncio.run, coro).result()
+        running = None
+    loop = _helper_loop()
+    if running is loop:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(asyncio.run, coro).result()
+    import concurrent.futures
+    # the task runs in a copy of the caller's context, as asyncio.run's would: the
+    # context variables (FILL_DERIVED, an open zip, a memory share) reach the coroutine
+    ctx = contextvars.copy_context()
+    result = concurrent.futures.Future()
+
+    def start():
+        try:
+            task = ctx.run(loop.create_task, coro)
+        except BaseException as exc:                # noqa: BLE001 - handed to the caller
+            result.set_exception(exc)
+            return
+
+        def done(t):
+            if t.cancelled():
+                result.cancel()
+            elif t.exception() is not None:
+                result.set_exception(t.exception())
+            else:
+                result.set_result(t.result())
+        task.add_done_callback(done)
+    loop.call_soon_threadsafe(start)
+    return result.result()
+
+
+_HELPER = {"loop": None, "pid": None}
+_HELPER_LOCK = threading.Lock()
+
+
+def _helper_loop() -> asyncio.AbstractEventLoop:
+    """ozp's event loop for `_run_coroutine` (a daemon thread; a new one in a forked
+    child, whose copy of the thread is gone)."""
+    with _HELPER_LOCK:
+        loop = _HELPER["loop"]
+        if loop is None or loop.is_closed() or _HELPER["pid"] != os.getpid():
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, name="ozp-event-loop",
+                             daemon=True).start()
+            _HELPER["loop"], _HELPER["pid"] = loop, os.getpid()
+        return loop
 
 
 def _is_tensorstore(arr) -> bool:
@@ -1061,24 +1111,34 @@ class NGFFMetadataHandler:
             if problems:
                 raise_for_metadata(str(self.zarr_group.store_path), problems, version)
         attrs = self.zarr_group.attrs
+        # the group's attributes as they will be, written in ONE update: each key set on
+        # zarr's attributes rewrites the group's metadata document (a plate of 10,000
+        # fields wrote each field's zarr.json six times)
+        new = dict(attrs)
         for name in self._removed_custom:
-            if name in attrs:
-                del attrs[name]
+            new.pop(name, None)
         self._removed_custom = set()
         if version in ('0.5', '0.6'):
             # the NGFF keys under `ome`, custom blocks beside it (the spec's placement)
-            attrs['ome'] = {k: v for k, v in metadata_dict.items() if k in self.NGFF_KEYS}
+            new['ome'] = {k: v for k, v in metadata_dict.items() if k in self.NGFF_KEYS}
             for key, value in metadata_dict.items():
                 if key not in self.NGFF_KEYS:
-                    attrs[key] = value
+                    new[key] = value
         else:
             # 0.4 keeps everything at the top level: multiscales, omero, image-label and
             # any attribute NGFF does not define (an application's namespaced block, e.g.
             # 'eubi_bridge'). Only those were written before, so custom blocks were lost.
-            self.zarr_group.attrs['multiscales'] = metadata_dict.get('multiscales')
+            new['multiscales'] = metadata_dict.get('multiscales')
             for key, value in metadata_dict.items():
                 if key not in ('multiscales', 'version'):
-                    self.zarr_group.attrs[key] = value
+                    new[key] = value
+        if hasattr(attrs, 'put'):
+            attrs.put(new)
+        else:                                       # an attributes object without put
+            for name in set(attrs) - set(new):
+                del attrs[name]
+            for key, value in new.items():
+                attrs[key] = value
 
         self._pending_changes = False
 

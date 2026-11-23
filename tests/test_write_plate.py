@@ -230,3 +230,60 @@ def test_a_plate_into_a_zip_holds_what_a_folder_holds(tmp_path, version):
     back = PyramidCollection.from_zarr(str(tmp_path / "screen.ome.zarr.zip"))
     assert [f.index for w in back.plates[0].wells for f in w.fields] == \
         [f.index for w in coll.plates[0].wells for f in w.fields]
+
+
+def _tree_files(root):
+    """Every file under `root` (relative path -> bytes)."""
+    out = {}
+    for folder, _, names in os.walk(root):
+        for name in names:
+            full = os.path.join(folder, name)
+            with open(full, "rb") as fh:
+                out[os.path.relpath(full, root)] = fh.read()
+    return out
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5", "0.6"])
+def test_images_at_once_writes_the_same_plate(tmp_path, version):
+    # several fields written at the same time: the same files, byte for byte, as one at
+    # a time (with an OME-XML per image, the local fast path included)
+    one, many = str(tmp_path / "one.zarr"), str(tmp_path / "many.zarr")
+    PyramidCollection.from_file(_file(), version=version).write_plate(one, version=version)
+    seen = []
+
+    def writer(pyr, target, **kwargs):
+        import threading
+        seen.append(threading.current_thread().name)
+        from ome_zarr_pyramid import IO
+        IO().write_pyramid(pyr, target, ome_xml="<OME/>", **kwargs)
+
+    PyramidCollection.from_file(_file(), version=version).write_plate(
+        many, version=version, writer=writer, images_at_once=3)
+    a, b = _tree_files(one), _tree_files(many)
+    xml = {k for k in b if k.endswith("METADATA.ome.xml")}
+    assert len(xml) == 3 and all(b[k] == b"<OME/>" for k in xml)
+    assert {k: v for k, v in b.items() if k not in xml} == a
+    assert all(name.startswith("ozp-plate") for name in seen)
+
+
+def test_images_at_once_raises_the_first_error_and_starts_no_more(tmp_path):
+    import threading
+    started, lock = [], threading.Lock()
+
+    def writer(pyr, target, **kwargs):
+        with lock:
+            started.append(target)
+        if len(started) == 1:
+            raise RuntimeError("disk full")
+        from ome_zarr_pyramid import IO
+        IO().write_pyramid(pyr, target, **kwargs)
+
+    many = [{"plate": 0, "acquisition": 0, "well": 0, "field": f} for f in range(12)]
+    images = [FakeImage(index, i) for i, index in enumerate(many)]
+    f = SimpleNamespace(path="/data/screen.idx.xml", images=images, plates=[PLATE])
+    out = str(tmp_path / "p.zarr")
+    with pytest.raises(RuntimeError, match="disk full"):
+        PyramidCollection.from_file(f).write_plate(out, writer=writer, images_at_once=2)
+    assert len(started) < 12                               # the rest were never started
+    # no plate metadata: a stopped write leaves no plate
+    assert "plate" not in json.dumps(zarr.open_group(out, mode="r").attrs.asdict())

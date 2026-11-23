@@ -1200,7 +1200,11 @@ class PyramidCollection(Mapping):
         for node, root in positions.items():
             if node[0] == "entry":
                 groups.setdefault(root, []).append(node[1])
-        before = {root: self._owner_of(keys) for root, keys in groups.items() if len(keys) > 1}
+        # where each entry sits in the tree: walked once, not once per component (a plate
+        # of 10,000 fields has a component per well)
+        where = self._entry_paths()
+        before = {root: self._owner_of(keys, where) for root, keys in groups.items()
+                  if len(keys) > 1}
         joining = []
         for edge in self._edges:
             ends = [node_of(e) for step in (edge,) + (steps(edge) if edge.type == "sequence" else ())
@@ -1222,15 +1226,20 @@ class PyramidCollection(Mapping):
             if end is not None:
                 out[find(end)].edges.append(edge)
         components = []
+        order = {k: i for i, k in enumerate(self._pyramids)}
+        # the owners the groups had before the edges joined them, by the component they
+        # are in now
+        owners_in: Dict[Any, set] = {}
+        for r, keys in groups.items():
+            if r in before:
+                owners_in.setdefault(find(("entry", keys[0])), set()).add(before[r])
         for root, c in out.items():
             if not c.entries:
                 continue                        # systems linked only to each other
-            order = {k: i for i, k in enumerate(self._pyramids)}
             entries = sorted(c.entries, key=lambda k: order.get(k, len(order)))
-            owner = self._owner_of(entries) if len(entries) > 1 else None
+            owner = self._owner_of(entries, where) if len(entries) > 1 else None
             components.append(Component(c.systems, entries, c.edges, owner))
-            owners = {before[r] for r, keys in groups.items()
-                      if r in before and find(("entry", keys[0])) == root}
+            owners = owners_in.get(root, set())
             if warn and len(owners) > 1:
                 import warnings
                 named = sorted({f"{e.type} {_end_text(e.input)} -> {_end_text(e.output)}"
@@ -1242,12 +1251,12 @@ class PyramidCollection(Mapping):
                               UserWarning, stacklevel=2)
         return components
 
-    def _owner_of(self, keys) -> Tuple[str, ...]:
-        """The path of names from the root to the smallest collection of the tree
-        holding every entry of `keys` (``()``: the root, also without a tree)."""
+    def _entry_paths(self) -> Dict[Any, Tuple[str, ...]]:
+        """Each entry's collection in the tree, as the path of names from the root
+        (entries outside the tree, or no tree: absent)."""
         from ome_zarr_pyramid.core.nodes import CollectionNode
         if self.tree is None or not isinstance(self.tree, CollectionNode):
-            return ()
+            return {}
         ids = {}
         for key, value in self._pyramids.items():
             ids[id(value)] = key
@@ -1262,6 +1271,17 @@ class PyramidCollection(Mapping):
                 if key is not None:
                     where[key] = path
         walk(self.tree, ())
+        return where
+
+    def _owner_of(self, keys, where: Optional[Dict[Any, Tuple[str, ...]]] = None
+                  ) -> Tuple[str, ...]:
+        """The path of names from the root to the smallest collection of the tree
+        holding every entry of `keys` (``()``: the root, also without a tree). `where`:
+        :meth:`_entry_paths`, when the caller has it already."""
+        if where is None:
+            where = self._entry_paths()
+        if not where:
+            return ()
         paths = [where.get(k, ()) for k in keys]
         common = paths[0]
         for p in paths[1:]:
@@ -1579,13 +1599,15 @@ class PyramidCollection(Mapping):
     def _write_plate(self, path, *, plate: int = 0, version: Optional[str] = None,
                      overwrite: bool = False, storage_options: Optional[dict] = None,
                      writer: Optional[Callable] = None, document: Optional[str] = None,
-                     **write_kwargs) -> str:
+                     images_at_once: int = 1, **write_kwargs) -> str:
         """Write plate `plate` of the collection as an NGFF plate: each image in turn
         (``io.write_pyramid``, or `writer`, with `write_kwargs`), then the plate and
         well metadata. Returns `path` (`document`, when given), for ``io.read``. See
         :func:`ome_zarr_pyramid.core.ngff_plate.write_plate` for `version` and
-        `overwrite`. ``version="rfc8"`` writes it as RFC 8 (see `write_collection`;
-        `document` puts the plate's RFC 8 document in a standalone ``.json``).
+        `overwrite`. `images_at_once`: images written at the same time (see there; RFC 8
+        writes one at a time). ``version="rfc8"`` writes it as RFC 8 (see
+        `write_collection`; `document` puts the plate's RFC 8 document in a standalone
+        ``.json``).
 
         A field holding several images (its images' keys agree in plate, acquisition,
         well and field but differ in tile, view, ...) raises
@@ -1626,7 +1648,8 @@ class PyramidCollection(Mapping):
         check_fields(node.name, fields)        # one image per field, in every version
         node = self._plate_with_keys(node, key_of, version)
         write_plate(node, path, version=version, overwrite=overwrite,
-                    storage_options=storage_options, writer=writer, **write_kwargs)
+                    storage_options=storage_options, writer=writer,
+                    images_at_once=images_at_once, **write_kwargs)
         return _written(path)
 
     def _plate_with_keys(self, node, key_of, version):
