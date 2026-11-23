@@ -93,13 +93,17 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      # cargo test leaves out the binding (ome-zarr-pyramid-core): it has no Rust tests,
+      # and its test program cannot link on macOS, where an extension module finds
+      # Python's symbols only when Python loads it (maturin adds the link flags for
+      # that; plain cargo does not). The parity step below tests the binding instead.
       - name: Rust checks
         working-directory: core
         run: |
           rustup show active-toolchain
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --release -- -D warnings
-          cargo test --workspace --release
+          cargo test --workspace --exclude ome-zarr-pyramid-core --release
 
       - name: Build and install the binding
         run: |
