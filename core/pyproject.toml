@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ome-zarr-pyramid-core"
+dynamic = ["version"]              # from Cargo.toml: one place for the version
+description = "ome_zarr_pyramid in Rust: OME-Zarr images, their multiscales and coordinate transformations, built on zarrs and dyna-zarr's crates."
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["zarr", "ome-zarr", "ngff", "native", "rust"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Private :: Do Not Upload",
+]
+# no Python dependencies: a compiled module only
+
+[project.urls]
+Homepage = "https://github.com/Euro-BioImaging/ome_zarr_pyramid"
+
+[tool.maturin]
+module-name = "ome_zarr_pyramid_core"

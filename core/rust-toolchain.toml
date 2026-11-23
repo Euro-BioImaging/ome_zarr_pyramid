@@ -1,0 +1,5 @@
+# Pinned for reproducible native builds, the same toolchain as micro-reader-core and dyna-zarr-core.
+# rustup picks this up automatically inside this folder.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

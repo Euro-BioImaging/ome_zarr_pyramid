@@ -74,6 +74,47 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v -o addopts=""
 
+  core:
+    # ozp in Rust (core/: the crate ome-zarr-pyramid and its binding ome-zarr-pyramid-core,
+    # Workplan DR9): Rust checks, then the binding built and compared with ozp on the
+    # same files (tests/test_rust_core_parity.py). The toolchain comes from
+    # core/rust-toolchain.toml.
+    name: core (Rust + parity, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # cargo test leaves out the binding (ome-zarr-pyramid-core): it has no Rust tests,
+      # and its test program cannot link on macOS, where an extension module finds
+      # Python's symbols only when Python loads it (maturin adds the link flags for
+      # that; plain cargo does not). The parity step below tests the binding instead.
+      - name: Rust checks
+        working-directory: core
+        run: |
+          rustup show active-toolchain
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --release -- -D warnings
+          cargo test --workspace --exclude ome-zarr-pyramid-core --release
+
+      - name: Build and install the binding
+        run: |
+          python -m pip install --upgrade pip maturin
+          python -m maturin build --release -m core/Cargo.toml -o dist-core
+          python -m pip install --find-links dist-core ome-zarr-pyramid-core
+          python -m pip install -e ".[dev]"
+
+      - name: Parity with ozp
+        run: python -m pytest tests/test_rust_core_parity.py -v -o addopts=""
+
   install-check:
     # Builds the wheel, installs it into a CLEAN venv from OUTSIDE the repo, and runs the
     # suite against the RESOLVED PyPI dependencies. The job above uses `-e .`, which tests
