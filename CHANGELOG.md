@@ -19,6 +19,10 @@
   on one long-lived event loop instead of a new loop and thread per call (each cost about
   3 ms on Windows); the coordinate-system components walk the collection tree once instead
   of once per component (quadratic on a plate of 10,000 fields).
+- TensorStore 0.1.86 or newer is required (was 0.1.62, without 0.1.77-0.1.85), as in
+  dyna-zarr. Before 0.1.86, TensorStore's thread pool can lose a wakeup, and a write then
+  waits forever. Several writes at once make this likely: a plate of 10,640 fields
+  written 6 at a time stopped for good on 0.1.81 with 4 fields unfinished.
 
 ## 0.6.1 (2026-11-10)
 

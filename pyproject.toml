@@ -39,11 +39,13 @@ classifiers = [
 # `pip install ome_zarr_pyramid` produced something that raised ModuleNotFoundError on
 # `import`.
 dependencies = [
-    # the same floors and exclusions as dyna-zarr (stated here too, so they hold for ozp
-    # itself): tensorstore 0.1.77-0.1.84 crash at process exit after any S3 access;
-    # 0.1.85 keeps memory while lower levels are built from level 0 (2.4 -> 115 GB)
+    # the same floor as dyna-zarr (stated here too, so it holds for ozp itself): before
+    # 0.1.86 a write can wait forever when several run at once (write_plate's
+    # images_at_once; TensorStore's thread pool lost a wakeup); 0.1.77-0.1.84 also crash
+    # at process exit after S3 access, and 0.1.85 keeps memory while lower levels are
+    # built from level 0 (2.4 -> 115 GB)
     "zarr>=3.1.5",
-    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84,!=0.1.85",
+    "tensorstore>=0.1.86",
     "numpy>=1.26",
     "numcodecs",          # utils/compressor_config.py, core/pyramid.py (codec configs)
     "pydantic>=2",        # utils/compressor_config.py (ConfigDict/field_validator = v2)
