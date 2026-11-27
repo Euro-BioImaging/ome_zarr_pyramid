@@ -436,11 +436,12 @@ def _fill(parent: CollectionNode, children: List[Node]) -> CollectionNode:
 
 def file_stem(path) -> str:
     """A file's name without its extension, the root name of :func:`tree_from_file`:
-    ``xyz.czi`` -> ``xyz``, ``cells.ome.tif`` / ``cells.ome.zarr`` -> ``cells``. A
+    ``xyz.czi`` -> ``xyz``, ``cells.ome.tif`` / ``cells.ome.zarr`` -> ``cells``, an OME
+    companion ``set.companion.ome`` -> ``set`` (as micro-reader's ``file_stem``). A
     folder (a plate or companion folder) keeps its whole name, except ``.zarr``."""
     path = str(path).rstrip("/\\")
     base = os.path.basename(path)
-    for pattern in (r"\.ome\.[A-Za-z0-9]+$", r"\.zarr$"):
+    for pattern in (r"\.companion\.ome$", r"\.ome\.[A-Za-z0-9]+$", r"\.zarr$"):
         stem = re.sub(pattern, "", base, flags=re.IGNORECASE)
         if stem != base:
             return stem or base
