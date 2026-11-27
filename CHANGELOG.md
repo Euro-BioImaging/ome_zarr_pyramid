@@ -24,6 +24,12 @@
   waits forever. Several writes at once make this likely: a plate of 10,640 fields
   written 6 at a time stopped for good on 0.1.81 with 4 fields unfinished.
 
+### Fixed
+
+- `tree_from_file` names the root of an OME companion after the companion without its
+  whole suffix: `set.companion.ome` gives `set`, not `set.companion`, as micro-reader's
+  `file_stem` does (`core.plates.file_stem`).
+
 ## 0.6.1 (2026-11-10)
 
 Zipped OME-Zarr: written straight into a zip and read from one. Needs dyna-zarr 0.1.3, which

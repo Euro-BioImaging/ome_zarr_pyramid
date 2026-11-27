@@ -210,7 +210,8 @@ def test_write_rfc8_refuses_an_image_inside_another_before_writing(tmp_path):
 @pytest.mark.parametrize("path, stem", [
     ("/d/xyz__multiple_images.czi", "xyz__multiple_images"), ("/d/cells.ome.tif", "cells"),
     ("/d/cells.OME.TIFF", "cells"), ("/d/p.ome.zarr/", "p"), ("/d/p.zarr", "p"),
-    ("/d/screen.idx.xml", "screen.idx"), ("noext", "noext")])
+    ("/d/screen.idx.xml", "screen.idx"), ("/d/ome-tiff.companion.ome", "ome-tiff"),
+    ("/d/set.Companion.OME", "set"), ("noext", "noext")])
 def test_the_root_is_named_by_the_file_stem(path, stem):
     from ome_zarr_pyramid.core.plates import file_stem
     assert file_stem(path) == stem
